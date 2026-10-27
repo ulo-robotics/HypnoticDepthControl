@@ -1,0 +1,5 @@
+numpy
+scipy
+jax          # GPU: pip install -U "jax[cuda12]"  (or use the Dockerfile)
+optax
+matplotlib   # only for evaluate.py --plot
