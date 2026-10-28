@@ -193,7 +193,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
             jobs[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
         asm = pop_map(lambda t, s, w, r, ft, bt: K.assemble(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0, 0, 0, 0, 0, 0))
         jobs["asm"] = (asm, (tp, sz, w_low, rho_u, ft_shape, bt_shape))
-        with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 8)) as ex:
+        with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
             fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
             exe = {}
             for k, f in fut.items():

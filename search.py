@@ -12,6 +12,7 @@ Meta-optimization of the v1 policy's training configuration (the procedure of th
   5. re-rank / test  all final models on a fresh key with --rerank-batch patients per scenario, the configuration with the best mean over seeds
                      wins (its best seed is the model); the winner is scored ONCE on the test key against the untrained base prior
 All trials see the same training patients (common random numbers). Score = weighted mean over model.VAL of J + 2 viol (lower is better).
+Training and scoring use the fixed stimulus (--stimulus, model.STIM_FIXED); finetune.py then moves the winner to the random one.
 
 Trials train in populations (trainer.Population): the trials of one network shape, up to --pop at a time, as one jitted program on the GPU,
 each with its own hyperparameters and optimizer. Shapes are the trials' sizes with the head and the extra physics modes padded to the largest
@@ -39,7 +40,7 @@ def _keys():
     return dict(val=T.VAL_KEY, rerank=jax.random.PRNGKey(424242), test=jax.random.PRNGKey(99999))
 
 
-def screen(designs, n):
+def screen(designs, n, stimulus):
     """iteration-0 scores of prior designs (vmapped over designs: only the physics layer differs, the residual output is zero)"""
     import jax, jax.numpy as jnp
     import model as M, policy as P, trainer as T
@@ -53,13 +54,13 @@ def screen(designs, n):
         except Exception:                                         # e.g. the Riccati solver rejected the design
             pass
     params = P.init_params(jax.random.PRNGKey(0), base)
-    names = list(M.VAL)
+    names, specs = list(M.VAL), M.val_specs(stimulus)
     keys = _keys()
 
     @jax.jit
     def scores(phs):
         def per_scen(i):
-            sp = {k: jnp.float32(v) for k, v in M.VAL[names[i]][0].items()}
+            sp = {k: jnp.float32(v) for k, v in specs[names[i]].items()}
             pts = M.sample_patients(jax.random.fold_in(jax.random.fold_in(keys["val"], 999), i), n, sp)
 
             def one(ph):
@@ -102,7 +103,14 @@ def decode(u, SPACE, pool, fix):
 
 
 def shape_key(c):
-    return (int(c["L"]), int(c["H"]), int(c["NS"]))
+    """padded (L, H, NS) of a configuration: H and NS rounded up to a few sizes, so that a search compiles few programs (at most 3 x 3 x 3)"""
+    up = lambda v, sizes: next((s for s in sizes if s >= int(v)), int(v))
+    return (int(c["L"]), up(c["H"], (16, 32, 64)), up(c["NS"], (8, 16, 32)))
+
+
+def group_shape(g):
+    """padded (L, H, NS) of a population: the largest of its members'"""
+    return tuple(max(x) for x in zip(*(shape_key(t["cfg"]) for t in g)))
 
 
 def p2(n):
@@ -143,7 +151,7 @@ class Search:
         designs = [{k: BASE[k] for k in PRIOR_KEYS}] + [
             {k: float(math.exp(math.log(rng[k][0]) + u * (math.log(rng[k][1]) - math.log(rng[k][0])))) for k, u in zip(PRIOR_KEYS, p)} for p in pts]
         t0 = time.time()
-        scores = np.asarray(screen(designs, a.val_batch))
+        scores = np.asarray(screen(designs, a.val_batch, a.stimulus))
         order = np.argsort(scores)
         keep = max(8, int(np.isfinite(scores).sum() * a.prior_keep))
         pool = [designs[i] for i in order[:keep]]
@@ -153,16 +161,17 @@ class Search:
         return pool
 
     def populations(self, todo):
-        """the trials grouped by network shape, up to --pop per population (deterministic: a resumed run forms the same populations)"""
-        by = {}
-        for t in sorted(todo, key=lambda t: (shape_key(t["cfg"]), t["id"])):
-            by.setdefault(shape_key(t["cfg"]), []).append(t)
-        out = []
-        for key in sorted(by, key=lambda k: -k[0] * k[1] * k[2]):                    # big ones first: an OOM shows early
-            ts = by[key]
-            n = min(self.max_pop.get(str(key), self.a.pop), self.a.pop)
-            out += [ts[i:i + n] for i in range(0, len(ts), n)]
-        return out
+        """the trials in populations of up to --pop, in size order so that neighbours share a padded shape: populations stay full when the
+        trials of each shape thin out in the later rungs (deterministic: a resumed run forms the same populations)"""
+        cap = lambda g: min(self.max_pop.get(str(group_shape(g)), self.a.pop), self.a.pop)
+        out, g = [], []
+        for t in sorted(todo, key=lambda t: (shape_key(t["cfg"]), int(t["cfg"]["H"]), int(t["cfg"]["NS"]), t["id"])):
+            if g and len(g) + 1 > cap(g + [t]):
+                out.append(g)
+                g = []
+            g.append(t)
+        out += [g] if g else []
+        return sorted(out, key=lambda g: -math.prod(group_shape(g)))                  # big ones first: an OOM shows early
 
     def train_group(self, trials, budget, val_idx, tag, train_seed=None):
         """train trials to `budget`, population by population. First every new (shape, size) has its gradient engine chosen (timed with the GPU
@@ -174,7 +183,7 @@ class Search:
         print(f"  [{tag}] {len(todo)} trials in {len(queue)} populations", flush=True)
         t0, seen = time.time(), set()
         for g in queue:                                                               # engine choices (cached across rungs and runs)
-            key = (shape_key(g[0]["cfg"]), p2(len(g)))
+            key = (group_shape(g), p2(len(g)))
             if key not in seen:
                 seen.add(key)
                 self.prepare(g, budget, train_seed, compile=False)
@@ -196,7 +205,7 @@ class Search:
                         raise
                     for f in nxt:
                         f.exception()                                                 # (discarded: the queue changes)
-                    key = str(shape_key(g[0]["cfg"]))
+                    key = str(group_shape(g))
                     self.max_pop[key] = max(1, p2(len(g)) // 2)
                     json.dump(self.max_pop, open(os.path.join(self.out, "max_pop.json"), "w"))
                     print(f"  [{tag}] out of memory with {len(g)} trials of shape {key}: splitting (at most {self.max_pop[key]} per population)",
@@ -221,7 +230,7 @@ class Search:
         n = p2(len(g))
         cfgs = [t["cfg"] for t in g] + [g[0]["cfg"]] * (n - len(g))                  # copies of the first member fill a power of two
         states += [states[0]] * (n - len(g))
-        H, NS, L = (max(int(c[k]) for c in cfgs) for k in ("H", "NS", "L"))
+        L, H, NS = group_shape(g)
         tk = jax.random.PRNGKey(10_000) if train_seed is None else jax.random.fold_in(jax.random.PRNGKey(10_000), train_seed)
         pop = T.Population(cfgs, states, tk, shape=dict(H=H, NS=NS, L=L, HD=PAD_HEAD, P=5 + PAD_EXTRA), opt_names=T.OPT_NAMES,
                            val_batch=self.a.val_batch, iters_hint=budget - states[0]["it"], block=self.a.block, log=lambda m: None)
@@ -271,7 +280,7 @@ class Search:
             pool = self.prior_screen(SPACE, BASE, PRIOR_KEYS) if a.prior_screen > 0 else None
             cfgs = [{**BASE, **fix}] + [{**BASE, **decode(u, SPACE, pool, fix)} for u in sobol(a.trials, len(SPACE), a.seed)][: a.trials - 1]
             for c in cfgs:
-                c["batch"] = a.batch
+                c["batch"], c["stimulus"] = a.batch, a.stimulus
             self.save(trials=[dict(id=i, cfg=c, it=0, score=None, failed=False, parent=i, seed=0) for i, c in enumerate(cfgs)])
         trials = self.man["trials"]
         if self.man["phase"] == "done":
@@ -322,7 +331,7 @@ class Search:
         models = [P.shrink(pickle.load(open(self.spath(t), "rb"))["ema"], t["cfg"]) for t in live]
         w = np.array([M.VAL[s][1] for s in M.VAL])
         comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
-        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True)])
+        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True, stimulus=a.stimulus)])
         mean, se = sc.mean(1), sc.std(1, ddof=1) / math.sqrt(sc.shape[1])
         rows = []
         for p in sorted({t["parent"] for t in live}):
@@ -336,7 +345,7 @@ class Search:
         for r in sorted(rows, key=lambda r: r["mean"]):
             print(f"  config {r['parent']:5d}: {r['mean']:.3f} +- {r['se']:.3f} over {r['n_seeds']} seeds")
         test = np.stack([comb(st) for st in T.evaluate([models[bi], P.init_params(jax.random.PRNGKey(0), dict(BASE, **fix))], a.test_batch,
-                                                        _keys()["test"], per_patient=True)])
+                                                        _keys()["test"], per_patient=True, stimulus=a.stimulus)])
         d = test[1] - test[0]
         res = dict(best_model=best["id"], best_parent=best["parent"], cfg=best["cfg"], iters=best["it"],
                    rerank=[dict(id=t["id"], parent=t["parent"], seed=t["seed"], mean=float(mean[i]), se=float(se[i]),
@@ -381,6 +390,8 @@ def main():
     ap.add_argument("--final-iters", type=int, default=3000)
     ap.add_argument("--final-seeds", type=int, default=3)
     ap.add_argument("--batch", type=int, default=512, help="training patients per iteration")
+    ap.add_argument("--stimulus", default="fixed", choices=["fixed", "random"], help="stimulus of training and scoring (model.STIM_FIXED: "
+                    "the paper's search; finetune.py then moves the winner to the random one)")
     ap.add_argument("--val-batch", type=int, default=1024, help="patients per validation scenario (rung scores)")
     ap.add_argument("--rerank-batch", type=int, default=4096)
     ap.add_argument("--test-batch", type=int, default=4096)

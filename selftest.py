@@ -12,8 +12,9 @@ Float64 (a minute on a CPU):
   6. padding is exact: a network zero-padded into a larger shape (more channels, states, layers, head units, physics modes) computes the same
      closed loop, its per-patient gradients equal the unpadded ones on the active entries and are exactly zero on the padding (raw and adjoint)
   7. a population of different configurations (sizes, optimizers, learning-rate rules, loss weights) trained together == each trained alone
+  8. the UKF-MM baseline with one observer of delay 0 and fixed noise == UKF+LQR, and the full bank runs (finite, in range)
 Float32, GPU only (a fresh process, `python selftest.py --engines`; run automatically when a GPU is present):
-  8. every Pallas and CUDA sweep candidate of engine.py == the XLA reference sweeps on every tape, for a single network (three shapes including
+  9. every Pallas and CUDA sweep candidate of engine.py == the XLA reference sweeps on every tape, for a single network (three shapes including
      the selected one) and a padded population. A candidate that does not fit a shape (e.g. shared memory) is reported as skipped: the engine
      would not use it either.
 """
@@ -172,6 +173,14 @@ def main():
         ok.append(check(f"population member == trained alone ({c['opt']}, H{c['H']} NS{c['NS']} L{c['L']} head{c['head']}, 3 iterations, relative)",
                         rel(together[i]["params"], alone.member_states()[0]["params"]), 1e-9))
 
+    # 8. UKF-MM reduces to UKF+LQR
+    import baselines as BL
+    _, u0 = M.run_numpy(BL.UKFLQR(q_theta=5e-4, rho=2e-4), pn)
+    _, u1 = M.run_numpy(BL.UKFMM(dset=(0,), adapt=False), pn)
+    ok.append(check("UKF-MM, one observer of delay 0, fixed noise == UKF+LQR (max |du|, mg/min)", float(np.max(np.abs(u0 - u1))), 1e-9))
+    _, u2 = M.run_numpy(BL.UKFMM(), pn)
+    ok.append(check("UKF-MM bank: inputs finite and in [0, UMAX] (violations)", float(np.sum(~np.isfinite(u2)) + np.sum((u2 < 0) | (u2 > M.UMAX))), 0.0))
+
     if E._gpu():
         print("engine checks (float32, GPU) in a fresh process:", flush=True)
         ok.append(subprocess.run([sys.executable, os.path.abspath(__file__), "--engines"]).returncode == 0)
@@ -182,7 +191,7 @@ def main():
 
 
 def engines():
-    """8. every GPU sweep candidate vs the XLA reference sweeps (float32)"""
+    """9. every GPU sweep candidate vs the XLA reference sweeps (float32)"""
     import engine as E
     import trainer as TR
     ok, n_run = [], 0

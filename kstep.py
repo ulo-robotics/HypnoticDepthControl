@@ -102,7 +102,7 @@ def to_kq(pts):
     """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
     B = pts["mu"].shape[0]
     a = jnp.exp(-M.DT / pts["tau"])
-    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], stim_t=pts["stim_t"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
              dmask=jax.nn.one_hot(pts["delay"], DP, dtype=pts["mu"].dtype))
     Ad = pts["Ad"].reshape(B, 16)
     for i in range(16):
@@ -150,7 +150,7 @@ def step_pre(kp, q, c, k, st):
     dt = q["mu"].dtype
     t = k.astype(dt) * M.DT if hasattr(k, "astype") else jnp.asarray(k * M.DT, dt)
     ce = jnp.maximum(c["x3"], 0.0)
-    l50 = q["mu"] + c["ou"] + q["stim"] * (t > 20.0).astype(dt)
+    l50 = q["mu"] + c["ou"] + q["stim"] * (t > q["stim_t"]).astype(dt)
     cg = jnp.power(ce, q["gamma"])
     b = q["e0"] - q["emax"] * cg / (cg + jnp.power(jnp.exp(l50), q["gamma"]))
     sh = (_iota((DP, DP), 0) + 1 == _iota((DP, DP), 1)).astype(dt)              # buf[:, j] -> buf[:, j + 1]

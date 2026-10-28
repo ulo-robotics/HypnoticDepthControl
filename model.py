@@ -2,7 +2,7 @@
 Propofol closed loop: 3-compartment PK + effect site -> Hill PD -> BIS, with drift, stimulus, monitor delay and noise.
 
 Plant      x' = A(p) x + B(p) u,  x = [c1, c2, c3, ce] (ug/mL), u in [0, 100] mg/min, zero-order hold, dt = 5 s, 30 min (360 steps)
-PD         BIS = E0 - Emax * ce^g / (ce^g + C50_t^g),  log C50_t = mu + OU drift (+ 0.3 after 20 min if the patient has a stimulus)
+PD         BIS = E0 - Emax * ce^g / (ce^g + C50_t^g),  log C50_t = mu + OU drift (+ a stimulus: a step of random size at a random time)
 Monitor    y_k = BIS_{k - delay} + sy_k * noise
 Cost       J = mean_k (BIS_k - target_k)^2 on the TRUE BIS; viol = mean relu(40 - BIS)^2
 
@@ -28,7 +28,8 @@ KMAX = 8                             # most target / noise-level changes per epi
 IND = np.arange(N) * DT <= 10.0      # induction phase (first 10 min)
 
 # ---------------------------------------------------------------- scenarios
-SPEC_NOMINAL = dict(tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, dmin=0, dmax=0,
+SPEC_NOMINAL = dict(tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0,
+                    dmin=0, dmax=0,
                     gamma_lo=GAMMA, gamma_hi=GAMMA, e0_lo=E0, e0_hi=E0, emax_lo=EMAX, emax_hi=EMAX,
                     tgt_lo=TARGET, tgt_hi=TARGET, pk_shift=0.0, sy_lo=SY, sy_hi=SY,
                     tgt_changes=0, tgt_dmax=10.0, sy_changes=0)
@@ -74,6 +75,22 @@ STRESS = {
                              e0_lo=85.0, e0_hi=100.0, emax_lo=70.0, emax_hi=100.0, tgt_lo=42.0, tgt_hi=65.0, pk_shift=0.8,
                              sy_lo=1.5, sy_hi=8.0, tgt_changes=8, tgt_dmax=20.0, sy_changes=8),
 }
+# the stimulus of the meta-optimization (search.py): +0.3 in log C50 after 20 min. A policy can learn to anticipate a fixed time, so the
+# selected model is fine-tuned (finetune.py) and evaluated on the random stimulus of the specs above.
+STIM_FIXED = dict(stim_lo=0.3, stim_hi=0.3, stim_tlo=20.0, stim_thi=20.0)
+
+
+def with_stimulus(sp, stimulus):
+    """spec `sp` with the "random" (as specified) or the "fixed" (STIM_FIXED) stimulus"""
+    assert stimulus in ("random", "fixed"), stimulus
+    return {**sp, **STIM_FIXED} if stimulus == "fixed" else dict(sp)
+
+
+def val_specs(stimulus="random"):
+    """the validation scenarios' specs, name -> spec"""
+    return {k: with_stimulus(v[0], stimulus) for k, v in VAL.items()}
+
+
 DMAX_ALL = max(int(s["dmax"]) for s in [TRAIN, *[v[0] for v in VAL.values()], *STRESS.values()])   # delay buffer length
 
 
@@ -168,12 +185,14 @@ def sample_patients(key, B, sp, nom_frac=0.0):
     nomv = jnp.broadcast_to(nom[:, None], tgt.shape)
     tgt, sy = jnp.where(nomv, TARGET, tgt), jnp.where(nomv, SY, sy)
     delay = jnp.floor(sp["dmin"] + u(ks[8]) * (sp["dmax"] - sp["dmin"] + 1)).astype(jnp.int32)
+    kst = jax.random.split(jax.random.fold_in(key, 2), 2)                  # stimulus: whether (ks[12]), how large (log C50 step), when (min)
+    stim = jnp.where(u(ks[12]) < sp["stim_p"], un(kst[0], sp["stim_lo"], sp["stim_hi"]), 0.0)
     return dict(
         pk=pk, Ad=Ad, Bd=Bd,
         mu=math.log(C50N) + C50_CV * jax.random.normal(ks[9], (B,)),
         tau=pick(lu(ks[10], sp["tau_lo"], sp["tau_hi"]), 20.0),
         sd=pick(un(ks[11], sp["sd_lo"], sp["sd_hi"]), 0.15),
-        stim=pick(0.3 * (u(ks[12]) < sp["stim_p"]), 0.0),
+        stim=pick(stim, 0.0), stim_t=un(kst[1], sp["stim_tlo"], sp["stim_thi"]),
         delay=jnp.where(nom, 0, delay),
         gamma=pick(lu(ks[13], sp["gamma_lo"], sp["gamma_hi"]), GAMMA),
         e0=pick(un(ks[14], sp["e0_lo"], sp["e0_hi"]), E0),
@@ -207,7 +226,7 @@ class Plant:
 
     def logc50(self, k=None):
         k = self.k if k is None else k
-        return self.p["mu"] + self.ou + self.p["stim"] * (k * DT > 20.0)
+        return self.p["mu"] + self.ou + self.p["stim"] * (k * DT > self.p["stim_t"])
 
     def bis(self):
         return hill(self.x[:, 3], self.logc50(), self.p["gamma"], self.p["e0"], self.p["emax"], xp=np)

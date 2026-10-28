@@ -10,7 +10,7 @@ the same shape, and many small recurrences fill the GPU together.
 
 Configuration = optimization (opt, lr, phys_mult, ssm_mult, clip, omb1 = 1 - beta1, omb2 = 1 - beta2, wd, sched, warm, tc, floor, ema), loss
 weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design (q_theta, sy_scale, rho_lqr, q_x), plus the training setup
-(patient_clip, nominal_frac, max_delay, delay_ramp, batch). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
+(patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
 import math, os, pickle, time
 from functools import partial
@@ -25,6 +25,7 @@ import engine as E
 
 jax.config.update("jax_default_matmul_precision", "highest")    # every engine computes the same float32 function (no TF32 in raw JAX)
 try:
+    os.makedirs(os.path.join(E.CACHE, "jax", "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)   # XLA does not create it on a fresh cache
     jax.config.update("jax_compilation_cache_dir", os.path.join(E.CACHE, "jax"))
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 2.0)
 except Exception:                                                # pragma: no cover
@@ -46,11 +47,12 @@ SPACE = [
     ("q_theta", "log", 2e-4, 2e-2), ("sy_scale", "log", 0.5, 2.0), ("rho_lqr", "log", 1e-5, 1e-2), ("q_x", "log", 1e-5, 1e-3),
 ]
 PRIOR_KEYS = ("q_theta", "sy_scale", "rho_lqr", "q_x")
-SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512)
+SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="random")
 
-# the selected configuration (winner of the last large search): train.py's default
-SELECTED = dict(opt="adabelief", lr=8.8e-3, phys_mult=0.24, ssm_mult=0.30, clip=1.0, omb1=0.1, omb2=1e-3, wd=1e-2, sched="exp", warm=25,
-                tc=1538.0, floor=0.14, ema=0.98, w_low=0.87, rho_u=0.21, **P.ARCH_DEFAULTS, **SETUP)
+# the selected configuration (winner of the paper's search, runs/search_full: config 171): train.py's default
+SELECTED = dict(opt="nadamw", lr=7.38e-3, phys_mult=0.024, ssm_mult=0.954, clip=2.0, omb1=0.0538, omb2=8.17e-4, wd=1.55e-2, sched="wsd",
+                warm=100, tc=509.1, floor=1.15e-3, ema=0.99, w_low=4.75, rho_u=0.256, H=32, NS=16, L=3, head=64, n_extra=8,
+                q_theta=2.87e-3, sy_scale=0.999, rho_lqr=1.64e-3, q_x=1.40e-4, **SETUP)
 # the search's starting point (trial 0 of a search; the old meta_opt DEFAULT_CFG)
 SEARCH_BASE = dict(opt="adam", lr=1e-3, phys_mult=0.1, ssm_mult=0.33, clip=1.0, omb1=0.1, omb2=1e-3, wd=1e-2, sched="const", warm=0,
                    tc=1000.0, floor=0.1, ema=0.99, w_low=2.0, rho_u=2.0, H=32, NS=32, L=1, head=0, n_extra=0,
@@ -169,13 +171,13 @@ def new_state(c, init_key):
 
 def train_spec(setup, it):
     dmax = jnp.minimum(setup["max_delay"], jnp.floor(setup["max_delay"] * it / max(setup["delay_ramp"], 1)))
-    return dict(M.TRAIN, dmax=dmax)
+    return dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax)
 
 
 def make_validate(n, stats_fn, scenarios=None, per_patient=False):
-    """validation of a population on n new patients per scenario (default: model.VAL), the same patients for every member.
+    """validation of a population on n new patients per scenario (default: model.val_specs()), the same patients for every member.
     stats_fn(tp, sz, pts) -> per-patient (J, viol) of one member. Returns validate(tp, sz, key) -> per member {scenario: {J, viol}}"""
-    scen = scenarios or {k: v[0] for k, v in M.VAL.items()}
+    scen = scenarios or M.val_specs()
     names = list(scen)
     specs = {k: jnp.asarray([scen[s][k] for s in names], jnp.float32) for k in M.SPEC_NOMINAL}
 
@@ -199,9 +201,9 @@ def make_validate(n, stats_fn, scenarios=None, per_patient=False):
     return validate
 
 
-def evaluate(models, n, key, per_patient=False):
+def evaluate(models, n, key, per_patient=False, stimulus="random"):
     """compact parameter trees (one network each, any sizes) on the validation scenarios, raw JAX forward; list of per-model stats"""
-    val = make_validate(n, E.forward_stats_fn({}), per_patient=per_patient)
+    val = make_validate(n, E.forward_stats_fn({}), M.val_specs(stimulus), per_patient=per_patient)
     out = []
     for p in models:
         tp, sz = P.expand(jax.tree_util.tree_map(jnp.asarray, p))
@@ -259,7 +261,7 @@ class Population:
         current one trains)"""
         K = self.block
         self._exe[K] = self._block_fn(K).lower(self.state, self.sz, self.hp, self.key, jnp.int32(self.it)).compile()
-        self._validate = make_validate(self.val_batch, self.stats_fn)
+        self._validate = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
         self._validate.compile(self.state["ema"], self.sz, VAL_KEY)
 
     def _block_fn(self, K):
@@ -303,7 +305,7 @@ class Population:
     def validate(self, key, which="ema"):
         """per member: (stats per scenario, score)"""
         if self._validate is None:
-            self._validate = make_validate(self.val_batch, self.stats_fn)
+            self._validate = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
         return [(st, M.score(st)) for st in self._validate(self.state[which], self.sz, key)]
 
     def member_states(self):

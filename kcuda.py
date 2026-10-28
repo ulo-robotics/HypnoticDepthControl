@@ -85,7 +85,7 @@ def pack_kp(kp):
 
 def pack_q(q):
     cols = [q[k][:, None] for k in ("mu", "a_ou", "osc", "stim", "gamma", "e0", "emax")] + [q["dmask"]]
-    cols += [q[f"A{i}"][:, None] for i in range(16)] + [q[f"B{i}"][:, None] for i in range(4)]
+    cols += [q[f"A{i}"][:, None] for i in range(16)] + [q[f"B{i}"][:, None] for i in range(4)] + [q["stim_t"][:, None]]
     return jnp.concatenate(cols, 1).astype(jnp.float32)
 
 
