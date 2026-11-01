@@ -197,7 +197,7 @@ def _chunk(tp, n):
 
 # ---------------------------------------------------------------- selection
 def _time(f, *a, reps=3, warm=1.0):
-    """best of reps calls after at least warm s of calls (the GPU clocks ramp up over about a second: an early candidate timed cold loses)"""
+    """best of reps calls after at least warm s of calls (the GPU clocks ramp up over a few seconds: a candidate timed cold loses)"""
     t0 = time.perf_counter()
     jax.block_until_ready(f(*a))
     while time.perf_counter() - t0 < warm:
@@ -385,7 +385,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
                             need, free = _need(e), _free()
                             if need is not None and free is not None and need > FIT * free:
                                 raise RuntimeError(f"needs {need / 2**30:.2f} GiB of {free / 2**30:.2f} GiB free: not run")
-                            times[(id(f_), id(a_))] = (_time(e, tp, sz, chk, w_low, rho_u), f_, a_)
+                            times[(id(f_), id(a_))] = (_time(e, tp, sz, chk, w_low, rho_u, reps=5, warm=3.0), f_, a_)
                             log(f"[engine] whole gradient, forward {f_[0]} {f_[1]} + assembly {a_[0]} {a_[1]}: "
                                 f"{1000 * times[(id(f_), id(a_))][0]:.1f} ms")
                         except Exception as err:

@@ -13,7 +13,7 @@ weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design 
 (patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
 import json, math, os, pickle, threading, time
-from functools import partial
+from functools import partial, reduce
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -131,24 +131,26 @@ def opt_update(names, ost, g, params, hp, it):
 
 # ---------------------------------------------------------------- per-patient clipping
 def aggregate(g, k):
-    """per-patient gradients (leading axis B) -> clipped mean. Non-finite patients are dropped. Returns (gradient, clipped share)"""
+    """per-patient gradients (leading axis B) -> clipped mean. Non-finite patients are dropped. Returns (gradient, clipped share).
+    Two passes over the gradients: per patient finiteness and squared norm (sibling reductions, one fused pass per leaf), then the weighted
+    sum"""
     leaves, tdef = jax.tree_util.tree_flatten(g)
     B = leaves[0].shape[0]
-    flat = jnp.concatenate([x.reshape(B, -1) for x in leaves], 1)
-    fin = jnp.all(jnp.isfinite(flat), 1)
-    flat = jnp.where(fin[:, None], flat, 0.0)
-    amax = jnp.max(jnp.abs(flat), 1)
-    nrm = amax * jnp.sqrt(jnp.sum((flat / jnp.where(amax > 0, amax, 1.0)[:, None]) ** 2, 1))     # no float32 overflow
+    rows = [x.reshape(B, -1) for x in leaves]
+    fin = reduce(jnp.logical_and, [jnp.all(jnp.isfinite(x), 1) for x in rows])
+    z = [jnp.where(jnp.isfinite(x), x, 0.0) for x in rows]
+    ss = sum(jnp.sum(v ** 2, 1) for v in z)
+    sl = sum(jnp.sum((v * 2.0 ** -64) ** 2, 1) for v in z)          # same pass: the norm where the squares above overflow float32
+    nrm = jnp.where(jnp.isfinite(ss), jnp.sqrt(ss), jnp.sqrt(sl) * 2.0 ** 64)
     if k > 0:
         pos = fin & (nrm > 0)
         med = jnp.nanmedian(jnp.where(pos, nrm, jnp.nan))
         scale = jnp.where(pos, jnp.minimum(1.0, k * med / jnp.maximum(nrm, 1e-30)), 0.0)
         scale = jnp.where(jnp.isfinite(scale), scale, 0.0)
     else:
-        scale = fin.astype(flat.dtype)
-    out = jnp.sum(flat * scale[:, None], 0) / B
-    parts = jnp.split(out, np.cumsum([int(np.prod(x.shape[1:])) for x in leaves])[:-1])
-    return jax.tree_util.tree_unflatten(tdef, [p.reshape(x.shape[1:]) for p, x in zip(parts, leaves)]), jnp.mean(scale < 1.0)
+        scale = fin.astype(rows[0].dtype)
+    out = [jnp.sum(jnp.where(scale[:, None] > 0, x * scale[:, None], 0.0), 0) / B for x in rows]
+    return jax.tree_util.tree_unflatten(tdef, [o.reshape(x.shape[1:]) for o, x in zip(out, leaves)]), jnp.mean(scale < 1.0)
 
 
 # ---------------------------------------------------------------- states, validation
