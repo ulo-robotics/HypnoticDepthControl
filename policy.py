@@ -1,5 +1,5 @@
 """
-The v1 policy: a physics-initialized S4D controller, u = r * (u_lin + 10 * residual).
+The policy: a physics-initialized S4D controller, u = r * (u_lin + 10 * residual).
 
 u_lin     the "physics layer": a steady-state Kalman observer (PK + a random-walk C50 state) + LQR with a moving set-point, designed on the
           nominal patient and written in modal coordinates. Its 5 complex modes (a, b), input / measurement gains (Bu, Bw) and output (Cout)

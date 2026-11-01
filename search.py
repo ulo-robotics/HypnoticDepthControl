@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Meta-optimization of the v1 policy's training configuration (the procedure of the paper):
+Meta-optimization of the policy's training configuration (the procedure of the paper):
 
   1. prior screen    score --prior-screen prior designs (q_theta, sy_scale, rho_lqr, q_x) at iteration 0 (forward only: the untrained policy
                      IS the prior compensator) and keep the best --prior-keep share as the pool the trials draw their prior design from

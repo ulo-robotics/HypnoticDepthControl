@@ -50,7 +50,8 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
 | `engine.py` | choice of the gradient engine (below) |
 | `kstep.py` | the step in kernel form, the XLA reference sweeps, the shared gradient assembly |
 | `kpallas.py` | Pallas (Triton) sweeps |
-| `kcuda.py`, `cuda/sweep.cu` | CUDA sweeps, called through XLA FFI |
+| `kcuda.py`, `cuda/sweep.cu`, `cuda/asm.cu`, `cuda/s4grad.cu` | CUDA sweeps of one network, the CUDA gradient assembly and S4D-kernel gradients, called through XLA FFI |
+| `cbwd.py`, `cuda/cfwd.cu`, `cuda/cbwd.cu` | CUDA sweeps in the blocked layout for populations, and the backward that also writes the gradient tapes |
 | `export_cpp.py`, `cpp/lethe_infer.hpp` | C++ inference engine of the deployed controller and its model exporter |
 | `bench_infer.py`, `cpp/bench.cpp` | C++ vs JAX inference: step-by-step agreement and latency |
 | `selftest.py` | correctness checks |
@@ -84,13 +85,19 @@ Per-patient gradients through a 360-step closed loop are the whole cost of train
     FFT cross-correlation for the S4D kernels.
   - The two sweeps run on XLA scans (per step, or with the S4D blocked over T steps: one GEMM gives the state part of a block's outputs
     and the state is read and written once per block, which matters when the state is large), Pallas kernels or CUDA kernels.
+  - The blocked CUDA kernels (`cbwd.py`) keep that layout: a thread block holds 16-32 patients, the GLU and head matmuls run on tensor cores
+    across them, and the S4D state stays in global memory, touched once per T-step block. Their backward can also write the per-step
+    cotangents, so the assembly becomes GEMMs over the steps plus `cuda/s4grad.cu`, without replaying the steps (the `tapes` candidate,
+    which replaces the backward sweep). Other assemblies: the XLA one with `cuda/s4grad.cu`, and `cuda/asm.cu`.
 
 **How the engine is chosen.** For each shape (sizes, population size, batch), every sweep candidate is compiled, checked against the XLA
 reference on stable patients, and timed on the real batch. The forward and backward sweeps are chosen independently; anything that fails to
-compile or disagrees is never used. The Pallas and XLA sweeps run vmapped over a population; the CUDA sweeps serve a single unpadded network.
+compile or disagrees is never used. The Pallas, XLA and blocked CUDA sweeps run on populations; the `kcuda.py` sweeps serve a single unpadded
+network. Assemblies are checked against the XLA assembly per patient and parameter; a joint backward + assembly competes on the whole gradient.
 Raw JAX is used when no adjoint candidate works (it was slower than the adjoint path at every measured shape, and vmapped over a population it
 mostly does not fit in memory) and for runs too short to repay tuning. Decisions are cached in `~/.cache/pkpd_v1/engine.json`.
-`PKPD_ENGINE=raw|adjoint|pallas|cuda` forces a choice. All engines use exact float32 matmuls (no TF32), so they compute the same function.
+`PKPD_ENGINE=raw|adjoint|pallas|cuda|cblk` forces a choice. The XLA, Pallas and `kcuda.py` engines use exact float32 matmuls (no TF32); the
+blocked CUDA kernels use the 3xTF32 split on tensor cores (float32 accuracy up to rounding), so every engine computes the same function.
 
 Training speed of one configuration (`train.py`), batch 512, on an RTX 4000 Ada (milliseconds per iteration, including sampling,
 clipping and the optimizer step; measured before population training, with the same engines):
@@ -105,6 +112,14 @@ At that size, 6000 iterations take about 11 minutes. Tuning a new shape takes ab
 
 In the search, populations of 8 trials train at, per trial-iteration (everything included, measured in the full search): L3 H64 NS32
 (the largest shape of the space) 99-109 ms, L2 H64 NS32 75 ms; the paper's run needed 165 and 113 ms for these shapes.
+
+Per-patient gradient of a population of 8 networks of the selected configuration (H32 NS16 L3 head64), 512 patients, warm GPU, median:
+
+| | XLA sweeps + assembly with `cuda/s4grad.cu` | blocked CUDA forward + backward with tapes + tape assembly |
+|---|---|---|
+| forward sweep | 67 ms | 33 ms |
+| backward sweep | 110 ms | 65 ms (without tapes) |
+| whole gradient | 288 ms | 138 ms |
 
 ## Inference engine
 `cpp/lethe_infer.hpp` is the deployed controller as a single dependency-free C++17 header: load the file written by `export_cpp.py`, then
@@ -156,8 +171,8 @@ is resumable at population granularity, and every score is logged.
   - the mean of per-patient gradients equals the batch gradient.
 - **Adjoint engine.** Per-patient gradients equal raw autodiff to 1e-14 in float64. The Pallas and CUDA sweeps equal the XLA reference sweeps
   to float32 rounding (≤ 2e-5 relative) on every tape, including no-head, H < 32 and extra-physics-mode shapes.
-- **GPU engines.** `selftest.py` also checks every Pallas and CUDA sweep candidate against the XLA reference on the GPU, at three shapes
-  including the selected one.
+- **GPU engines.** `selftest.py` also checks every Pallas and CUDA sweep candidate and every GPU assembly (including the joint backward with
+  tapes) against the XLA references on the GPU, at three shapes including the selected one and on a padded population.
 - **Search.** A smoke search (`search.py --smoke`) runs end to end. Interrupted and resumed, it gives the identical winner and test score.
 - **UKF-MM.** With one observer of delay 0 and fixed noise, it equals UKF+LQR exactly (`selftest.py`).
 - **Inference.** The C++ engine reproduces the JAX policy's actions to float32 rounding.

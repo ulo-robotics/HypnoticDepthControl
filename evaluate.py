@@ -2,15 +2,15 @@
 """
 Evaluate a trained policy against the baselines on the SAME fresh patients (a key never used in training or validation).
 
-  python evaluate.py runs/v1/best_model.pkl                       # validation scenarios, 1000 patients each
-  python evaluate.py runs/v1/best_model.pkl --stress --n 2000     # + the out-of-distribution stress scenarios
-  python evaluate.py runs/v1/best_model.pkl --prior --plot        # + the untrained policy, + a figure of BIS / infusion quantiles
+  python evaluate.py runs/train/best_model.pkl                       # validation scenarios, 1000 patients each
+  python evaluate.py runs/train/best_model.pkl --stress --n 2000     # + the out-of-distribution stress scenarios
+  python evaluate.py runs/train/best_model.pkl --prior --plot        # + the untrained policy, + a figure of BIS / infusion quantiles
   python evaluate.py runs/ft/best_model.pkl --extra winner=runs/search/best_model.pkl --stim-times 10,15,20,25
                                                                    # + another model; + a stimulus of 0.3 at each of these times (min)
 
 The policy runs in the JAX closed loop, the baselines on the numpy plant (both checked equal by selftest.py). Prints, per scenario, the mean
 J of every controller and the paired difference policy - baseline (95% CI, share of patients where the policy is better). Writes
-<out>/results.json and per-patient metrics <out>/<scenario>.npz. Also accepts the best_model.pkl files of the old meta_opt runs (v1).
+<out>/results.json and per-patient metrics <out>/<scenario>.npz. Also accepts the best_model.pkl files of the old meta_opt runs.
 """
 import argparse, json, os, pickle, time
 import numpy as np

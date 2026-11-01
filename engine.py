@@ -6,9 +6,17 @@ or by the adjoint method of kstep.py, whose forward and backward sweeps each run
                                                                          blocked over T steps (state traffic once per block)
   pallas   Pallas / Triton kernels (kpallas.py)                          GPU; some sizes do not fit (shared memory)
   cuda     hand-written CUDA kernels via XLA FFI (kcuda.py)              GPU + nvcc; one unpadded network (train.py)
+  cblk     CUDA kernels in the blocked layout (cbwd.py: cuda/cfwd.cu,    GPU + nvcc; populations, masked and plain layouts
+           cuda/cbwd.cu): PB patients per thread block, GLU / head on tensor cores, S4D state touched once per T-step block
+and the gradient assembly on one of
+  xla      kstep.assemble (replayed steps' VJP; S4D kernels by FFT cross-correlation)      always available, the reference
+  xla+s4   the same with the S4D-kernel gradients from cuda/s4grad.cu                     GPU + nvcc
+  cuda     cuda/asm.cu (fused step VJP) + batched GEMMs + cuda/s4grad.cu (kcuda.assemble)  GPU + nvcc; masked and plain layouts
+  tapes    joint backward + assembly (cbwd.grads): the cuda/cbwd.cu backward also writes the per-step cotangents, so the assembly is GEMMs and
+           cuda/s4grad.cu without replaying the steps; replaces the backward sweep (chosen when forward + joint < forward + backward + assembly)
 Selection per shape (padded sizes, members, batch, device): every candidate is compiled, checked against the XLA reference on stable (nominal)
-patients and timed on the real batch; the forward and the backward sweep are chosen independently. A candidate that fails to compile or
-disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the adjoint path at
+patients and timed on the real batch; the forward sweep, the backward sweep and the assembly are chosen independently. A candidate that fails
+to compile or disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the adjoint path at
 every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
 Decisions are cached in $PKPD_CACHE/engine.json.
 
@@ -32,12 +40,16 @@ TOL = 1e-3                       # relative tolerance of a candidate's tapes vs 
 XLA_CANDS = [dict(T=10), dict(T=20)]
 PALLAS_CANDS = [dict(kb=16, nw=4, lazy=False), dict(kb=16, nw=8, lazy=False), dict(kb=16, nw=8, lazy=True)]
 CUDA_CANDS = [dict(wpb=1, stage=0), dict(wpb=4, stage=0), dict(wpb=8, stage=1), dict(wpb=16, stage=1)]
+ASM_CUDA_CANDS = [dict(wpb=1, nseg=12), dict(wpb=2, nseg=12), dict(wpb=4, nseg=24)]
+CBLK_CANDS = [dict(T=5, pb=32, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)]
+TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)]
 
 
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("kstep.py", "kpallas.py", "kcuda.py", "cuda/sweep.cu", "policy.py", "model.py", "engine.py"):
+    for f in ("kstep.py", "kpallas.py", "kcuda.py", "cbwd.py", "cuda/sweep.cu", "cuda/asm.cu", "cuda/s4grad.cu", "cuda/cbwd.cu", "cuda/cfwd.cu",
+              "policy.py", "model.py", "engine.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):
             h.update(open(p, "rb").read())
@@ -87,6 +99,9 @@ def sweep_fns(kind, opt):
     if kind == "cuda":
         import kcuda
         return partial(kcuda.forward, **opt), partial(kcuda.backward, **opt)
+    if kind == "cblk":
+        import cbwd
+        return partial(cbwd.forward, **opt), partial(cbwd.backward, **opt)
     raise ValueError(kind)
 
 
@@ -105,9 +120,43 @@ def candidates(B, n=1, plain=None, only=None):
             import kcuda
             if n == 1 and plain is not None and kcuda.available():
                 out += [("cuda", o) for o in CUDA_CANDS if B % o["wpb"] == 0]
+            if kcuda.available():
+                out += [("cblk", o) for o in CBLK_CANDS if B % o["pb"] == 0]
         except Exception:
             pass
     return [c for c in out if only is None or c[0] in (only, "xla")]
+
+
+def asm_candidates():
+    out = [("xla", {})]
+    if _gpu():
+        try:
+            import kcuda
+            if kcuda.available():
+                out += [("xla", dict(s4="cuda"))] + [("cuda", o) for o in ASM_CUDA_CANDS] + [("tapes", o) for o in TAPES_CANDS]
+        except Exception:
+            pass
+    return out
+
+
+def asm_fn(kind, opt):
+    """the gradient assembly: (tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk) -> per-patient gradients"""
+    if kind == "xla":
+        if opt.get("s4") == "cuda":
+            import kcuda
+            return partial(K.assemble, s4=kcuda.s4d_grads)
+        return K.assemble
+    if kind == "cuda":
+        import kcuda
+        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: kcuda.assemble(tp, sz, w, r, plain, q, st, ft, bt, None, **opt)
+    if kind == "tapes":                                  # joint: ignores bt (runs its own backward)
+        import cbwd
+        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: cbwd.grads(tp, sz, w, r, plain, q, st, ft, chunk=chunk, **opt)
+    raise ValueError(kind)
+
+
+def _no_backward(kp, q, st, ftape):
+    return {}
 
 
 # ---------------------------------------------------------------- gradient functions: (tp, sz, pts, w_low, rho_u) -> per-patient grads, loss, J
@@ -126,8 +175,8 @@ def population(fn, n):
     return pop_map(fn, n, (0, 0, None, 0, 0))
 
 
-def adjoint_fn(fwd, bwd, plain, chunk):
-    return partial(K.adjoint_grads, plain=plain, forward=fwd, backward=bwd, chunk=chunk)
+def adjoint_fn(fwd, bwd, plain, chunk, asm=None):
+    return partial(K.adjoint_grads, plain=plain, forward=fwd, backward=bwd, chunk=chunk, assembly=asm)
 
 
 def _chunk(tp, n):
@@ -152,6 +201,16 @@ def _rel(a, b):
     if not np.all(np.isfinite(a)):
         return float("inf")
     return float(np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1e-30))
+
+
+def _rel_tree(a, b):
+    """largest per-leaf relative error (each leaf against its own scale, floored at 1e-6 of the largest leaf)"""
+    la = [np.asarray(x, np.float64) for x in jax.tree_util.tree_leaves(a)]
+    lb = [np.asarray(x, np.float64) for x in jax.tree_util.tree_leaves(b)]
+    if not all(np.all(np.isfinite(x)) for x in la):
+        return float("inf")
+    top = max(float(np.max(np.abs(y))) for y in lb) + 1e-30
+    return max(float(np.max(np.abs(x - y))) / (float(np.max(np.abs(y))) + 1e-6 * top) for x, y in zip(la, lb))
 
 
 def _aot(fn, *args):
@@ -191,8 +250,11 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
             fwd, bwd = sweep_fns(kind, opt)
             jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
             jobs[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
-        asm = pop_map(lambda t, s, w, r, ft, bt: K.assemble(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0, 0, 0, 0, 0, 0))
-        jobs["asm"] = (asm, (tp, sz, w_low, rho_u, ft_shape, bt_shape))
+        acands = asm_candidates() if mode == "auto" else [("xla", {})]
+        for kind, opt in acands:
+            af = asm_fn(kind, opt)
+            jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
+                                              (tp, sz, w_low, rho_u, ft_shape, bt_shape))
         with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
             fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
             exe = {}
@@ -238,21 +300,42 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         if res:
             fb = min(res, key=lambda x: x[2][0])
             bb = min(res, key=lambda x: x[2][1])
-            try:
-                t_asm, _ = timed("asm", tp, sz, w_low, rho_u, ft, bt)
-                rec = dict(engine="adjoint", fwd=[fb[0], fb[1]], bwd=[bb[0], bb[1]], fwd_ms=1000 * fb[2][0], bwd_ms=1000 * bb[2][1],
-                           assemble_ms=1000 * t_asm, total_ms=1000 * (fb[2][0] + bb[2][1] + t_asm))
-            except Exception as e:
-                log(f"[engine] gradient assembly unavailable ({type(e).__name__}: {str(e).splitlines()[0][:100]}): raw JAX")
+            ares, g_ref = [], None
+            for kind, opt in acands:
+                try:
+                    ta, g = timed(("asm", kind, repr(opt)), tp, sz, w_low, rho_u, ft, bt)
+                except Exception as e:
+                    log(f"[engine] assembly {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
+                    continue
+                if g_ref is None:
+                    if kind != "xla" or opt:
+                        break                                  # no reference: nothing else is trusted
+                    g_ref = g
+                err = _rel_tree(g, g_ref)
+                if not err < TOL:
+                    log(f"[engine] assembly {kind} {opt}: REJECTED (error vs reference {err:.1e})")
+                    continue
+                log(f"[engine] assembly {kind} {opt}: {1000 * ta:.1f} ms (error {err:.1e})")
+                ares.append((kind, opt, ta))
+            if ares:                                       # a joint candidate includes its backward: compare whole gradients
+                total = lambda x: fb[2][0] + x[2] + (0.0 if x[0] == "tapes" else bb[2][1])
+                ab = min(ares, key=total)
+                joint = ab[0] == "tapes"
+                rec = dict(engine="adjoint", fwd=[fb[0], fb[1]], bwd=(["joint", {}] if joint else [bb[0], bb[1]]), asm=[ab[0], ab[1]],
+                           fwd_ms=1000 * fb[2][0], bwd_ms=0.0 if joint else 1000 * bb[2][1], assemble_ms=1000 * ab[2], total_ms=1000 * total(ab))
+            else:
+                log("[engine] gradient assembly unavailable: raw JAX")
         rec["tune_s"] = time.perf_counter() - t0
         rec["compile_s"] = t_compile
         _save(sig, rec)
     if rec["engine"] == "raw":
         log("[engine] using raw JAX")
         return raw, rec
-    log(f"[engine] using adjoint: forward {rec['fwd'][0]} {rec['fwd'][1]}, backward {rec['bwd'][0]} {rec['bwd'][1]}: "
+    a = rec.get("asm", ["xla", {}])
+    log(f"[engine] using adjoint: forward {rec['fwd'][0]} {rec['fwd'][1]}, backward {rec['bwd'][0]} {rec['bwd'][1]}, assembly {a[0]} {a[1]}: "
         f"{rec['total_ms']:.0f} ms per gradient (tuning {rec['tune_s']:.0f} s)")
-    return population(adjoint_fn(sweep_fns(*rec["fwd"])[0], sweep_fns(*rec["bwd"])[1], plain, chunk), n), rec
+    bwd = _no_backward if rec["bwd"][0] == "joint" else sweep_fns(*rec["bwd"])[1]
+    return population(adjoint_fn(sweep_fns(*rec["fwd"])[0], bwd, plain, chunk, asm_fn(*a)), n), rec
 
 
 def forward_stats_fn(rec, plain=None):

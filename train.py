@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Train the v1 policy (one configuration) with pathwise gradients through the differentiable closed loop.
+Train the policy (one configuration) with pathwise gradients through the differentiable closed loop.
 
 Every iteration draws a fresh batch of patients from model.TRAIN (a share of them exactly nominal; the monitor-delay range ramps up over the
 first iterations), computes one gradient per patient (engine.py: the fastest verified engine, raw JAX as the fallback), clips every patient's
@@ -9,8 +9,8 @@ scales and the rest). An EMA of the weights is validated every --eval-every iter
 best EMA snapshot is written to <out>/best_model.pkl (compact layout). The run is a trainer.Population of one: the same program as a trial
 of search.py.
 
-  python train.py --out runs/v1                       # defaults = the selected configuration (trainer.SELECTED)
-  python train.py --out runs/v1 --resume              # continue after an interruption
+  python train.py --out runs/train                       # defaults = the selected configuration (trainer.SELECTED)
+  python train.py --out runs/train --resume              # continue after an interruption
   python train.py --out runs/smoke --iters 30 --batch 64 --val-batch 128 --eval-every 10 --H 16 --L 1 --head 0   # quick check
   PKPD_ENGINE=raw python train.py ...                 # force raw JAX autodiff (see engine.py)
 """
