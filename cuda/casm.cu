@@ -1,8 +1,9 @@
 // casm.cu -- the tape assembly (cbwd.assemble_tapes) as one CUDA kernel: per patient, one pass over the gradient tapes that cuda/cbwd.cu writes.
 // It gives the per-patient gradients of the GLU and head matrices (sums over the steps of activation x cotangent outer products), the GLU
 // biases and D, and the two moments of every S4D mode (cuda/s4grad.cu's P = sum_k cy_k s_k and P' = sum_k cy_k d_k with s_k = dA s_(k-1) + u_k,
-// d_k = dA d_(k-1) + s_(k-1)). Thread block = (patient, member, mode slice): the steps are streamed through shared memory in chunks of CK, so
-// every tape is read from memory once; slice 0 also accumulates the matrices and sums, every slice a share of the modes (RM per thread).
+// d_k = dA d_(k-1) + s_(k-1)). Thread block = (mode slice, patient, member): the steps are streamed through shared memory in chunks of CK, so
+// every tape is read from memory once (a patient's slices run together and share t_x in L2); slice 0 also accumulates the matrices and sums,
+// every slice a share of the modes (RM per thread).
 // Compile-time configuration: cfg.h (cbwd.py).
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -31,7 +32,7 @@ __global__ void __launch_bounds__(NT) casm_kernel(Args A, int B) {
   float* SA = SX + CK * WX;                     // [LP][3][CK][HP] a, dzv, dzg
   float* SE = SA + LP * 3 * CK * HP;            // [CK][HP]       trunk output xe
   float* SD = SE + CK * HP;                     // [CK][HDP]      head pre-activation cotangent
-  const int t = threadIdx.x, b = blockIdx.x, g = blockIdx.y, slice = blockIdx.z;
+  const int t = threadIdx.x, slice = blockIdx.x, b = blockIdx.y, g = blockIdx.z;       // a patient's slices adjacent: t_x shared in L2
   const size_t gb = (size_t)g * B + b;
   const bool mats = slice == 0;
 
@@ -225,7 +226,7 @@ static ffi::Error Impl(cudaStream_t stream, ffi::RemainingArgs args, ffi::Remain
     cudaFuncSetAttribute(casm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     attr = true;
   }
-  dim3 grid(B, G, MS);
+  dim3 grid(MS, B, G);
   casm_kernel<<<grid, NT, smem, stream>>>(A, B);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));

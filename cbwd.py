@@ -34,7 +34,7 @@ def dims(kp):
 
 def smem_bytes(d, pb):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
-    lds = max(2 * H, HDP)
+    lds = max(2 * H, HDP) + 4
     nv = 7 + 5 * L
     return 4 * (3 * L * pb * H + L * pb * 2 + 3 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
 
@@ -53,6 +53,21 @@ def nsm(d):
 
 
 # ---------------------------------------------------------------- inputs (one network; under vmap every input gets the member axis)
+MM_WEIGHTS = ("head_W1", "W1T", "L_Wv", "L_Wg", "L_WvT", "L_WgT")      # the kernels' tensor-core operands: passed as TF32 hi / lo parts
+
+
+def tf32_rna(x):
+    """x rounded to TF32 (10 mantissa bits) as cvt.rna.tf32.f32: to nearest, ties away from zero"""
+    u = lax.bitcast_convert_type(x, jnp.uint32)
+    return lax.bitcast_convert_type((u + jnp.uint32(0x1000)) & jnp.uint32(0xFFFFE000), jnp.float32)
+
+
+def tf32_split(w):
+    """w ~ hi + lo, both TF32 (the 3xTF32 operand split, done once instead of per step)"""
+    hi = tf32_rna(w)
+    return hi, tf32_rna(w - hi)
+
+
 def pack_q(q):
     B = q["mu"].shape[0]
     cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc")]
@@ -83,11 +98,10 @@ def inputs(kp, q, st, ftape, T, tapes=True):
     ins["L_WgT"] = jnp.swapaxes(ins["L_Wg"], 1, 2)
     ins["q_c"] = pack_q(q)
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho")])
-    bm = [K.block_mats(lp, T) for lp in ly]
-    tr = lambda w: jnp.transpose(w, (2, 1, 0))                          # (H, NS, T) -> (T, NS, H): channels fastest
-    ins["b_K"] = jnp.stack([m["K"].T for m in bm])
-    ins["b_W"] = jnp.stack([jnp.stack([tr(jnp.real(m["Wb"])), tr(jnp.imag(m["Wb"])), tr(jnp.real(m["Wu"])), tr(jnp.imag(m["Wu"]))]) for m in bm])
-    ins["b_AT"] = jnp.stack([jnp.stack([jnp.real(m["AT"]).T, jnp.imag(m["AT"]).T]) for m in bm])
+    ins["b_K"] = jnp.stack([K.block_mats(lp, T)["K"].T for lp in ly])
+    ins["b_S4"] = jnp.stack([jnp.stack([lp[k].T for k in ("Ar", "Ai", "Br", "Bi", "Cr", "Ci")]) for lp in ly])    # (L, 6, NS, H): channels fastest
+    for k in [k for k in MM_WEIGHTS if k in ins]:
+        ins[k], ins[k + "_lo"] = tf32_split(jnp.asarray(ins[k], jnp.float32))
     if tapes:                                                            # the forward kernel's native tapes when there (no repacking)
         ins["c_tape"] = ftape["packed"] if "packed" in ftape else KC.pack_tape(ftape["c"])
         ins["t_ys"] = ftape["ys_all"] if "ys_all" in ftape else jnp.stack(ftape["ys"])
@@ -137,6 +151,8 @@ def _build(header, src_path=SRC, symbol="CbwdHandler", prefix="cbwd"):
                    "-I" + jax.ffi.include_dir(), "-include", hf, src_path, "-o", f"{so}.{os.getpid()}.tmp"]
             if os.environ.get("CBWD_VERBOSE"):
                 cmd += ["-Xptxas", "-v"]
+            if os.environ.get("CBWD_LINEINFO"):
+                cmd += ["-lineinfo"]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode != 0:
                 raise RuntimeError(f"nvcc failed:\n{res.stderr[-4000:]}")
@@ -174,7 +190,7 @@ def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, la
 # ---------------------------------------------------------------- the forward sweep (cuda/cfwd.cu, blocked S4D)
 def smem_fwd(d, pb, T):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
-    return 4 * (3 * pb * max(2 * H, HDP) + (7 + 6 * L) * H + 2 * HDP + 8 * PP + L * T * H + pb * NQ)
+    return 4 * (3 * pb * (max(2 * H, HDP) + 4) + (7 + 6 * L) * H + 2 * HDP + 8 * PP + L * T * H + pb * NQ)
 
 
 def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
@@ -182,12 +198,12 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
     d = dims(kp)
     B = q["mu"].shape[0]
     lanes = lanes or default_lanes(d["H"])
-    if not (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024 and M.N % T == 0
-            and smem_fwd(d, pb, T) <= SMEM_MAX):
+    if not (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and pb % 8 == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024
+            and M.N % T == 0 and smem_fwd(d, pb, T) <= SMEM_MAX):
         raise ValueError(f"cfwd: pb={pb} lanes={lanes} T={T} not valid for {d}")
     full = inputs(kp, q, st, dict(c=None, ys=None), T, tapes=False)
     ins = {k: full[k] for k in ("sc", "gl", "mH", "enc_b", "encW", "dec_lin", "head_W1", "head_b1", "head_dec", "p5", "L_vec", "L_Wv", "L_Wg",
-                                "q_c", "b_K", "b_W", "b_AT") if k in full}
+                                "q_c", "b_K", "b_S4", "L_Wv_lo", "L_Wg_lo", "head_W1_lo") if k in full}
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1")]).astype(jnp.float32)
     N, L, H, NS = M.N, d["L"], d["H"], d["NS"]
     outs = dict(tape=(N, B, 6 + 2 * d["PP"] + K.DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))

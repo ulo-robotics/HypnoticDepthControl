@@ -21,7 +21,7 @@ namespace ffi = xla::ffi;
 #define CHD ((HDP + LANES - 1) / LANES)
 #define CP5 ((P5P + LANES - 1) / LANES)
 #define FULL 0xffffffffu
-#define LDS ((2 * HP) > HDP ? (2 * HP) : HDP)
+#define LDS (((2 * HP) > HDP ? (2 * HP) : HDP) + 4)                // (+ 4: rows on distinct banks)
 #define S_TAPE (6 + 2 * P5P + DPAD)
 #define DPL ((DPAD + LANES - 1) / LANES)                      // delay-line entries per lane: entry lane + LANES j
 
@@ -55,8 +55,8 @@ __device__ __forceinline__ void gelu_d(float x, float& y, float& d) {
 
 // Y[p][n] = sum_k X[p][k] W[k][n] (+ sum_k X2[p][k] W2[k][n]) + bias[n]; X = hi + lo staged in shared memory (row length LDS), W global.
 template <int KD, int KD2, int ND>
-__device__ __forceinline__ void mm(const float* X, const float* XL, const float* __restrict__ W, const float* X2, const float* XL2, const float* __restrict__ W2,
-                                   const float* __restrict__ bias, float* Y) {
+__device__ __forceinline__ void mm(const float* X, const float* XL, const float* __restrict__ W, const float* __restrict__ WL, const float* X2,
+                                   const float* XL2, const float* __restrict__ W2, const float* __restrict__ WL2, const float* __restrict__ bias, float* Y) {
   const int t = threadIdx.x;
   if constexpr (ND >= LANES) {
     constexpr int OPT = ND / LANES;
@@ -73,7 +73,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
     for (int k = 0; k < KD; k++) {
       float w[TN];
 #pragma unroll
-      for (int c = 0; c < TN; c++) w[c] = __ldg(W + k * ND + nt + c * NCT);
+      for (int c = 0; c < TN; c++) w[c] = (__ldg(W + k * ND + nt + c * NCT) + __ldg(WL + k * ND + nt + c * NCT));
 #pragma unroll
       for (int a = 0; a < TP; a++) {
         const float x = X[(pt * TP + a) * LDS + k] + XL[(pt * TP + a) * LDS + k];
@@ -86,7 +86,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
       for (int k = 0; k < KD2; k++) {
         float w[TN];
 #pragma unroll
-        for (int c = 0; c < TN; c++) w[c] = __ldg(W2 + k * ND + nt + c * NCT);
+        for (int c = 0; c < TN; c++) w[c] = (__ldg(W2 + k * ND + nt + c * NCT) + __ldg(WL2 + k * ND + nt + c * NCT));
 #pragma unroll
         for (int a = 0; a < TP; a++) {
           const float x = X2[(pt * TP + a) * LDS + k] + XL2[(pt * TP + a) * LDS + k];
@@ -103,55 +103,58 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
     for (int o = t; o < PB * ND; o += NT) {
       const int p = o / ND, n = o % ND;
       float s = bias ? __ldg(bias + n) : 0.f;
-      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k] + XL[p * LDS + k], __ldg(W + k * ND + n), s);
-      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k] + XL2[p * LDS + k], __ldg(W2 + k * ND + n), s);
+      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k] + XL[p * LDS + k], __ldg(W + k * ND + n) + __ldg(WL + k * ND + n), s);
+      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k] + XL2[p * LDS + k], __ldg(W2 + k * ND + n) + __ldg(WL2 + k * ND + n), s);
       Y[p * LDS + n] = s;
     }
   }
 }
 
-// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32); rows = the block's patients (padded to 16), one warp per 16 x 8 tile
+// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32), transposed: the weights are the 16-row A operand (W = hi + lo, split by
+// cbwd.py), the block's patients the 8 columns of B (X = hi + lo staged in shared memory); one warp per 16 channels x 8 patients
 __device__ __forceinline__ uint32_t tf32(float x) { uint32_t r; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x)); return r; }
 __device__ __forceinline__ void mma8(float d[4], const uint32_t a[4], const uint32_t b[2]) {
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 template <int KD>
-__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, int ND, int r0, int r1, bool v0, bool v1,
-                                     int c0, int gid, int tq) {
+__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, const float* __restrict__ WL, int ND,
+                                     int c0, int p0, int gid, int tq) {
 #pragma unroll 4
+  const bool up = ND % 16 == 0 || c0 + 8 < ND;                       // rows c0 + 8 .. c0 + 15 exist (ND = 8: zero)
   for (int k0 = 0; k0 < KD; k0 += 8) {
-    const int i0 = r0 * LDS + k0 + tq, i1 = r1 * LDS + k0 + tq;
-    uint32_t ah[4] = {v0 ? __float_as_uint(X[i0]) : 0u, v1 ? __float_as_uint(X[i1]) : 0u, v0 ? __float_as_uint(X[i0 + 4]) : 0u, v1 ? __float_as_uint(X[i1 + 4]) : 0u};
-    uint32_t al[4] = {v0 ? __float_as_uint(XL[i0]) : 0u, v1 ? __float_as_uint(XL[i1]) : 0u, v0 ? __float_as_uint(XL[i0 + 4]) : 0u, v1 ? __float_as_uint(XL[i1 + 4]) : 0u};
-    const int w0 = (k0 + tq) * ND + c0 + gid, w1 = w0 + 4 * ND;
-    const float bf0 = __ldg(W + w0), bf1 = __ldg(W + w1);
-    uint32_t bh[2] = {tf32(bf0), tf32(bf1)};
-    uint32_t bl[2] = {tf32(bf0 - __uint_as_float(bh[0])), tf32(bf1 - __uint_as_float(bh[1]))};
+    const int wa = (k0 + tq) * ND + c0 + gid, wb = wa + 4 * ND;
+    const uint32_t ah[4] = {__float_as_uint(__ldg(W + wa)), up ? __float_as_uint(__ldg(W + wa + 8)) : 0u, __float_as_uint(__ldg(W + wb)),
+                            up ? __float_as_uint(__ldg(W + wb + 8)) : 0u};
+    const uint32_t al[4] = {__float_as_uint(__ldg(WL + wa)), up ? __float_as_uint(__ldg(WL + wa + 8)) : 0u, __float_as_uint(__ldg(WL + wb)),
+                            up ? __float_as_uint(__ldg(WL + wb + 8)) : 0u};
+    const int xi = (p0 + gid) * LDS + k0 + tq;
+    const uint32_t bh[2] = {__float_as_uint(X[xi]), __float_as_uint(X[xi + 4])};
+    const uint32_t bl[2] = {__float_as_uint(XL[xi]), __float_as_uint(XL[xi + 4])};
     mma8(d, al, bh);
     mma8(d, ah, bl);
     mma8(d, ah, bh);
   }
 }
 template <int KD, int KD2, int ND>
-__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* W, const float* X2, const float* XL2, const float* W2,
-                                    const float* __restrict__ bias, float* Y) {
-  if constexpr (TC && ND % 8 == 0 && KD % 8 == 0 && KD2 % 8 == 0) {
+__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* W, const float* WL, const float* X2, const float* XL2, const float* W2,
+                                    const float* WL2, const float* __restrict__ bias, float* Y) {
+  if constexpr (TC && ND % 8 == 0 && KD % 8 == 0 && KD2 % 8 == 0 && PB % 8 == 0) {
     const int warp = threadIdx.x >> 5, ln = threadIdx.x & 31, gid = ln >> 2, tq = ln & 3;
-    constexpr int NTL = ND / 8;
-    constexpr int MT = (PB + 15) / 16;
-    for (int tile = warp; tile < MT * NTL; tile += NT / 32) {
-      const int r0 = (tile / NTL) * 16 + gid, c0 = (tile % NTL) * 8, r1 = r0 + 8;
-      const bool v0 = r0 < PB, v1 = r1 < PB;
-      const float b0 = bias ? __ldg(bias + c0 + 2 * tq) : 0.f, b1 = bias ? __ldg(bias + c0 + 2 * tq + 1) : 0.f;
-      float d[4] = {b0, b1, b0, b1};
-      tc_k<KD>(d, X, XL, W, ND, r0, r1, v0, v1, c0, gid, tq);
-      if constexpr (KD2 > 0) tc_k<KD2>(d, X2, XL2, W2, ND, r0, r1, v0, v1, c0, gid, tq);
-      if (v0) { Y[r0 * LDS + c0 + 2 * tq] = d[0]; Y[r0 * LDS + c0 + 2 * tq + 1] = d[1]; }
-      if (v1) { Y[r1 * LDS + c0 + 2 * tq] = d[2]; Y[r1 * LDS + c0 + 2 * tq + 1] = d[3]; }
+    constexpr int MTL = (ND + 15) / 16, PT = PB / 8;
+    for (int tile = warp; tile < MTL * PT; tile += NT / 32) {
+      const int c0 = (tile % MTL) * 16, p0 = (tile / MTL) * 8;
+      const bool up = ND % 16 == 0 || c0 + 8 < ND;
+      const float b0 = bias ? __ldg(bias + c0 + gid) : 0.f, b1 = bias && up ? __ldg(bias + c0 + gid + 8) : 0.f;
+      float d[4] = {b0, b0, b1, b1};
+      tc_k<KD>(d, X, XL, W, WL, ND, c0, p0, gid, tq);
+      if constexpr (KD2 > 0) tc_k<KD2>(d, X2, XL2, W2, WL2, ND, c0, p0, gid, tq);
+      const int y0 = (p0 + 2 * tq) * LDS + c0 + gid;
+      Y[y0] = d[0]; Y[y0 + LDS] = d[1];
+      if (up) { Y[y0 + 8] = d[2]; Y[y0 + LDS + 8] = d[3]; }
     }
   } else {
-    mm<KD, KD2, ND>(X, XL, W, X2, XL2, W2, bias, Y);
+    mm<KD, KD2, ND>(X, XL, W, WL, X2, XL2, W2, WL2, bias, Y);
   }
 }
 
@@ -335,8 +338,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         }
         __syncthreads();
         const size_t wo = ((size_t)g * LP + l) * HP * HP;
-        mmx<HP, 0, HP>(SX, SXL, INP(L_Wv) + wo, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY);
-        mmx<HP, 0, HP>(SX, SXL, INP(L_Wg) + wo, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
+        mmx<HP, 0, HP>(SX, SXL, INP(L_Wv) + wo, INP(L_Wv_lo) + wo, nullptr, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY);
+        mmx<HP, 0, HP>(SX, SXL, INP(L_Wg) + wo, INP(L_Wg_lo) + wo, nullptr, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
         __syncthreads();
         float v[CH], ps = 0.f;
 #pragma unroll
@@ -376,7 +379,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #if HEAD
       float hid[CHD], hgd[CHD];
       __syncthreads();
-      mmx<HP, 0, HDP>(SX, SXL, INP(head_W1) + (size_t)g * HP * HDP, nullptr, nullptr, nullptr, INP(head_b1) + g * HDP, SY);
+      mmx<HP, 0, HDP>(SX, SXL, INP(head_W1) + (size_t)g * HP * HDP, INP(head_W1_lo) + (size_t)g * HP * HDP, nullptr, nullptr, nullptr, nullptr, INP(head_b1) + g * HDP, SY);
       __syncthreads();
       float poh = 0.f;
 #pragma unroll
@@ -452,7 +455,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           }
         }
         __syncthreads();
-        mmx<HDP, 0, HP>(SX, SXL, INP(W1T) + (size_t)g * HDP * HP, nullptr, nullptr, nullptr, nullptr, SY);
+        mmx<HDP, 0, HP>(SX, SXL, INP(W1T) + (size_t)g * HDP * HP, INP(W1T_lo) + (size_t)g * HDP * HP, nullptr, nullptr, nullptr, nullptr, nullptr, SY);
         __syncthreads();
       }
 #endif
@@ -534,7 +537,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         }
         __syncthreads();
         const size_t wo = ((size_t)g * LP + l) * HP * HP;
-        mmx<HP, HP, HP>(SX, SXL, INP(L_WvT) + wo, SX + HP, SXL + HP, INP(L_WgT) + wo, nullptr, SY);
+        mmx<HP, HP, HP>(SX, SXL, INP(L_WvT) + wo, INP(L_WvT_lo) + wo, SX + HP, SXL + HP, INP(L_WgT) + wo, INP(L_WgT_lo) + wo, nullptr, SY);
         __syncthreads();
         // S4D (blocked adjoint): cot(u) += e + K0 cy,  e = F_i + sum_{j > i in the block} K[j - i] cy_j
         const float* Kl = INP(b_K) + ((size_t)g * LP + l) * TBLK * HP;
@@ -618,7 +621,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #pragma unroll
       for (int j = 0; j < CP5; j++) { cthr[j] = d_hpr[j] * fr; cthi[j] = d_hpi[j] * fr; }
     }
-    // ======== block boundary: lam <- conj(dA^T) lam + 2 sum_i cy_i conj(C dA^(i+1)); F_i <- Re sum_n conj(lam) dB dA^(T-1-i) ========
+    // ======== block boundary: lam <- conj(dA^T) lam + 2 sum_i cy_i conj(C dA^(i+1)); F_i <- Re sum_n conj(lam) dB dA^(T-1-i), both by
+    // Horner's rule on conj(dA) (the powers are not loaded) ========
 #pragma unroll
     for (int l = 0; l < LP; l++)
 #pragma unroll
@@ -631,21 +635,24 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         const size_t gl_ = (size_t)g * LP + l;
         for (int n = 0; n < NSP; n++) {
           const size_t so = (((gl_ * 2) * B + bb) * NSP + n) * HP + h, so2 = so + (size_t)B * NSP * HP;
-          const size_t ao = ((gl_ * 2) * NSP + n) * HP + h;
-          const float lr = OUT(s_l)[so], li = OUT(s_l)[so2];
-          const float Ar = LD(b_AT, ao), Ai = LD(b_AT, ao + NSP * HP);
-          float nr = Ar * lr + Ai * li, ni = Ar * li - Ai * lr;
+          const size_t ao = (gl_ * 6 * NSP + n) * HP + h, as = (size_t)NSP * HP;
+          const float Ar = LD(b_S4, ao), Ai = LD(b_S4, ao + as), Br = LD(b_S4, ao + 2 * as), Bi = LD(b_S4, ao + 3 * as),
+                      Cr = LD(b_S4, ao + 4 * as), Ci = LD(b_S4, ao + 5 * as);
+          float nr = OUT(s_l)[so], ni = OUT(s_l)[so2];
 #pragma unroll
-          for (int ii = 0; ii < TBLK; ii++) {
-            const size_t wo = (((gl_ * 4 + 0) * TBLK + ii) * NSP + n) * HP + h, ws = (size_t)TBLK * NSP * HP;
-            nr += cy[ii] * LD(b_W, wo);
-            ni -= cy[ii] * LD(b_W, wo + ws);
+          for (int ii = TBLK - 1; ii >= 0; ii--) {                       // (lam + cy_i conj(C)) conj(dA), i = T-1 .. 0
+            const float ar = nr + cy[ii] * Cr, ai = ni - cy[ii] * Ci;
+            nr = Ar * ar + Ai * ai;
+            ni = Ar * ai - Ai * ar;
           }
           OUT(s_l)[so] = nr; OUT(s_l)[so2] = ni;
+          float zr = nr * Br + ni * Bi, zi = nr * Bi - ni * Br;           // conj(lam) dB, then times dA per step back
 #pragma unroll
-          for (int ii = 0; ii < TBLK; ii++) {
-            const size_t wo = (((gl_ * 4 + 2) * TBLK + ii) * NSP + n) * HP + h, ws = (size_t)TBLK * NSP * HP;
-            F[ii] += nr * LD(b_W, wo) + ni * LD(b_W, wo + ws);
+          for (int ii = TBLK - 1; ii >= 0; ii--) {
+            F[ii] += zr;
+            const float tr = Ar * zr - Ai * zi;
+            zi = Ar * zi + Ai * zr;
+            zr = tr;
           }
         }
 #pragma unroll

@@ -42,13 +42,17 @@ TOL = 1e-3                       # relative tolerance of a candidate's tapes vs 
 FIT = 0.7                        # a candidate runs only if it needs less than this share of the free GPU memory: an execution that runs out of
                                  # memory leaks its allocation for the rest of the process (XLA runtime), and the free memory is fragmented
                                  # (an 8.4 GiB candidate failed with 11.7 GiB free)
+FINAL, NFINAL = 1.15, 2          # stage winners within this factor of the best (at most NFINAL each) are timed as whole gradients
 
 XLA_CANDS = [dict(T=10), dict(T=20)]
 PALLAS_CANDS = [dict(kb=16, nw=4, lazy=False), dict(kb=16, nw=8, lazy=False), dict(kb=16, nw=8, lazy=True)]
 CUDA_CANDS = [dict(wpb=1, stage=0), dict(wpb=4, stage=0), dict(wpb=8, stage=1), dict(wpb=16, stage=1)]
 ASM_CUDA_CANDS = [dict(wpb=1, nseg=12), dict(wpb=2, nseg=12), dict(wpb=4, nseg=24)]
-CBLK_CANDS = [dict(T=5, pb=32, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)]
-TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16), dict(T=10, pb=16, lanes=32, casm=True), dict(T=10, pb=32, lanes=16, casm=True)]
+CBLK_CANDS = [dict(T=10, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=10, pb=8, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=5, pb=32, lanes=16),
+              dict(T=10, pb=32, lanes=16)]                                   # 8 patients per block for the wide networks, more for the narrow
+TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)] + [dict(o, casm=True) for o in (
+    dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, pb=16, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=5, pb=32, lanes=16),
+    dict(T=10, pb=32, lanes=16))]
 
 
 def _code_hash():
@@ -192,8 +196,12 @@ def _chunk(tp, n):
 
 
 # ---------------------------------------------------------------- selection
-def _time(f, *a, reps=2):
+def _time(f, *a, reps=3, warm=1.0):
+    """best of reps calls after at least warm s of calls (the GPU clocks ramp up over about a second: an early candidate timed cold loses)"""
+    t0 = time.perf_counter()
     jax.block_until_ready(f(*a))
+    while time.perf_counter() - t0 < warm:
+        jax.block_until_ready(f(*a))
     best = float("inf")
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -361,14 +369,41 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
         if ares:                                       # a joint candidate includes its backward: compare whole gradients
             total = lambda x: fb[2][0] + x[2] + (0.0 if x[0] == "tapes" else bb[2][1])
             ab = min(ares, key=total)
+            fin_f = [x for x in sorted(res, key=lambda x: x[2][0]) if x[2][0] <= FINAL * fb[2][0]][:NFINAL]
+            fin_a = [x for x in sorted(ares, key=total) if total(x) <= FINAL * total(ab)][:NFINAL]
+            whole = None
+            if len(fin_f) * len(fin_a) > 1:            # the stages timed alone carry their own output copies: the finalists as whole gradients
+                ft = bt = g_ref = None
+                gc.collect()
+                times = {}
+                for f_ in fin_f:
+                    for a_ in fin_a:
+                        bwd = _no_backward if a_[0] == "tapes" else sweep_fns(bb[0], bb[1])[1]
+                        g = population(adjoint_fn(sweep_fns(f_[0], f_[1])[0], bwd, plain, chunk, asm_fn(a_[0], a_[1])), n)
+                        try:
+                            e = _aot(g, tp, sz, chk, w_low, rho_u)
+                            need, free = _need(e), _free()
+                            if need is not None and free is not None and need > FIT * free:
+                                raise RuntimeError(f"needs {need / 2**30:.2f} GiB of {free / 2**30:.2f} GiB free: not run")
+                            times[(id(f_), id(a_))] = (_time(e, tp, sz, chk, w_low, rho_u), f_, a_)
+                            log(f"[engine] whole gradient, forward {f_[0]} {f_[1]} + assembly {a_[0]} {a_[1]}: "
+                                f"{1000 * times[(id(f_), id(a_))][0]:.1f} ms")
+                        except Exception as err:
+                            log(f"[engine] whole gradient, forward {f_[0]} {f_[1]} + assembly {a_[0]} {a_[1]}: unavailable "
+                                f"({type(err).__name__}: {str(err).splitlines()[0][:110]})")
+                        e = None
+                        gc.collect()
+                if times:
+                    whole, fb, ab = min(times.values(), key=lambda x: x[0])
             joint = ab[0] == "tapes"
             rec = dict(engine="adjoint", fwd=[fb[0], fb[1]], bwd=(["joint", {}] if joint else [bb[0], bb[1]]), asm=[ab[0], ab[1]],
-                       fwd_ms=1000 * fb[2][0], bwd_ms=0.0 if joint else 1000 * bb[2][1], assemble_ms=1000 * ab[2], total_ms=1000 * total(ab))
+                       fwd_ms=1000 * fb[2][0], bwd_ms=0.0 if joint else 1000 * bb[2][1], assemble_ms=1000 * ab[2],
+                       total_ms=1000 * (total(ab) if whole is None else whole))
         else:
             log("[engine] gradient assembly unavailable: raw JAX")
     rec["tune_s"] = time.perf_counter() - t0
     rec["compile_s"] = t_compile
-    del exe, kp, ft, bt, res, timed
+    del exe, kp, ft, bt, res, timed, chk
     gc.collect()                                                    # every candidate's executable and outputs released before the next stage
     return rec
 
@@ -393,6 +428,9 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         only = None if mode == "auto" else ("xla" if mode == "adjoint" else mode)
         cands = candidates(B, n, plain, only)
         acands = asm_candidates() if mode == "auto" else [("xla", {})]
+        if any(x.dtype == np.float64 for x in jax.tree_util.tree_leaves(tp)):   # the CUDA kernels compute in float32
+            cands = [c for c in cands if c[0] not in ("cuda", "cblk")]
+            acands = [a for a in acands if a == ("xla", {})]
         tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log)
         prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
         if prev is not None and not full:                                      # the same shape at another population size

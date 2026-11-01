@@ -110,7 +110,7 @@ clipping and the optimizer step; measured before population training, with the s
 | 32 8 3 64 | 294 | 49 | 6.0× | CUDA, CUDA |
 | 64 8 3 64 (the earlier default) | 514 | 108 | 4.8× | CUDA, CUDA |
 
-At that size, 6000 iterations take about 11 minutes. Tuning a new shape takes about 1.5 minutes, once.
+At that size, 6000 iterations take about 11 minutes. Tuning a new shape takes about 3 minutes, once.
 
 In the search, populations of 8 trials train at, per trial-iteration (everything included, measured in the full search): L3 H64 NS32
 (the largest shape of the space) 99-109 ms, L2 H64 NS32 75 ms; the paper's run needed 165 and 113 ms for these shapes.
@@ -122,6 +122,18 @@ Per-patient gradient of a population of 8 networks of the selected configuration
 | forward sweep | 67 ms | 33 ms |
 | backward sweep | 110 ms | 65 ms (without tapes) |
 | whole gradient | 288 ms | 110 ms (with the assembly of `cuda/casm.cu`) |
+
+The blocked CUDA kernels at the search shapes (population of 8, padded like `search.py`, 512 patients, warm GPU, the engine's choice; the
+first column is the kernels before the block-end update by Horner's rule, 8-patient thread blocks, the transposed tensor-core tiles and the
+reordered assembly grid):
+
+| shape (L H NS) | before | now |
+|---|---|---|
+| 3 64 32 | 437 ms | 287 ms |
+| 2 64 32 | 245 ms | 162 ms |
+| 3 32 32 | 191 ms | 123 ms |
+| 3 32 16 | 145 ms | 107 ms |
+| 3 16 8 | 74 ms | 56 ms |
 
 ## Inference engine
 `cpp/lethe_infer.hpp` is the deployed controller as a single dependency-free C++17 header: load the file written by `export_cpp.py`, then
