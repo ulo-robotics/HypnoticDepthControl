@@ -13,16 +13,18 @@ and the gradient assembly on one of
   xla+s4   the same with the S4D-kernel gradients from cuda/s4grad.cu                     GPU + nvcc
   cuda     cuda/asm.cu (fused step VJP) + batched GEMMs + cuda/s4grad.cu (kcuda.assemble)  GPU + nvcc; masked and plain layouts
   tapes    joint backward + assembly (cbwd.grads): the cuda/cbwd.cu backward also writes the per-step cotangents, so the assembly is GEMMs and
-           cuda/s4grad.cu without replaying the steps; replaces the backward sweep (chosen when forward + joint < forward + backward + assembly)
+           cuda/s4grad.cu (or all of it in one pass over the tapes, cuda/casm.cu) without replaying the steps; replaces the backward sweep
+           (chosen when forward + joint < forward + backward + assembly)
 Selection per shape (padded sizes, members, batch, device): every candidate is compiled, checked against the XLA reference on stable (nominal)
 patients and timed on the real batch; the forward sweep, the backward sweep and the assembly are chosen independently. A candidate that fails
 to compile or disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the adjoint path at
 every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
 Decisions are cached in $PKPD_CACHE/engine.json.
 
-PKPD_ENGINE = auto (default) | raw | adjoint | pallas | cuda    (adjoint / pallas / cuda force that sweep backend; raw forces the fallback)
+PKPD_ENGINE = auto (default) | raw | adjoint | pallas | cuda | cblk   (adjoint / pallas / cuda / cblk force that sweep backend; raw forces
+the fallback). PKPD_TUNE=full tunes every candidate (default: a shape is tuned once, the preferred candidates first; see select).
 """
-import hashlib, json, os, time
+import hashlib, json, os, re, time
 from functools import partial
 import numpy as np
 import jax
@@ -42,13 +44,13 @@ PALLAS_CANDS = [dict(kb=16, nw=4, lazy=False), dict(kb=16, nw=8, lazy=False), di
 CUDA_CANDS = [dict(wpb=1, stage=0), dict(wpb=4, stage=0), dict(wpb=8, stage=1), dict(wpb=16, stage=1)]
 ASM_CUDA_CANDS = [dict(wpb=1, nseg=12), dict(wpb=2, nseg=12), dict(wpb=4, nseg=24)]
 CBLK_CANDS = [dict(T=5, pb=32, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)]
-TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)]
+TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16), dict(T=10, pb=16, lanes=32, casm=True), dict(T=10, pb=32, lanes=16, casm=True)]
 
 
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("kstep.py", "kpallas.py", "kcuda.py", "cbwd.py", "cuda/sweep.cu", "cuda/asm.cu", "cuda/s4grad.cu", "cuda/cbwd.cu", "cuda/cfwd.cu",
+    for f in ("kstep.py", "kpallas.py", "kcuda.py", "cbwd.py", "cuda/sweep.cu", "cuda/asm.cu", "cuda/s4grad.cu", "cuda/cbwd.cu", "cuda/cfwd.cu", "cuda/casm.cu",
               "policy.py", "model.py", "engine.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):
@@ -218,12 +220,121 @@ def _aot(fn, *args):
     return jax.jit(fn).lower(*args).compile()
 
 
+def _other_size(sig):
+    """a decision cached for the same shape at another population size (the sizes of a search share their engine)"""
+    size = lambda k: int(re.search(r"_x(\d+)_", k).group(1))
+    shape = lambda k: re.sub(r"_x\d+_", "_x_", k, count=1)
+    hits = [(k, v) for k, v in _load().items() if k != sig and shape(k) == shape(sig) and v.get("engine") == "adjoint"]
+    return max(hits, key=lambda kv: size(kv[0]))[1] if hits else None
+
+
+def _preferred(cands, acands):
+    """the candidates that won at every measured shape on CUDA GPUs (blocked CUDA sweeps, CUDA tape assembly), with the XLA references"""
+    c = [x for x in cands if x[0] == "cblk" or (x[0] == "xla" and not x[1])]
+    a = [x for x in acands if (x[0] == "tapes" and x[1].get("casm")) or (x[0] == "xla" and not x[1])]
+    return (c, a) if len(c) > 1 and len(a) > 1 else None
+
+
+def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
+    """compile every candidate (in parallel threads), check it against the XLA reference on stable (nominal) patients, time it with that same
+    executable (run time does not depend on the patients). Returns the decision record (engine raw when no adjoint path works)"""
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.perf_counter()
+    chk = M.sample_patients(jax.random.PRNGKey(4242), B, M.VAL["nominal"][0])
+    kp = pop_map(lambda t, s, w, r: K.to_kp(t, s, w, r, plain), n, (0, 0, 0, 0))(tp, sz, w_low, rho_u)
+    q, st = K.to_kq(chk)
+    sweeps = lambda f, tape: pop_map(lambda k_, t_=None: f(k_, q, st) if t_ is None else f(k_, q, st, t_), n, (0,) if tape is None else (0, 0))
+    ft_shape = jax.eval_shape(sweeps(K.xla_forward, None), kp)[0]
+    bt_shape = jax.eval_shape(sweeps(K.xla_backward, 1), kp, ft_shape)
+    jobs = {}
+    for kind, opt in cands:
+        fwd, bwd = sweep_fns(kind, opt)
+        jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
+        jobs[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
+    for kind, opt in acands:
+        af = asm_fn(kind, opt)
+        jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
+                                          (tp, sz, w_low, rho_u, ft_shape, bt_shape))
+    with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
+        fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
+        exe = {}
+        for k, f in fut.items():
+            try:
+                exe[k] = f.result()
+            except Exception as e:                                  # compile failure, resources, missing toolchain: not a candidate
+                exe[k] = e
+    t_compile = time.perf_counter() - t0
+
+    def timed(k, *a):
+        e = exe[k]
+        if isinstance(e, Exception):
+            raise e
+        return _time(e, *a), e(*a)
+
+    try:
+        _, (ft, s) = timed(("xla", "{}", "fwd"), kp)
+        _, bt = timed(("xla", "{}", "bwd"), kp, ft)
+    except Exception as e:
+        log(f"[engine] XLA reference sweeps unavailable ({type(e).__name__}): raw JAX")
+        ft = None
+    res = []
+    if ft is not None:
+        for kind, opt in cands:
+            try:
+                tf, (ft2, s2) = timed((kind, repr(opt), "fwd"), kp)
+                tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+            except Exception as e:
+                log(f"[engine] {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
+                continue
+            err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
+                        [_rel(s2["cost"], s["cost"])])
+            err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
+            if not (err_f < TOL and err_b < TOL):
+                log(f"[engine] {kind} {opt}: REJECTED (error vs reference fwd {err_f:.1e}, bwd {err_b:.1e})")
+                continue
+            log(f"[engine] {kind} {opt}: fwd {1000 * tf:.1f} ms, bwd {1000 * tb:.1f} ms (error fwd {err_f:.1e}, bwd {err_b:.1e})")
+            res.append((kind, opt, (tf, tb)))
+    if mode not in ("auto", "adjoint"):
+        res = [x for x in res if x[0] == mode] or res
+    rec = dict(engine="raw")
+    if res:
+        fb = min(res, key=lambda x: x[2][0])
+        bb = min(res, key=lambda x: x[2][1])
+        ares, g_ref = [], None
+        for kind, opt in acands:
+            try:
+                ta, g = timed(("asm", kind, repr(opt)), tp, sz, w_low, rho_u, ft, bt)
+            except Exception as e:
+                log(f"[engine] assembly {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
+                continue
+            if g_ref is None:
+                if kind != "xla" or opt:
+                    break                                  # no reference: nothing else is trusted
+                g_ref = g
+            err = _rel_tree(g, g_ref)
+            if not err < TOL:
+                log(f"[engine] assembly {kind} {opt}: REJECTED (error vs reference {err:.1e})")
+                continue
+            log(f"[engine] assembly {kind} {opt}: {1000 * ta:.1f} ms (error {err:.1e})")
+            ares.append((kind, opt, ta))
+        if ares:                                       # a joint candidate includes its backward: compare whole gradients
+            total = lambda x: fb[2][0] + x[2] + (0.0 if x[0] == "tapes" else bb[2][1])
+            ab = min(ares, key=total)
+            joint = ab[0] == "tapes"
+            rec = dict(engine="adjoint", fwd=[fb[0], fb[1]], bwd=(["joint", {}] if joint else [bb[0], bb[1]]), asm=[ab[0], ab[1]],
+                       fwd_ms=1000 * fb[2][0], bwd_ms=0.0 if joint else 1000 * bb[2][1], assemble_ms=1000 * ab[2], total_ms=1000 * total(ab))
+        else:
+            log("[engine] gradient assembly unavailable: raw JAX")
+    rec["tune_s"] = time.perf_counter() - t0
+    rec["compile_s"] = t_compile
+    return rec
+
+
 def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print):
     """choose the gradient implementation for a population (tp, sz, w_low, rho_u with a leading member axis) on batches of B patients.
     Returns (grad_fn(tp, sz, pts, w_low, rho_u) -> (per-patient grads (n, B, ...), loss (n, B), J (n, B)), description).
-    Every candidate sweep is compiled once, in parallel threads, then checked against the XLA reference on stable (nominal) patients and timed
-    with that same executable (run time does not depend on the patients)."""
-    from concurrent.futures import ThreadPoolExecutor
+    A shape is tuned once: another population size of the same shape re-checks (and re-times) only the choice made there. A new shape first
+    tries the candidates that won everywhere so far (_preferred) and tunes the full set only when none of them works (PKPD_TUNE=full: always)."""
     mode = (mode or os.environ.get("PKPD_ENGINE") or "auto").lower()
     n = jax.tree_util.tree_leaves(tp)[0].shape[0]
     raw = population(raw_grads, n)
@@ -236,97 +347,25 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         log(f"[engine] run too short to pay for tuning ({iters} its): raw JAX")
         return raw, dict(engine="raw", untuned=True)
     if rec is None:
-        t0 = time.perf_counter()
-        chk = M.sample_patients(jax.random.PRNGKey(4242), B, M.VAL["nominal"][0])
-        kp = pop_map(lambda t, s, w, r: K.to_kp(t, s, w, r, plain), n, (0, 0, 0, 0))(tp, sz, w_low, rho_u)
-        q, st = K.to_kq(chk)
-        sweeps = lambda f, tape: pop_map(lambda k_, t_=None: f(k_, q, st) if t_ is None else f(k_, q, st, t_), n, (0,) if tape is None else (0, 0))
-        ft_shape = jax.eval_shape(sweeps(K.xla_forward, None), kp)[0]
-        bt_shape = jax.eval_shape(sweeps(K.xla_backward, 1), kp, ft_shape)
         only = None if mode == "auto" else ("xla" if mode == "adjoint" else mode)
         cands = candidates(B, n, plain, only)
-        jobs = {}
-        for kind, opt in cands:
-            fwd, bwd = sweep_fns(kind, opt)
-            jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
-            jobs[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
         acands = asm_candidates() if mode == "auto" else [("xla", {})]
-        for kind, opt in acands:
-            af = asm_fn(kind, opt)
-            jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
-                                              (tp, sz, w_low, rho_u, ft_shape, bt_shape))
-        with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
-            fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
-            exe = {}
-            for k, f in fut.items():
-                try:
-                    exe[k] = f.result()
-                except Exception as e:                                  # compile failure, resources, missing toolchain: not a candidate
-                    exe[k] = e
-        t_compile = time.perf_counter() - t0
-
-        def timed(k, *a):
-            e = exe[k]
-            if isinstance(e, Exception):
-                raise e
-            return _time(e, *a), e(*a)
-
-        try:
-            _, (ft, s) = timed(("xla", "{}", "fwd"), kp)
-            _, bt = timed(("xla", "{}", "bwd"), kp, ft)
-        except Exception as e:
-            log(f"[engine] XLA reference sweeps unavailable ({type(e).__name__}): raw JAX")
-            ft = None
-        res = []
-        if ft is not None:
-            for kind, opt in cands:
-                try:
-                    tf, (ft2, s2) = timed((kind, repr(opt), "fwd"), kp)
-                    tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
-                except Exception as e:
-                    log(f"[engine] {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
-                    continue
-                err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
-                            [_rel(s2["cost"], s["cost"])])
-                err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
-                if not (err_f < TOL and err_b < TOL):
-                    log(f"[engine] {kind} {opt}: REJECTED (error vs reference fwd {err_f:.1e}, bwd {err_b:.1e})")
-                    continue
-                log(f"[engine] {kind} {opt}: fwd {1000 * tf:.1f} ms, bwd {1000 * tb:.1f} ms (error fwd {err_f:.1e}, bwd {err_b:.1e})")
-                res.append((kind, opt, (tf, tb)))
-        if mode not in ("auto", "adjoint"):
-            res = [x for x in res if x[0] == mode] or res
-        rec = dict(engine="raw")
-        if res:
-            fb = min(res, key=lambda x: x[2][0])
-            bb = min(res, key=lambda x: x[2][1])
-            ares, g_ref = [], None
-            for kind, opt in acands:
-                try:
-                    ta, g = timed(("asm", kind, repr(opt)), tp, sz, w_low, rho_u, ft, bt)
-                except Exception as e:
-                    log(f"[engine] assembly {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
-                    continue
-                if g_ref is None:
-                    if kind != "xla" or opt:
-                        break                                  # no reference: nothing else is trusted
-                    g_ref = g
-                err = _rel_tree(g, g_ref)
-                if not err < TOL:
-                    log(f"[engine] assembly {kind} {opt}: REJECTED (error vs reference {err:.1e})")
-                    continue
-                log(f"[engine] assembly {kind} {opt}: {1000 * ta:.1f} ms (error {err:.1e})")
-                ares.append((kind, opt, ta))
-            if ares:                                       # a joint candidate includes its backward: compare whole gradients
-                total = lambda x: fb[2][0] + x[2] + (0.0 if x[0] == "tapes" else bb[2][1])
-                ab = min(ares, key=total)
-                joint = ab[0] == "tapes"
-                rec = dict(engine="adjoint", fwd=[fb[0], fb[1]], bwd=(["joint", {}] if joint else [bb[0], bb[1]]), asm=[ab[0], ab[1]],
-                           fwd_ms=1000 * fb[2][0], bwd_ms=0.0 if joint else 1000 * bb[2][1], assemble_ms=1000 * ab[2], total_ms=1000 * total(ab))
-            else:
-                log("[engine] gradient assembly unavailable: raw JAX")
-        rec["tune_s"] = time.perf_counter() - t0
-        rec["compile_s"] = t_compile
+        tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log)
+        prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
+        if prev is not None and not full:                                      # the same shape at another population size
+            keep = lambda lst, ch: [x for x in lst if (x[0] == "xla" and not x[1]) or [x[0], x[1]] == ch]
+            log(f"[engine] this shape was tuned at another population size: checking its choice")
+            rec = tune(keep(cands, prev["fwd"]) + [x for x in keep(cands, prev["bwd"]) if x not in keep(cands, prev["fwd"])],
+                       keep(acands, prev["asm"]))
+            rec = rec if rec["engine"] == "adjoint" and [rec["fwd"], rec["asm"]] == [prev["fwd"], prev["asm"]] else None
+        pref = None if full else _preferred(cands, acands)
+        if rec is None and pref is not None:
+            rec = tune(*pref)
+            if rec["engine"] != "adjoint" or rec["fwd"][0] != "cblk" or rec["asm"][0] != "tapes":
+                log("[engine] the preferred candidates do not all work at this shape: tuning every candidate")
+                rec = None
+        if rec is None:
+            rec = tune(cands, acands)
         _save(sig, rec)
     if rec["engine"] == "raw":
         log("[engine] using raw JAX")

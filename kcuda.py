@@ -302,6 +302,15 @@ def s4d_grads(tp, mS, X, ou, oc, lstride):
     pq = jax.ffi.ffi_call(name, jax.ShapeDtypeStruct((X.shape[0], L, H, NS, 4), jnp.float32), vmap_method="broadcast_all")(
         jnp.stack([jnp.real(dA), jnp.imag(dA)], -1).astype(jnp.float32), X.astype(jnp.float32),
         ou=np.int32(ou), oc=np.int32(oc), lstride=np.int32(lstride))
+    return s4d_from_moments(tp, mS, pq)
+
+
+def s4d_from_moments(tp, mS, pq):
+    """per-patient gradients of log_dt, log_A_re, A_im, C from the moments (B, L, H, NS, 4): Re P, Im P, Re P', Im P'"""
+    ly = tp["extra"]["layers"]
+    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
+    dlt = jnp.exp(ly["log_dt"])[..., None]
+    dA = jnp.exp(dlt * A)
     Pz, Pd = pq[..., 0] + 1j * pq[..., 1], pq[..., 2] + 1j * pq[..., 3]
     # k[m] = 2 Re sum_n C dB dA^m  ->  loss = 2 Re F,  F = sum_n C dB P(dA)
     dB = (dA - 1) / A * mS

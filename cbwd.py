@@ -20,6 +20,7 @@ import kcuda as KC
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "cbwd.cu")
 SRC_FWD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "cfwd.cu")
+SRC_ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "casm.cu")
 SMEM_MAX = 101376                     # dynamic shared memory per block (sm_89)
 NQ = 48
 ASM_PREC = K.HI                       # precision of the assembly GEMMs
@@ -201,10 +202,44 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
 
 
 # ---------------------------------------------------------------- replay-free assembly
-def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
+CASM_CK = (30, 24, 20, 12, 10, 8)            # steps per chunk, largest first (measured at H32 NS16 L3: 30 best, 21 -> 18 ms from 12 to 30)
+
+
+def casm(tp, btape, ck=None, nt=256):
+    """cuda/casm.cu on backward(..., grads=True)'s tapes: dict(pq (B, L, H, NS, 4) S4D moments, g_w (B, L, 2, H, H) GLU matrices,
+    g_b (B, L, 3, H) bv / bg / D, and with a head g_hw (B, H, HD), g_hb (B, HD)). ck: steps per chunk (None: the largest that fits)"""
+    ly = tp["extra"]["layers"]
+    L, H, NS = ly["log_A_re"].shape
+    HD = btape["t_dpre"].shape[-1] if "t_dpre" in btape else 0
+    B = btape["g_sm"].shape[0]
+    fits = lambda c: M.N % c == 0 and 4 * c * (2 * L * H + 3 * L * H + H + max(HD, 8)) <= SMEM_MAX
+    ck = ck or next((c for c in CASM_CK if fits(c)), None)
+    if ck is None or not fits(ck):
+        raise ValueError(f"casm: ck={ck} does not fit (H{H} L{L} HD{HD})")
+    nm = L * H * NS
+    rm = min(6, -(-nm // nt))
+    ms = -(-nm // (nt * rm))
+    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
+    dA = jnp.exp(jnp.exp(ly["log_dt"])[..., None] * A)
+    ins = dict(dA=jnp.stack([jnp.real(dA), jnp.imag(dA)], -1), t_x=btape["t_x"], t_a=btape["t_a"], t_dzv=btape["t_dzv"], t_dzg=btape["t_dzg"])
+    outs = dict(pq=(B, L, H, NS, 4), g_w=(B, L, 2, H, H), g_b=(B, L, 3, H))
+    if HD:
+        ins.update(t_xe=btape["t_xe"], t_dpre=btape["t_dpre"])
+        outs.update(g_hw=(B, H, HD), g_hb=(B, HD))
+    lines = [f"#define HP {H}", f"#define NSP {NS}", f"#define LP {L}", f"#define HDP {max(HD, 8)}", f"#define HEAD {int(HD > 0)}",
+             f"#define NSTEP {M.N}", f"#define NT {nt}", f"#define CK {ck}", f"#define RM {rm}", f"#define MS {ms}", f"#define NIN {len(ins)}"]
+    lines += [f"#define I_{k} {i}" for i, k in enumerate(ins)] + [f"#define NOUT {len(outs)}"] + [f"#define O_{k} {i}" for i, k in enumerate(outs)]
+    name = _build("\n".join(lines) + "\n", SRC_ASM, "CasmHandler", "casm")
+    res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s_, jnp.float32) for s_ in outs.values()], vmap_method="broadcast_all")(
+        *[jnp.asarray(v, jnp.float32) for v in ins.values()], B=np.int32(B))
+    return dict(zip(outs, res))
+
+
+def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, cuda=False, ck=None):
     """per-patient gradients (as kstep.assemble) from backward(..., grads=True): small parameters from the kernel's sums, the large matrices as
     GEMMs over the steps, the S4D kernels from cuda/s4grad.cu, then the VJP of the kernel layout. The whole batch at once: unlike the replay
-    assembly nothing here grows with the batch beyond the tapes themselves (chunking only copied them). chunk: unused (the engine's signature)"""
+    assembly nothing here grows with the batch beyond the tapes themselves (chunking only copied them). chunk: unused (the engine's signature).
+    cuda=True: the matrices, sums and S4D moments in one pass over the tapes (cuda/casm.cu, ck steps per chunk)"""
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: K.to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
@@ -237,25 +272,34 @@ def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None)
     decb, u0 = take(1)[:, 0], take(1)[:, 0]
     g["sc"] = g["sc"].at[:, 0].set(u0).at[:, 1].set(decb)
     lng, lnb = take(L * H).reshape(B, L, H), take(L * H).reshape(B, L, H)
+    r = casm(tp, btape, ck) if cuda else None
     for l in range(L):
         gl = g["layers"][l]
-        aa, dzv, dzg = btape["t_a"][l], btape["t_dzv"][l], btape["t_dzg"][l]
         gl["g"], gl["beta"] = lng[:, l], lnb[:, l]
+        if cuda:
+            gl["Wv"], gl["Wg"] = r["g_w"][:, l, 0], r["g_w"][:, l, 1]
+            gl["bv"], gl["bg"], gl["D"] = r["g_b"][:, l, 0], r["g_b"][:, l, 1], r["g_b"][:, l, 2]
+            continue
+        aa, dzv, dzg = btape["t_a"][l], btape["t_dzv"][l], btape["t_dzg"][l]
         gl["Wv"], gl["Wg"] = ein(aa, dzv), ein(aa, dzg)
         gl["bv"], gl["bg"] = dzv.sum(1), dzg.sum(1)
         gl["D"] = jnp.einsum("bkh,bkh->bh", X[..., (2 * l + 1) * H:(2 * l + 2) * H], X[..., 2 * l * H:(2 * l + 1) * H], precision=K.HI)
     if HD:
-        dpre = btape["t_dpre"]
-        g["hW"], g["hb"] = ein(btape["t_xe"], dpre), dpre.sum(1)
+        if cuda:
+            g["hW"], g["hb"] = r["g_hw"], r["g_hb"]
+        else:
+            dpre = btape["t_dpre"]
+            g["hW"], g["hb"] = ein(btape["t_xe"], dpre), dpre.sum(1)
     gt = jax.vmap(lambda gk: kp_vjp(gk)[0])(g)
     glt = gt["extra"]["layers"]
-    for k, v in KC.s4d_grads(tp, mS, X, 0, H, 2 * H).items():
+    s4 = KC.s4d_from_moments(tp, mS, r["pq"]) if cuda else KC.s4d_grads(tp, mS, X, 0, H, 2 * H)
+    for k, v in s4.items():
         glt[k] = glt[k] + v
     return gt
 
 
-def grads(tp, sz, w_low, rho_u, plain, q, st, ftape, T=10, pb=16, lanes=None, chunk=None):
+def grads(tp, sz, w_low, rho_u, plain, q, st, ftape, T=10, pb=16, lanes=None, chunk=None, casm=False):
     """backward with tapes + replay-free assembly in one: the engine's joint candidate (the assembly signature with the kernel's own backward)"""
     kp = K.to_kp(tp, sz, w_low, rho_u, plain)
     bt = backward(kp, q, st, ftape, T, pb=pb, lanes=lanes, grads=True, lam=False)
-    return assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, bt, chunk)
+    return assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, bt, chunk, cuda=casm)

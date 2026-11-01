@@ -12,7 +12,7 @@ Configuration = optimization (opt, lr, phys_mult, ssm_mult, clip, omb1 = 1 - bet
 weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design (q_theta, sy_scale, rho_lqr, q_x), plus the training setup
 (patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
-import math, os, pickle, time
+import json, math, os, pickle, threading, time
 from functools import partial
 import numpy as np
 import jax
@@ -212,6 +212,19 @@ def evaluate(models, n, key, per_patient=False, stimulus="random"):
 
 
 # ---------------------------------------------------------------- the population
+_PROGRAMS, _PROGRAMS_LOCK = {}, threading.Lock()     # compiled training blocks and validations, shared by the populations of a process
+
+
+def _program(key, build):
+    """the compiled program for key, built once per process (search.py prepares populations in threads: a duplicate build is harmless)"""
+    with _PROGRAMS_LOCK:
+        if key in _PROGRAMS:
+            return _PROGRAMS[key]
+    prog = build()
+    with _PROGRAMS_LOCK:
+        return _PROGRAMS.setdefault(key, prog)
+
+
 def own_shape(c):
     """training-layout shape of a configuration's network"""
     return dict(H=int(c["H"]), NS=int(c["NS"]), L=int(c["L"]), HD=max(int(c["head"]), 1), P=5 + int(c["n_extra"]))
@@ -256,13 +269,28 @@ class Population:
         self._validate = None
         self._blocks, self._exe = {}, {}
 
+    def _sig(self, *extra):
+        """everything a compiled block / validation depends on: two populations with the same signature run the same program (the
+        hyperparameters, states and data key are arguments)"""
+        spec = lambda t: jax.tree_util.tree_map(lambda a: [list(a.shape), str(a.dtype)], t)
+        eng = {k: v for k, v in self.engine.items() if not k.endswith(("_ms", "_s"))}
+        return json.dumps([self.n, self.shape, self.names, self.setup, eng, self.plain, spec(self.state), spec(self.sz), spec(self.hp), *extra],
+                          sort_keys=True, default=str)
+
+    def _validator(self):
+        def build():
+            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
+            v.compile(self.state["ema"], self.sz, VAL_KEY)
+            return v
+        return _program(("val", self._sig(self.val_batch)), build)
+
     def compile(self):
         """compile the training block and the validation ahead of time (no GPU work: search.py does this for the next population while the
-        current one trains)"""
+        current one trains); a population with the same program as an earlier one of the process reuses it"""
         K = self.block
-        self._exe[K] = self._block_fn(K).lower(self.state, self.sz, self.hp, self.key, jnp.int32(self.it)).compile()
-        self._validate = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
-        self._validate.compile(self.state["ema"], self.sz, VAL_KEY)
+        self._exe[K] = _program(("block", self._sig(K)),
+                                lambda: self._block_fn(K).lower(self.state, self.sz, self.hp, self.key, jnp.int32(self.it)).compile())
+        self._validate = self._validator()
 
     def _block_fn(self, K):
         """K training iterations as one jitted scan (the state is donated)"""
@@ -305,7 +333,7 @@ class Population:
     def validate(self, key, which="ema"):
         """per member: (stats per scenario, score)"""
         if self._validate is None:
-            self._validate = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
+            self._validate = self._validator()
         return [(st, M.score(st)) for st in self._validate(self.state[which], self.sz, key)]
 
     def member_states(self):

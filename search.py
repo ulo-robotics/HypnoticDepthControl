@@ -16,7 +16,8 @@ Training and scoring use the fixed stimulus (--stimulus, model.STIM_FIXED); fine
 
 Trials train in populations (trainer.Population): the trials of one network shape, up to --pop at a time, as one jitted program on the GPU,
 each with its own hyperparameters and optimizer. Shapes are the trials' sizes with the head and the extra physics modes padded to the largest
-values (cheap), and populations are rounded up to a power of two (copies of a member, discarded), so a compilation serves every rung. A
+values (cheap), and every population is padded to the full size of its shape (--pop, or the size an out-of-memory split left; copies of a
+member, discarded; --no-pad-pop: up to the next power of two), so each shape has one program and one engine choice for the whole search. A
 population that does not fit in memory is split in two. One process: JAX owns the GPU.
 Everything is resumable (--resume) at population granularity: trial states live in <out>/store, the plan and all scores in <out>/manifest.json,
 every score in log.jsonl.
@@ -160,13 +161,20 @@ class Search:
         json.dump(dict(pool=pool, scores=[float(scores[i]) for i in order[:keep]]), open(os.path.join(self.out, "prior_pool.json"), "w"))
         return pool
 
+    def cap(self, g):
+        """the most trials a population of g's shape holds (--pop, or less after an out-of-memory split)"""
+        return min(self.max_pop.get(str(group_shape(g)), self.a.pop), self.a.pop)
+
+    def members(self, g):
+        """members of g's compiled population: padded to its shape's full size (one program per shape), or to the next power of two"""
+        return p2(self.cap(g)) if self.a.pad_pop else p2(len(g))
+
     def populations(self, todo):
         """the trials in populations of up to --pop, in size order so that neighbours share a padded shape: populations stay full when the
         trials of each shape thin out in the later rungs (deterministic: a resumed run forms the same populations)"""
-        cap = lambda g: min(self.max_pop.get(str(group_shape(g)), self.a.pop), self.a.pop)
         out, g = [], []
         for t in sorted(todo, key=lambda t: (shape_key(t["cfg"]), int(t["cfg"]["H"]), int(t["cfg"]["NS"]), t["id"])):
-            if g and len(g) + 1 > cap(g + [t]):
+            if g and len(g) + 1 > self.cap(g + [t]):
                 out.append(g)
                 g = []
             g.append(t)
@@ -183,7 +191,7 @@ class Search:
         print(f"  [{tag}] {len(todo)} trials in {len(queue)} populations", flush=True)
         t0, seen = time.time(), set()
         for g in queue:                                                               # engine choices (cached across rungs and runs)
-            key = (group_shape(g), p2(len(g)))
+            key = (group_shape(g), self.members(g))
             if key not in seen:
                 seen.add(key)
                 self.prepare(g, budget, train_seed, compile=False)
@@ -227,8 +235,8 @@ class Search:
         for t in g:
             p = self.spath(t)
             states.append(pickle.load(open(p, "rb")) if os.path.exists(p) else T.new_state(t["cfg"], jax.random.PRNGKey(t["id"] % SEED_STRIDE)))
-        n = p2(len(g))
-        cfgs = [t["cfg"] for t in g] + [g[0]["cfg"]] * (n - len(g))                  # copies of the first member fill a power of two
+        n = self.members(g)
+        cfgs = [t["cfg"] for t in g] + [g[0]["cfg"]] * (n - len(g))                  # copies of the first member fill the population
         states += [states[0]] * (n - len(g))
         L, H, NS = group_shape(g)
         tk = jax.random.PRNGKey(10_000) if train_seed is None else jax.random.fold_in(jax.random.PRNGKey(10_000), train_seed)
@@ -399,6 +407,8 @@ def main():
     ap.add_argument("--prior-keep", type=float, default=0.25)
     ap.add_argument("--pop", type=int, default=8, help="trials per population (at most; a population that does not fit is split)")
     ap.add_argument("--block", type=int, default=100, help="training iterations per jitted call")
+    ap.add_argument("--no-pad-pop", dest="pad_pop", action="store_false", help="pad a population only to the next power of two (fewer discarded "
+                    "copies in a rung's last population, but one more program and engine choice per population size)")
     ap.add_argument("--seed", type=int, default=0, help="Sobol scrambling seed")
     ap.add_argument("--fix", action="append", help="pin a dimension: --fix H=64 --fix opt='\"adam\"'")
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run (overrides the budgets)")

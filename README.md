@@ -51,7 +51,7 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
 | `kstep.py` | the step in kernel form, the XLA reference sweeps, the shared gradient assembly |
 | `kpallas.py` | Pallas (Triton) sweeps |
 | `kcuda.py`, `cuda/sweep.cu`, `cuda/asm.cu`, `cuda/s4grad.cu` | CUDA sweeps of one network, the CUDA gradient assembly and S4D-kernel gradients, called through XLA FFI |
-| `cbwd.py`, `cuda/cfwd.cu`, `cuda/cbwd.cu` | CUDA sweeps in the blocked layout for populations, and the backward that also writes the gradient tapes |
+| `cbwd.py`, `cuda/cfwd.cu`, `cuda/cbwd.cu`, `cuda/casm.cu` | CUDA sweeps in the blocked layout for populations, the backward that also writes the gradient tapes, and the assembly from those tapes |
 | `export_cpp.py`, `cpp/lethe_infer.hpp` | C++ inference engine of the deployed controller and its model exporter |
 | `bench_infer.py`, `cpp/bench.cpp` | C++ vs JAX inference: step-by-step agreement and latency |
 | `selftest.py` | correctness checks |
@@ -88,10 +88,12 @@ Per-patient gradients through a 360-step closed loop are the whole cost of train
   - The blocked CUDA kernels (`cbwd.py`) keep that layout: a thread block holds 16-32 patients, the GLU and head matmuls run on tensor cores
     across them, and the S4D state stays in global memory, touched once per T-step block. Their backward can also write the per-step
     cotangents, so the assembly becomes GEMMs over the steps plus `cuda/s4grad.cu`, without replaying the steps (the `tapes` candidate,
-    which replaces the backward sweep). Other assemblies: the XLA one with `cuda/s4grad.cu`, and `cuda/asm.cu`.
+    which replaces the backward sweep); `cuda/casm.cu` does that whole assembly in one pass over each patient's tapes. Other assemblies: the XLA one with `cuda/s4grad.cu`, and `cuda/asm.cu`.
 
-**How the engine is chosen.** For each shape (sizes, population size, batch), every sweep candidate is compiled, checked against the XLA
-reference on stable patients, and timed on the real batch. The forward and backward sweeps are chosen independently; anything that fails to
+**How the engine is chosen.** For each shape (sizes, population size, batch), the candidates are compiled, checked against the XLA
+reference on stable patients, and timed on the real batch. A shape is tuned once: another population size of it only re-checks the choice
+made there. A new shape first tries the candidates that won at every measured shape (blocked CUDA sweeps, CUDA tape assembly) and tunes
+every candidate only if one of them does not work; `PKPD_TUNE=full` always tunes every candidate. The forward and backward sweeps are chosen independently; anything that fails to
 compile or disagrees is never used. The Pallas, XLA and blocked CUDA sweeps run on populations; the `kcuda.py` sweeps serve a single unpadded
 network. Assemblies are checked against the XLA assembly per patient and parameter; a joint backward + assembly competes on the whole gradient.
 Raw JAX is used when no adjoint candidate works (it was slower than the adjoint path at every measured shape, and vmapped over a population it
@@ -119,7 +121,7 @@ Per-patient gradient of a population of 8 networks of the selected configuration
 |---|---|---|
 | forward sweep | 67 ms | 33 ms |
 | backward sweep | 110 ms | 65 ms (without tapes) |
-| whole gradient | 288 ms | 138 ms |
+| whole gradient | 288 ms | 110 ms (with the assembly of `cuda/casm.cu`) |
 
 ## Inference engine
 `cpp/lethe_infer.hpp` is the deployed controller as a single dependency-free C++17 header: load the file written by `export_cpp.py`, then
@@ -150,7 +152,8 @@ time, as one jitted program, each with its own hyperparameters and optimizer:
 - the members are zero-padded to a common shape (the head and the extra physics modes to the largest of the space), and masks keep each one
   exactly its own network: padded entries get exactly zero gradients, so a member trains like the same configuration alone (`selftest.py`);
 - every hyperparameter is an array, the optimizer is a switch over the members' update rules, and 100 iterations run per jitted call, so one
-  compilation serves every population of that shape, in every rung;
+  compilation serves every population of that shape, in every rung: populations are padded to the full size of their shape (copies,
+  discarded; `--no-pad-pop`: to the next power of two), and a process reuses a compiled program for every population that has it;
 - many recurrences at once keep the GPU busy, where one trial's 512 patients leave most of it idle.
 
 One process owns the GPU (the JAX model: a device belongs to one process). A population that does not fit in memory is split in two. The search
