@@ -23,8 +23,9 @@ Decisions are cached in $PKPD_CACHE/engine.json.
 
 PKPD_ENGINE = auto (default) | raw | adjoint | pallas | cuda | cblk   (adjoint / pallas / cuda / cblk force that sweep backend; raw forces
 the fallback). PKPD_TUNE=full tunes every candidate (default: a shape is tuned once, the preferred candidates first; see select).
+PKPD_TUNE_DEBUG=1 logs every candidate's memory need against the free GPU memory.
 """
-import hashlib, json, os, re, time
+import gc, hashlib, json, os, re, time
 from functools import partial
 import numpy as np
 import jax
@@ -38,6 +39,9 @@ CACHE = os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1")
 TUNE_FILE = os.path.join(CACHE, "engine.json")
 MIN_TUNE_ITERS = 200             # shorter runs use raw JAX untuned (tuning compiles every candidate)
 TOL = 1e-3                       # relative tolerance of a candidate's tapes vs the XLA reference (float32, stable patients)
+FIT = 0.7                        # a candidate runs only if it needs less than this share of the free GPU memory: an execution that runs out of
+                                 # memory leaks its allocation for the rest of the process (XLA runtime), and the free memory is fragmented
+                                 # (an 8.4 GiB candidate failed with 11.7 GiB free)
 
 XLA_CANDS = [dict(T=10), dict(T=20)]
 PALLAS_CANDS = [dict(kb=16, nw=4, lazy=False), dict(kb=16, nw=8, lazy=False), dict(kb=16, nw=8, lazy=True)]
@@ -220,6 +224,29 @@ def _aot(fn, *args):
     return jax.jit(fn).lower(*args).compile()
 
 
+def _bare(e):
+    """an exception without its traceback: a stored or re-raised failure must not keep the tuning frame (its executables and multi-GiB
+    tapes) alive through a reference cycle"""
+    return RuntimeError(f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}")
+
+
+def _need(exe):
+    """bytes a compiled candidate allocates when it runs (outputs + scratch), None if unknown"""
+    try:
+        m = exe.memory_analysis()
+        return m.output_size_in_bytes + m.temp_size_in_bytes - m.alias_size_in_bytes
+    except Exception:
+        return None
+
+
+def _free():
+    try:
+        st = jax.devices()[0].memory_stats()
+        return st["bytes_limit"] - st["bytes_in_use"]
+    except Exception:
+        return None
+
+
 def _other_size(sig):
     """a decision cached for the same shape at another population size (the sizes of a search share their engine)"""
     size = lambda k: int(re.search(r"_x(\d+)_", k).group(1))
@@ -262,15 +289,26 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
             try:
                 exe[k] = f.result()
             except Exception as e:                                  # compile failure, resources, missing toolchain: not a candidate
-                exe[k] = e
+                exe[k] = _bare(e)
     t_compile = time.perf_counter() - t0
 
     def timed(k, *a):
         e = exe[k]
         if isinstance(e, Exception):
             raise e
-        return _time(e, *a), e(*a)
+        need, free = _need(e), _free()
+        if os.environ.get("PKPD_TUNE_DEBUG"):
+            st = jax.devices()[0].memory_stats() or {}
+            log(f"[engine] {k}: needs {(need or 0) / 2**30:.2f} GiB, free {(free or 0) / 2**30:.2f} GiB, largest free block "
+                f"{st.get('largest_free_block_bytes', 0) / 2**30:.2f} GiB")
+        if need is not None and free is not None and need > FIT * free:   # an out-of-memory run leaks its allocation (XLA runtime): never try
+            raise RuntimeError(f"needs {need / 2**30:.2f} GiB of {free / 2**30:.2f} GiB free: not run")
+        try:
+            return _time(e, *a), e(*a)
+        except Exception as err:                                    # raised without the frames that hold the buffers
+            raise _bare(err) from None
 
+    ft = bt = None
     try:
         _, (ft, s) = timed(("xla", "{}", "fwd"), kp)
         _, bt = timed(("xla", "{}", "bwd"), kp, ft)
@@ -279,16 +317,18 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
         ft = None
     res = []
     if ft is not None:
-        for kind, opt in cands:
+        for kind, opt in cands:                        # one candidate's outputs at a time (checked, then released)
             try:
                 tf, (ft2, s2) = timed((kind, repr(opt), "fwd"), kp)
+                err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
+                            [_rel(s2["cost"], s["cost"])])
+                del ft2, s2
                 tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+                err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
+                del bt2
             except Exception as e:
                 log(f"[engine] {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
                 continue
-            err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
-                        [_rel(s2["cost"], s["cost"])])
-            err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
             if not (err_f < TOL and err_b < TOL):
                 log(f"[engine] {kind} {opt}: REJECTED (error vs reference fwd {err_f:.1e}, bwd {err_b:.1e})")
                 continue
@@ -310,8 +350,9 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
             if g_ref is None:
                 if kind != "xla" or opt:
                     break                                  # no reference: nothing else is trusted
-                g_ref = g
+                g_ref = jax.device_get(g)                  # the reference on the host: the candidates get the GPU memory
             err = _rel_tree(g, g_ref)
+            del g
             if not err < TOL:
                 log(f"[engine] assembly {kind} {opt}: REJECTED (error vs reference {err:.1e})")
                 continue
@@ -327,6 +368,8 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
             log("[engine] gradient assembly unavailable: raw JAX")
     rec["tune_s"] = time.perf_counter() - t0
     rec["compile_s"] = t_compile
+    del exe, kp, ft, bt, res, timed
+    gc.collect()                                                    # every candidate's executable and outputs released before the next stage
     return rec
 
 

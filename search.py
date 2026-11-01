@@ -189,12 +189,21 @@ class Search:
         todo = [t for t in trials if t.get("done") != tag and not t.get("failed")]
         queue = self.populations(todo)
         print(f"  [{tag}] {len(todo)} trials in {len(queue)} populations", flush=True)
-        t0, seen = time.time(), set()
-        for g in queue:                                                               # engine choices (cached across rungs and runs)
+        t0, seen, i = time.time(), set(), 0
+        while i < len(queue):                                                         # engine choices (cached across rungs and runs)
+            g = queue[i]
             key = (group_shape(g), self.members(g))
             if key not in seen:
+                try:
+                    self.prepare(g, budget, train_seed, compile=False)
+                except Exception as e:
+                    if not _oom(e) or self.members(g) == 1:
+                        raise
+                    self.shrink(g, tag)
+                    queue, seen, i = self.populations(todo), set(), 0                 # the shape's populations re-formed at the smaller size
+                    continue
                 seen.add(key)
-                self.prepare(g, budget, train_seed, compile=False)
+            i += 1
         print(f"  [{tag}] engines for {len(seen)} (shape, population size) pairs: {time.time() - t0:.0f}s", flush=True)
         t0, done = time.time(), [0]
         ahead = lambda q: [ex.submit(self.prepare, g, budget, train_seed) for g in q[:AHEAD]]
@@ -213,18 +222,22 @@ class Search:
                         raise
                     for f in nxt:
                         f.exception()                                                 # (discarded: the queue changes)
-                    key = str(group_shape(g))
-                    self.max_pop[key] = max(1, p2(len(g)) // 2)
-                    json.dump(self.max_pop, open(os.path.join(self.out, "max_pop.json"), "w"))
-                    print(f"  [{tag}] out of memory with {len(g)} trials of shape {key}: splitting (at most {self.max_pop[key]} per population)",
-                          flush=True)
-                    h = self.max_pop[key]
+                    h = self.shrink(g, tag)
                     queue = [g[i:i + h] for i in range(0, len(g), h)] + queue
                     nxt = ahead(queue)
                     continue
                 done[0] += len(g)
                 el = time.time() - t0
                 print(f"  [{tag}] {done[0]}/{len(todo)} trials, {el / 60:.1f} min, ETA {el / done[0] * (len(todo) - done[0]) / 60:.0f} min", flush=True)
+
+    def shrink(self, g, tag):
+        """g's shape did not fit: at most half its population size from now on (recorded: a resumed run keeps it). Returns the new cap"""
+        key = str(group_shape(g))
+        self.max_pop[key] = max(1, self.members(g) // 2)
+        json.dump(self.max_pop, open(os.path.join(self.out, "max_pop.json"), "w"))
+        print(f"  [{tag}] out of memory with {self.members(g)} members of shape {key}: splitting (at most {self.max_pop[key]} per population)",
+              flush=True)
+        return self.max_pop[key]
 
     def prepare(self, g, budget, train_seed, compile=True):
         """the population of trials g (states from the store, or new), with its gradient engine; compiled ahead of time unless compile=False"""
