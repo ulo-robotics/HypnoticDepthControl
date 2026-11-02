@@ -14,30 +14,40 @@ import argparse, os, pickle, struct
 import numpy as np
 
 
-def write_model(params, path):
+def discretized(params):
+    """the deployed model in float64: sizes (H, NS, L, head, modes) and the arrays of model.bin in their order, by name (the discretized
+    matrices; shared with export_onnx.py)"""
     ph, ex = params["phys"], params["extra"]
     f64 = lambda a: np.asarray(a, np.float64)
     lam = np.exp(-np.exp(f64(ph["a"])) + 1j * f64(ph["b"]))
     cx = lambda m: f64(m)[:, 0] + 1j * f64(m)[:, 1]
     H, NS = f64(ex["layers"][0]["log_A_re"]).shape
     hd = f64(ex["head_b1"]).shape[0] if "head_W1" in ex else 0
-    parts = [f64([ph["u0"][0], ex["dec_b"][0]])]
-    for z in (lam, cx(ph["Bu"]), cx(ph["Bw"]), cx(ph["Cout"])):
-        parts += [z.real, z.imag]
-    parts += [f64(ex["enc_W"]), f64(ex["enc_b"])]
-    for lp in ex["layers"]:
+    a = dict(u0=f64(ph["u0"][0]), dec_b=f64(ex["dec_b"][0]))
+    for n, z in (("lam", lam), ("Bu", cx(ph["Bu"])), ("Bw", cx(ph["Bw"])), ("Cout", cx(ph["Cout"]))):
+        a[n + "_re"], a[n + "_im"] = z.real, z.imag
+    a["enc_W"], a["enc_b"] = f64(ex["enc_W"]), f64(ex["enc_b"])
+    for l, lp in enumerate(ex["layers"]):
         A = -np.exp(f64(lp["log_A_re"])) + 1j * f64(lp["A_im"])
         dA = np.exp(np.exp(f64(lp["log_dt"]))[:, None] * A)
         dB = (dA - 1) / A
         C = cx(lp["C"].reshape(-1, 2)).reshape(H, NS)
-        parts += [dA.real, dA.imag, dB.real, dB.imag, C.real, C.imag, f64(lp["D"]), f64(lp["W_mix"]), f64(lp["b_mix"]), f64(lp["ln_g"]), f64(lp["ln_b"])]
+        for n, v in (("dA_re", dA.real), ("dA_im", dA.imag), ("dB_re", dB.real), ("dB_im", dB.imag), ("C_re", C.real), ("C_im", C.imag),
+                     ("D", lp["D"]), ("W_mix", lp["W_mix"]), ("b_mix", lp["b_mix"]), ("ln_g", lp["ln_g"]), ("ln_b", lp["ln_b"])):
+            a[f"l{l}_{n}"] = f64(v)
     if hd:
-        parts += [f64(ex["head_W1"]), f64(ex["head_b1"])]
-    parts.append(f64(ex["dec_W"])[:, 0])
+        a["head_W1"], a["head_b1"] = f64(ex["head_W1"]), f64(ex["head_b1"])
+    a["dec_W"] = f64(ex["dec_W"])[:, 0]
+    return dict(H=H, NS=NS, L=len(ex["layers"]), head=hd, modes=len(lam)), a
+
+
+def write_model(params, path):
+    d, a = discretized(params)
     with open(path, "wb") as f:
-        f.write(b"LETHE01\0" + struct.pack("<5i", H, NS, len(ex["layers"]), hd, len(lam)))
-        for p in parts:
-            f.write(np.ascontiguousarray(p, "<f8").tobytes())
+        f.write(b"LETHE01\0" + struct.pack("<5i", d["H"], d["NS"], d["L"], d["head"], d["modes"]))
+        f.write(np.ascontiguousarray([a["u0"], a["dec_b"]], "<f8").tobytes())
+        for k in [k for k in a if k not in ("u0", "dec_b")]:
+            f.write(np.ascontiguousarray(a[k], "<f8").tobytes())
 
 
 def write_trace(params, path, n=8, seed=0):

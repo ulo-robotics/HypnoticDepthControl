@@ -3,3 +3,5 @@ scipy
 jax          # GPU: pip install -U "jax[cuda12]"  (or use the Dockerfile)
 optax
 matplotlib   # only for evaluate.py --plot
+onnx         # only for export_onnx.py (with onnxruntime; TensorRT: tensorrt, cuda-python; LiteRT: onnx2tf, tensorflow, tf_keras, ai-edge-litert)
+onnxruntime

@@ -53,6 +53,7 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
 | `kcuda.py`, `cuda/sweep.cu`, `cuda/asm.cu`, `cuda/s4grad.cu` | CUDA sweeps of one network, the CUDA gradient assembly and S4D-kernel gradients, called through XLA FFI |
 | `cbwd.py`, `cuda/cfwd.cu`, `cuda/cbwd.cu`, `cuda/casm.cu` | CUDA sweeps in the blocked layout for populations, the backward that also writes the gradient tapes, and the assembly from those tapes |
 | `export_cpp.py`, `cpp/lethe_infer.hpp` | C++ inference engine of the deployed controller and its model exporter |
+| `export_onnx.py` | the control step as an ONNX model, its fp16 / int8 forms, TensorRT engines and LiteRT models, each checked in closed loops |
 | `bench_infer.py`, `cpp/bench.cpp` | C++ vs JAX inference: step-by-step agreement and latency |
 | `selftest.py` | correctness checks |
 
@@ -62,6 +63,7 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
     python train.py --out runs/lethe                                  # 6000 iterations, batch 512; Ctrl-C is safe, then --resume
     python evaluate.py runs/lethe/best_model.pkl --stress --prior --plot
     python bench_infer.py runs/lethe/best_model.pkl                   # C++ inference engine: check against JAX, latency
+    python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx --tensorrt fp32,fp16,int8 --litert fp32,dynamic
     python search.py --out runs/search                                # the full meta-optimization (hours, one GPU)
     python search.py --out runs/search --resume
     python finetune.py --search runs/search --out runs/finetune       # minutes
@@ -147,6 +149,34 @@ For an H 64, NS 8, L 3, head 64 policy (the earlier default) on an Intel Core Ul
 - **C++, float:** 8.2 µs per control step (p99 8.7 µs); agrees with the JAX policy to 1.8e-3 mg/min (float32 rounding).
 - **C++, double:** 9.2 µs per step.
 - **JAX, for comparison** (one patient, jitted, dominated by dispatch): 280 µs per step on CPU, 3 ms on GPU.
+
+`export_onnx.py` writes the same step, batched over patients, as an ONNX graph (opset 18, float32; the recurrent states are inputs and
+outputs), and from it reduced-precision models: `policy_int8.onnx` (quantize / dequantize nodes), TensorRT engines (`--tensorrt
+fp32,fp16,int8`, strongly typed networks through the Python API) and LiteRT models at batch 1 (`--litert fp32,dynamic`, through onnx2tf
+and the TFLite converter). Each is checked in its own runtime, in closed loops on the numpy plant over every validation scenario, against
+the float32 model.
+
+Precision has to be judged clinically here. The infusion is a high-gain function of the measured BIS (du/dBIS 3.6 mg/min per point at the
+median, up to 40), and a rounding anywhere in the network, every layer about alike, acts like a small change of that measurement: float32
+alone moves u by 1e-3 mg/min from the float64 model, TF32 matmuls (the GPU default) by up to 1 mg/min. So the check reports the selection
+score, the infusions and the BIS trajectories, beside a physical floor: BIS read as an integer, as monitors display it. For the model of
+the paper, 256 patients x 11 scenarios against onnxruntime float32 (itself 2.2e-3 mg/min from the JAX policy):
+
+| model | score change | \|du\| p99 (mg/min) | \|dBIS\| p99 | \|dBIS\| max |
+|---|---|---|---|---|
+| floor: BIS read as an integer | +0.070 | 4.7 | 0.50 | 6.6 |
+| TensorRT fp32, LiteRT fp32 | < 1e-6 | 8e-5 | 0 | 0 |
+| TensorRT fp16 (network fp16, recurrences fp32) | +0.001 | 0.17 | 0.025 | 0.20 |
+| LiteRT dynamic (int8 weights) | +0.011 | 0.87 | 0.11 | 0.90 |
+| int8, onnxruntime and TensorRT (identical) | +0.035 | 2.0 | 0.30 | 8.8 |
+
+The int8 model quantizes the mixing and head matmuls (int8 weights per output channel, activations per tensor) after smoothing the
+activations per channel (as in SmoothQuant, exponent 0.75; plain int8 activations land at the floor itself), with scales fitted to the
+least squared error on calibration patients of their own keys; the encoder, the recurrences and the infusion stay float32. Recurrent
+states in integers do not hold up: an int8 S4D state breaks the controller (score +17), and a full-integer LiteRT model (16x8) drifts to
+twice the floor's BIS error over an episode even with its state magnitudes equalized, so it is not exported. On the RTX 4000 Ada, the
+TensorRT fp32 engine runs a step of 256 patients in 0.93 ms including host copies; fp16 and int8 are slower at this size (the casts and
+the quantize / dequantize steps cost more than the matmuls they shrink).
 
 ## Meta-optimization
 `search.py` follows the procedure used for the paper:
