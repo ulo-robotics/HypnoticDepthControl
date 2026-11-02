@@ -12,10 +12,12 @@ Float64 (a minute on a CPU):
   6. padding is exact: a network zero-padded into a larger shape (more channels, states, layers, head units, physics modes) computes the same
      closed loop, its per-patient gradients equal the unpadded ones on the active entries and are exactly zero on the padding (raw and adjoint)
   7. a population of different configurations (sizes, optimizers, learning-rate rules, loss weights) trained together == each trained alone
+  8. the UKF-MM baseline with one observer of delay 0 and fixed noise == UKF+LQR, and the full bank runs (finite, in range)
 Float32, GPU only (a fresh process, `python selftest.py --engines`; run automatically when a GPU is present):
-  8. every Pallas and CUDA sweep candidate of engine.py == the XLA reference sweeps on every tape, for a single network (three shapes including
-     the selected one) and a padded population. A candidate that does not fit a shape (e.g. shared memory) is reported as skipped: the engine
-     would not use it either.
+  9. every Pallas and CUDA sweep candidate of engine.py (cuda, cblk) == the XLA reference sweeps on every tape, for a single network (three
+     shapes including the selected one) and a padded population, and every GPU gradient assembly (XLA with the CUDA S4D-kernel gradients, the
+     CUDA assembly, the joint cbwd backward + tape assembly) == the XLA reference assembly, per patient and per parameter. A candidate that does not fit a shape (e.g. shared memory) is reported as
+     skipped: the engine would not use it either.
 """
 import os, subprocess, sys
 import numpy as np
@@ -172,6 +174,14 @@ def main():
         ok.append(check(f"population member == trained alone ({c['opt']}, H{c['H']} NS{c['NS']} L{c['L']} head{c['head']}, 3 iterations, relative)",
                         rel(together[i]["params"], alone.member_states()[0]["params"]), 1e-9))
 
+    # 8. UKF-MM reduces to UKF+LQR
+    import baselines as BL
+    _, u0 = M.run_numpy(BL.UKFLQR(q_theta=5e-4, rho=2e-4), pn)
+    _, u1 = M.run_numpy(BL.UKFMM(dset=(0,), adapt=False), pn)
+    ok.append(check("UKF-MM, one observer of delay 0, fixed noise == UKF+LQR (max |du|, mg/min)", float(np.max(np.abs(u0 - u1))), 1e-9))
+    _, u2 = M.run_numpy(BL.UKFMM(), pn)
+    ok.append(check("UKF-MM bank: inputs finite and in [0, UMAX] (violations)", float(np.sum(~np.isfinite(u2)) + np.sum((u2 < 0) | (u2 > M.UMAX))), 0.0))
+
     if E._gpu():
         print("engine checks (float32, GPU) in a fresh process:", flush=True)
         ok.append(subprocess.run([sys.executable, os.path.abspath(__file__), "--engines"]).returncode == 0)
@@ -182,10 +192,10 @@ def main():
 
 
 def engines():
-    """8. every GPU sweep candidate vs the XLA reference sweeps (float32)"""
+    """9. every GPU sweep and assembly candidate vs the XLA references (float32)"""
     import engine as E
     import trainer as TR
-    ok, n_run = [], 0
+    ok, n_run, n_asm = [], 0, 0
     noisy = lambda cfg: jax.tree_util.tree_map(lambda x: x + 0.05 * jax.random.normal(jax.random.PRNGKey(1), x.shape, x.dtype),
                                                P.init_params(jax.random.PRNGKey(0), cfg))
     pts = M.sample_patients(jax.random.PRNGKey(3), 64, M.VAL["mixed_hard"][0])
@@ -203,6 +213,7 @@ def engines():
         tp = jax.tree_util.tree_map(lambda *a: jnp.stack([jnp.asarray(x) for x in a]), *tps)
         sz = {k: jnp.asarray([s_[k] for s_ in szs]) for k in szs[0]}
         kp = E.pop_map(lambda t, s_: K.to_kp(t, s_, 0.87, 0.21, plain), n, (0, 0))(tp, sz)
+        wl, ru = jnp.full((n,), 0.87), jnp.full((n,), 0.21)
         fw = lambda f: jax.jit(E.pop_map(lambda k_: f(k_, q, st), n, (0,)))
         bw = lambda f: jax.jit(E.pop_map(lambda k_, t_: f(k_, q, st, t_), n, (0, 0)))
         ft, s = fw(K.xla_forward)(kp)
@@ -222,7 +233,18 @@ def engines():
                       [E._rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
             ok.append(check(f"{kind} {opt} sweeps == XLA reference ({tag}, all tapes, relative)", err, 1e-3))
             n_run += 1
+        g_ref = jax.jit(E.pop_map(lambda t, s_, w, r, f, b: K.assemble(t, s_, w, r, plain, q, st, f, b), n, (0,) * 6))(tp, sz, wl, ru, ft, bt)
+        for kind, opt in E.asm_candidates()[1:]:
+            af = E.asm_fn(kind, opt)
+            try:
+                g = jax.jit(E.pop_map(lambda t, s_, w, r, f, b: af(t, s_, w, r, plain, q, st, f, b, None), n, (0,) * 6))(tp, sz, wl, ru, ft, bt)
+            except Exception as e:
+                print(f"[skip] assembly {kind} {opt} {tag}: {type(e).__name__}: {str(e).splitlines()[0][:90]}", flush=True)
+                continue
+            ok.append(check(f"assembly {kind} {opt} == XLA reference ({tag}, per-patient gradients, relative per leaf)", E._rel_tree(g, g_ref), 1e-3))
+            n_asm += 1
     ok.append(check("number of GPU sweep candidates checked", n_run, 1, at_least=True))
+    ok.append(check("number of GPU assembly candidates checked", n_asm, 1, at_least=True))
     raise SystemExit(0 if all(ok) else 1)
 
 

@@ -1,5 +1,5 @@
 """
-The v1 policy: a physics-initialized S4D controller, u = r * (u_lin + 10 * residual).
+The policy: a physics-initialized S4D controller, u = r * (u_lin + 10 * residual).
 
 u_lin     the "physics layer": a steady-state Kalman observer (PK + a random-walk C50 state) + LQR with a moving set-point, designed on the
           nominal patient and written in modal coordinates. Its 5 complex modes (a, b), input / measurement gains (Bu, Bw) and output (Cout)
@@ -237,7 +237,7 @@ def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
 
 
 # ---------------------------------------------------------------- closed loop in JAX (training and evaluation)
-PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
+PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "stim_t", "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
 
 
 def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
@@ -254,7 +254,7 @@ def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
         x, ou, state, u_prev, buf = carry
         k, z = inp
         t = k * M.DT
-        b = M.hill(x[:, 3], pts["mu"] + ou + pts["stim"] * (t > 20.0), pts["gamma"], pts["e0"], pts["emax"])
+        b = M.hill(x[:, 3], pts["mu"] + ou + pts["stim"] * (t > pts["stim_t"]), pts["gamma"], pts["e0"], pts["emax"])
         buf = jnp.where(k == 0, b[:, None], jnp.concatenate([b[:, None], buf[:, :-1]], 1))   # buf[:, j] = BIS j steps ago (first reading before that)
         y = jnp.sum(buf * dmask, -1) + pts["sy"][:, k] * z[0]
         tg, tgp = pts["tgt"][:, k], pts["tgt"][:, jnp.maximum(k - 1, 0)]

@@ -102,7 +102,7 @@ def to_kq(pts):
     """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
     B = pts["mu"].shape[0]
     a = jnp.exp(-M.DT / pts["tau"])
-    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], stim_t=pts["stim_t"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
              dmask=jax.nn.one_hot(pts["delay"], DP, dtype=pts["mu"].dtype))
     Ad = pts["Ad"].reshape(B, 16)
     for i in range(16):
@@ -150,7 +150,7 @@ def step_pre(kp, q, c, k, st):
     dt = q["mu"].dtype
     t = k.astype(dt) * M.DT if hasattr(k, "astype") else jnp.asarray(k * M.DT, dt)
     ce = jnp.maximum(c["x3"], 0.0)
-    l50 = q["mu"] + c["ou"] + q["stim"] * (t > 20.0).astype(dt)
+    l50 = q["mu"] + c["ou"] + q["stim"] * (t > q["stim_t"]).astype(dt)
     cg = jnp.power(ce, q["gamma"])
     b = q["e0"] - q["emax"] * cg / (cg + jnp.power(jnp.exp(l50), q["gamma"]))
     sh = (_iota((DP, DP), 0) + 1 == _iota((DP, DP), 1)).astype(dt)              # buf[:, j] -> buf[:, j + 1]
@@ -436,8 +436,9 @@ def xcorr(cy, u):
     return jnp.fft.irfft(jnp.fft.rfft(cy, nf) * jnp.conj(jnp.fft.rfft(u, nf)), nf)[..., :n]
 
 
-def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
-    """per-patient gradients (tree like tp with a leading batch axis) from the two tapes"""
+def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, s4=None):
+    """per-patient gradients (tree like tp with a leading batch axis) from the two tapes. s4: optional implementation of the S4D-kernel gradients
+    (kcuda.s4d_grads; default: FFT cross-correlation and the kernel's VJP)"""
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
@@ -459,6 +460,12 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
         g_kp, cy, us = jax.vmap(one, in_axes=axes)(*args)
         g = jax.vmap(lambda gk: kp_vjp(gk)[0])(g_kp)
         gl = g["extra"]["layers"]
+        if s4 is not None:
+            H = us[0].shape[-1]
+            X = jnp.concatenate([z for l in range(len(us)) for z in (us[l], cy[l])], -1)
+            for k, v in s4(tp, mS, X, 0, H, 2 * H).items():
+                gl[k] = gl[k] + v
+            return g
         for l in range(len(us)):                                                 # S4D kernels: FFT cross-correlation, then the kernel's VJP
             gK = xcorr(jnp.swapaxes(cy[l], 1, 2), jnp.swapaxes(us[l], 1, 2))      # (chunk, H, N)
             _, kvjp = jax.vjp(lambda p: s4d_kernel(p, mS), {k: tp["extra"]["layers"][k][l] for k in ("log_dt", "log_A_re", "A_im", "C")})
@@ -475,11 +482,11 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
     return jax.tree_util.tree_map(lambda a: a.reshape((B,) + a.shape[2:]), out)
 
 
-def adjoint_grads(tp, sz, pts, w_low, rho_u, plain=None, forward=xla_forward, backward=xla_backward, chunk=None):
-    """per-patient gradients, loss and J of one network with the given sweep implementations (default: the XLA reference)"""
+def adjoint_grads(tp, sz, pts, w_low, rho_u, plain=None, forward=xla_forward, backward=xla_backward, chunk=None, assembly=None):
+    """per-patient gradients, loss and J of one network with the given sweep and assembly implementations (default: the XLA reference)"""
     kp = to_kp(tp, sz, w_low, rho_u, plain)
     q, st = to_kq(pts)
     ftape, sums = forward(kp, q, st)
     btape = backward(kp, q, st, ftape)
-    g = assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk)
+    g = (assembly or assemble)(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk)
     return g, sums["cost"] / M.N, sums["se"] / M.N

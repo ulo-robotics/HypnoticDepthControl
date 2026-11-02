@@ -2,13 +2,15 @@
 """
 Evaluate a trained policy against the baselines on the SAME fresh patients (a key never used in training or validation).
 
-  python evaluate.py runs/v1/best_model.pkl                       # validation scenarios, 1000 patients each
-  python evaluate.py runs/v1/best_model.pkl --stress --n 2000     # + the out-of-distribution stress scenarios
-  python evaluate.py runs/v1/best_model.pkl --prior --plot        # + the untrained policy, + a figure of BIS / infusion quantiles
+  python evaluate.py runs/train/best_model.pkl                       # validation scenarios, 1000 patients each
+  python evaluate.py runs/train/best_model.pkl --stress --n 2000     # + the out-of-distribution stress scenarios
+  python evaluate.py runs/train/best_model.pkl --prior --plot        # + the untrained policy, + a figure of BIS / infusion quantiles
+  python evaluate.py runs/ft/best_model.pkl --extra winner=runs/search/best_model.pkl --stim-times 10,15,20,25
+                                                                   # + another model; + a stimulus of 0.3 at each of these times (min)
 
 The policy runs in the JAX closed loop, the baselines on the numpy plant (both checked equal by selftest.py). Prints, per scenario, the mean
 J of every controller and the paired difference policy - baseline (95% CI, share of patients where the policy is better). Writes
-<out>/results.json and per-patient metrics <out>/<scenario>.npz. Also accepts the best_model.pkl files of the old meta_opt runs (v1).
+<out>/results.json and per-patient metrics <out>/<scenario>.npz. Also accepts the best_model.pkl files of the old meta_opt runs.
 """
 import argparse, json, os, pickle, time
 import numpy as np
@@ -19,6 +21,7 @@ import model as M
 import policy as P
 import baselines as BL
 
+jax.config.update("jax_default_matmul_precision", "highest")    # float32 matmuls (not TF32): the policy computes what it was trained on
 EVAL_KEY = jax.random.PRNGKey(8_000_000)
 
 
@@ -40,6 +43,8 @@ def main():
     ap.add_argument("--out", default="", help="default: <model folder>/eval")
     ap.add_argument("--stress", action="store_true")
     ap.add_argument("--prior", action="store_true", help="also the untrained policy (prior compensator) of the model's config")
+    ap.add_argument("--extra", action="append", default=[], help="name=path: another model on the same patients")
+    ap.add_argument("--stim-times", default="", help="comma separated times (min): a scenario with a stimulus of 0.3 at each")
     ap.add_argument("--baselines", default=",".join(BL.BASELINES), help="comma separated, from: " + ", ".join(BL.BASELINES))
     ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
@@ -51,10 +56,15 @@ def main():
     if args.prior:
         cfg = {**P.ARCH_DEFAULTS, **(m.get("cfg") or {})}
         ctrls["prior"] = P.init_params(jax.random.PRNGKey(0), cfg)
+    for e in args.extra:
+        n, path = e.split("=", 1)
+        ctrls[n] = jax.tree_util.tree_map(jnp.asarray, pickle.load(open(path, "rb"))["params"])
     names = [b for b in args.baselines.split(",") if b]
     scen = {n: sp for n, (sp, _w) in M.VAL.items()}
     if args.stress:
         scen.update(M.STRESS)
+    for t in (float(x) for x in args.stim_times.split(",") if x):
+        scen[f"stim_at_{t:g}"] = M.spec(stim_p=1.0, stim_lo=0.3, stim_hi=0.3, stim_tlo=t, stim_thi=t)
 
     res, curves = {}, {}
     for si, (sname, sp) in enumerate(scen.items()):
@@ -101,7 +111,7 @@ def plot(curves, path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     show = [s for s in ("nominal", "delay_60s", "mixed_hard") if s in curves]
-    ctr = [c for c in ("policy", "UKF+LQR", "oracle-CE") if c in curves[show[0]]]
+    ctr = [c for c in ("policy", "UKF-MM", "UKF+LQR", "oracle-CE") if c in curves[show[0]]]
     t = np.arange(M.N) * M.DT
     fig, ax = plt.subplots(2, len(show), figsize=(5 * len(show), 6), sharex=True, squeeze=False)
     for j, s in enumerate(show):

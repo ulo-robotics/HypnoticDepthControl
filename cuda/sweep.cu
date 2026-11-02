@@ -5,7 +5,7 @@
 // Layouts (kcuda.py packs / unpacks them):
 //   kp   flat parameters: sc[4] | lamr lami Bur Bui Bwr Bwi Cor Coi [PP each] | enc0..enc3 enc_b [H each] | dec [HD or H] |
 //        (HD > 0) hW [H*HD] hWT [HD*H] hb [HD] | per layer: Ar Ai Br Bi Cr Ci [H*NS] K0 D [H] Wv WvT Wg WgT [H*H] bv bg g beta [H]
-//   q    (B, 43): mu a_ou osc stim gamma e0 emax | dmask[16] | Ad[16] (row major) | Bd[4]
+//   q    (B, 44): mu a_ou osc stim gamma e0 emax | dmask[16] | Ad[16] (row major) | Bd[4] | stim_t
 //   st   (6, N, B): z0 z1 tg sy r rho
 //   tape (N, B, S), S = 6 + 2 PP + 16: x0 x1 x2 x3 ou up | hpr[PP] | hpi[PP] | buf[16]   (forward: carry before step k; backward: adjoint of the carry after step k)
 //   ys / e  (NL, N, B, H);  sums (3, B): cost, (b - tg)^2, relu(40 - b)^2 summed over the episode
@@ -18,7 +18,7 @@ namespace ffi = xla::ffi;
 #ifndef H
 #error "compile with -DH=.. -DNS=.. -DNL=.. -DHD=.. -DPP=.. -DWPB=.."
 #endif
-constexpr int NSTEP = 360, DP = 16, NQ = 43;
+constexpr int NSTEP = 360, DP = 16, NQ = 44;
 constexpr float DT = 5.0f / 60.0f, T_END = 30.0f, UMAX = 100.0f, E0N = 100.0f, EMAXN = 100.0f, GAMN = 2.0f, C50N = 4.5f;
 constexpr int CH = (H + 31) / 32;                       // channels per lane
 constexpr int HDV = HD > 0 ? HD : H;                    // length of the decoder vector
@@ -69,7 +69,7 @@ __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x))
 __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
 struct Patient {      // per-patient constants (warp-uniform)
-  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4];
+  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4], stim_t;
   __device__ void load(const float* q, int b) {
     const float* r = q + (size_t)b * NQ;
     mu = r[0]; a_ou = r[1]; osc = r[2]; stim = r[3]; gam = r[4]; e0 = r[5]; emax = r[6];
@@ -79,6 +79,7 @@ struct Patient {      // per-patient constants (warp-uniform)
     for (int j = 0; j < 16; j++) A[j] = r[23 + j];
 #pragma unroll
     for (int j = 0; j < 4; j++) Bd[j] = r[39 + j];
+    stim_t = r[43];
   }
 };
 
@@ -91,7 +92,7 @@ __device__ __forceinline__ void pre_stage(const Patient& P, int k, float x3, flo
                                           Pre& o) {
   float t = k * DT;
   o.ce = fmaxf(x3, 0.0f);
-  float l50 = P.mu + ou + P.stim * (t > 20.0f ? 1.0f : 0.0f);
+  float l50 = P.mu + ou + P.stim * (t > P.stim_t ? 1.0f : 0.0f);
   o.cg = powf(o.ce, P.gam);
   o.eg = powf(expf(l50), P.gam);
   o.b = P.e0 - P.emax * o.cg / (o.cg + o.eg);

@@ -10,10 +10,10 @@ the same shape, and many small recurrences fill the GPU together.
 
 Configuration = optimization (opt, lr, phys_mult, ssm_mult, clip, omb1 = 1 - beta1, omb2 = 1 - beta2, wd, sched, warm, tc, floor, ema), loss
 weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design (q_theta, sy_scale, rho_lqr, q_x), plus the training setup
-(patient_clip, nominal_frac, max_delay, delay_ramp, batch). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
+(patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
-import math, os, pickle, time
-from functools import partial
+import json, math, os, pickle, threading, time
+from functools import partial, reduce
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -25,6 +25,7 @@ import engine as E
 
 jax.config.update("jax_default_matmul_precision", "highest")    # every engine computes the same float32 function (no TF32 in raw JAX)
 try:
+    os.makedirs(os.path.join(E.CACHE, "jax", "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)   # XLA does not create it on a fresh cache
     jax.config.update("jax_compilation_cache_dir", os.path.join(E.CACHE, "jax"))
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 2.0)
 except Exception:                                                # pragma: no cover
@@ -46,11 +47,12 @@ SPACE = [
     ("q_theta", "log", 2e-4, 2e-2), ("sy_scale", "log", 0.5, 2.0), ("rho_lqr", "log", 1e-5, 1e-2), ("q_x", "log", 1e-5, 1e-3),
 ]
 PRIOR_KEYS = ("q_theta", "sy_scale", "rho_lqr", "q_x")
-SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512)
+SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="random")
 
-# the selected configuration (winner of the last large search): train.py's default
-SELECTED = dict(opt="adabelief", lr=8.8e-3, phys_mult=0.24, ssm_mult=0.30, clip=1.0, omb1=0.1, omb2=1e-3, wd=1e-2, sched="exp", warm=25,
-                tc=1538.0, floor=0.14, ema=0.98, w_low=0.87, rho_u=0.21, **P.ARCH_DEFAULTS, **SETUP)
+# the selected configuration (winner of the paper's search, runs/search_full: config 171): train.py's default
+SELECTED = dict(opt="nadamw", lr=7.38e-3, phys_mult=0.024, ssm_mult=0.954, clip=2.0, omb1=0.0538, omb2=8.17e-4, wd=1.55e-2, sched="wsd",
+                warm=100, tc=509.1, floor=1.15e-3, ema=0.99, w_low=4.75, rho_u=0.256, H=32, NS=16, L=3, head=64, n_extra=8,
+                q_theta=2.87e-3, sy_scale=0.999, rho_lqr=1.64e-3, q_x=1.40e-4, **SETUP)
 # the search's starting point (trial 0 of a search; the old meta_opt DEFAULT_CFG)
 SEARCH_BASE = dict(opt="adam", lr=1e-3, phys_mult=0.1, ssm_mult=0.33, clip=1.0, omb1=0.1, omb2=1e-3, wd=1e-2, sched="const", warm=0,
                    tc=1000.0, floor=0.1, ema=0.99, w_low=2.0, rho_u=2.0, H=32, NS=32, L=1, head=0, n_extra=0,
@@ -129,24 +131,26 @@ def opt_update(names, ost, g, params, hp, it):
 
 # ---------------------------------------------------------------- per-patient clipping
 def aggregate(g, k):
-    """per-patient gradients (leading axis B) -> clipped mean. Non-finite patients are dropped. Returns (gradient, clipped share)"""
+    """per-patient gradients (leading axis B) -> clipped mean. Non-finite patients are dropped. Returns (gradient, clipped share).
+    Two passes over the gradients: per patient finiteness and squared norm (sibling reductions, one fused pass per leaf), then the weighted
+    sum"""
     leaves, tdef = jax.tree_util.tree_flatten(g)
     B = leaves[0].shape[0]
-    flat = jnp.concatenate([x.reshape(B, -1) for x in leaves], 1)
-    fin = jnp.all(jnp.isfinite(flat), 1)
-    flat = jnp.where(fin[:, None], flat, 0.0)
-    amax = jnp.max(jnp.abs(flat), 1)
-    nrm = amax * jnp.sqrt(jnp.sum((flat / jnp.where(amax > 0, amax, 1.0)[:, None]) ** 2, 1))     # no float32 overflow
+    rows = [x.reshape(B, -1) for x in leaves]
+    fin = reduce(jnp.logical_and, [jnp.all(jnp.isfinite(x), 1) for x in rows])
+    z = [jnp.where(jnp.isfinite(x), x, 0.0) for x in rows]
+    ss = sum(jnp.sum(v ** 2, 1) for v in z)
+    sl = sum(jnp.sum((v * 2.0 ** -64) ** 2, 1) for v in z)          # same pass: the norm where the squares above overflow float32
+    nrm = jnp.where(jnp.isfinite(ss), jnp.sqrt(ss), jnp.sqrt(sl) * 2.0 ** 64)
     if k > 0:
         pos = fin & (nrm > 0)
         med = jnp.nanmedian(jnp.where(pos, nrm, jnp.nan))
         scale = jnp.where(pos, jnp.minimum(1.0, k * med / jnp.maximum(nrm, 1e-30)), 0.0)
         scale = jnp.where(jnp.isfinite(scale), scale, 0.0)
     else:
-        scale = fin.astype(flat.dtype)
-    out = jnp.sum(flat * scale[:, None], 0) / B
-    parts = jnp.split(out, np.cumsum([int(np.prod(x.shape[1:])) for x in leaves])[:-1])
-    return jax.tree_util.tree_unflatten(tdef, [p.reshape(x.shape[1:]) for p, x in zip(parts, leaves)]), jnp.mean(scale < 1.0)
+        scale = fin.astype(rows[0].dtype)
+    out = [jnp.sum(jnp.where(scale[:, None] > 0, x * scale[:, None], 0.0), 0) / B for x in rows]
+    return jax.tree_util.tree_unflatten(tdef, [o.reshape(x.shape[1:]) for o, x in zip(out, leaves)]), jnp.mean(scale < 1.0)
 
 
 # ---------------------------------------------------------------- states, validation
@@ -169,13 +173,13 @@ def new_state(c, init_key):
 
 def train_spec(setup, it):
     dmax = jnp.minimum(setup["max_delay"], jnp.floor(setup["max_delay"] * it / max(setup["delay_ramp"], 1)))
-    return dict(M.TRAIN, dmax=dmax)
+    return dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax)
 
 
 def make_validate(n, stats_fn, scenarios=None, per_patient=False):
-    """validation of a population on n new patients per scenario (default: model.VAL), the same patients for every member.
+    """validation of a population on n new patients per scenario (default: model.val_specs()), the same patients for every member.
     stats_fn(tp, sz, pts) -> per-patient (J, viol) of one member. Returns validate(tp, sz, key) -> per member {scenario: {J, viol}}"""
-    scen = scenarios or {k: v[0] for k, v in M.VAL.items()}
+    scen = scenarios or M.val_specs()
     names = list(scen)
     specs = {k: jnp.asarray([scen[s][k] for s in names], jnp.float32) for k in M.SPEC_NOMINAL}
 
@@ -199,9 +203,9 @@ def make_validate(n, stats_fn, scenarios=None, per_patient=False):
     return validate
 
 
-def evaluate(models, n, key, per_patient=False):
+def evaluate(models, n, key, per_patient=False, stimulus="random"):
     """compact parameter trees (one network each, any sizes) on the validation scenarios, raw JAX forward; list of per-model stats"""
-    val = make_validate(n, E.forward_stats_fn({}), per_patient=per_patient)
+    val = make_validate(n, E.forward_stats_fn({}), M.val_specs(stimulus), per_patient=per_patient)
     out = []
     for p in models:
         tp, sz = P.expand(jax.tree_util.tree_map(jnp.asarray, p))
@@ -210,6 +214,19 @@ def evaluate(models, n, key, per_patient=False):
 
 
 # ---------------------------------------------------------------- the population
+_PROGRAMS, _PROGRAMS_LOCK = {}, threading.Lock()     # compiled training blocks and validations, shared by the populations of a process
+
+
+def _program(key, build):
+    """the compiled program for key, built once per process (search.py prepares populations in threads: a duplicate build is harmless)"""
+    with _PROGRAMS_LOCK:
+        if key in _PROGRAMS:
+            return _PROGRAMS[key]
+    prog = build()
+    with _PROGRAMS_LOCK:
+        return _PROGRAMS.setdefault(key, prog)
+
+
 def own_shape(c):
     """training-layout shape of a configuration's network"""
     return dict(H=int(c["H"]), NS=int(c["NS"]), L=int(c["L"]), HD=max(int(c["head"]), 1), P=5 + int(c["n_extra"]))
@@ -254,13 +271,28 @@ class Population:
         self._validate = None
         self._blocks, self._exe = {}, {}
 
+    def _sig(self, *extra):
+        """everything a compiled block / validation depends on: two populations with the same signature run the same program (the
+        hyperparameters, states and data key are arguments)"""
+        spec = lambda t: jax.tree_util.tree_map(lambda a: [list(a.shape), str(a.dtype)], t)
+        eng = {k: v for k, v in self.engine.items() if not k.endswith(("_ms", "_s"))}
+        return json.dumps([self.n, self.shape, self.names, self.setup, eng, self.plain, spec(self.state), spec(self.sz), spec(self.hp), *extra],
+                          sort_keys=True, default=str)
+
+    def _validator(self):
+        def build():
+            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
+            v.compile(self.state["ema"], self.sz, VAL_KEY)
+            return v
+        return _program(("val", self._sig(self.val_batch)), build)
+
     def compile(self):
         """compile the training block and the validation ahead of time (no GPU work: search.py does this for the next population while the
-        current one trains)"""
+        current one trains); a population with the same program as an earlier one of the process reuses it"""
         K = self.block
-        self._exe[K] = self._block_fn(K).lower(self.state, self.sz, self.hp, self.key, jnp.int32(self.it)).compile()
-        self._validate = make_validate(self.val_batch, self.stats_fn)
-        self._validate.compile(self.state["ema"], self.sz, VAL_KEY)
+        self._exe[K] = _program(("block", self._sig(K)),
+                                lambda: self._block_fn(K).lower(self.state, self.sz, self.hp, self.key, jnp.int32(self.it)).compile())
+        self._validate = self._validator()
 
     def _block_fn(self, K):
         """K training iterations as one jitted scan (the state is donated)"""
@@ -303,7 +335,7 @@ class Population:
     def validate(self, key, which="ema"):
         """per member: (stats per scenario, score)"""
         if self._validate is None:
-            self._validate = make_validate(self.val_batch, self.stats_fn)
+            self._validate = self._validator()
         return [(st, M.score(st)) for st in self._validate(self.state[which], self.sz, key)]
 
     def member_states(self):
