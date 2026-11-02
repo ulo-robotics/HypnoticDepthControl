@@ -128,17 +128,21 @@ Per-patient gradient of a population of 8 networks of the selected configuration
 | whole gradient | 288 ms | 110 ms (with the assembly of `cuda/casm.cu`) |
 
 The blocked CUDA kernels at the search shapes (population of 8, padded like `search.py`, 512 patients, warm GPU, the engine's choice from
-an empty cache, median of 11 calls). The kernels pipeline the block-end loads of the S4D modes, load the tensor-core weights as packed TF32
-fragments, compute the sigmoid and GELU on the special-function unit (`ex2.approx`, `rcp.approx`: about 2^-22 relative) and are built
-for a fixed batch size; the first column is the previous kernels (`5ffcd8f`), which themselves took L3 H64 NS32 from 437 ms to 280 ms:
+an empty cache, median of 11 calls). The kernels pipeline the block-end loads of the S4D modes, read the tensor-core weights in fragment
+order as plain float32 and split every operand into its TF32 hi / lo parts in registers (hi = the top 19 bits, a mask; lo = x - hi, exact
+in float32), so the weights are read once instead of as two arrays and the activations are staged in shared memory once; they compute the
+sigmoid and GELU on the special-function unit (`ex2.approx`, `rcp.approx`: about 2^-22 relative), take the two reductions of the
+layer-norm backward in one pass (the centred inputs sum to zero over the active channels), and are built for a fixed batch size. The
+first column is the previous kernels (`0d7befc`, measured again with the same protocol), which took L3 H64 NS32 from 437 ms to 280 ms
+and then to 247 ms:
 
 | shape (L H NS) | before | now |
 |---|---|---|
-| 3 64 32 | 280 ms | 247 ms |
-| 2 64 32 | 181 ms | 152 ms |
-| 3 32 32 | 146 ms | 117 ms |
-| 3 32 16 | 117 ms | 92 ms |
-| 3 16 8 | 60 ms | 43 ms |
+| 3 64 32 | 249 ms | 225 ms |
+| 2 64 32 | 153 ms | 145 ms |
+| 3 32 32 | 123 ms | 112 ms |
+| 3 32 16 | 94 ms | 92 ms |
+| 3 16 8 | 44 ms | 40 ms |
 
 ## Inference engine
 `cpp/lethe_infer.hpp` is the deployed controller as a single dependency-free C++17 header: load the file written by `export_cpp.py`, then

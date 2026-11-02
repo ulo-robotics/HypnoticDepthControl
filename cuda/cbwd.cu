@@ -23,7 +23,7 @@ namespace ffi = xla::ffi;
 #define CP5 ((P5P + LANES - 1) / LANES)
 #define FULL 0xffffffffu
 #define TCW (TC && PB % 8 == 0)                                       // the matmuls on tensor cores (weights packed by cbwd.py)
-#define PSZ(KD, ND) ((((ND) + 15) / 16) * 16 * (KD) * 2)            // floats of a packed weight matrix
+#define PSZ(KD, ND) ((((ND) + 15) / 16) * 16 * (KD))            // floats of a packed weight matrix
 #define WSZ(KD, ND) (TCW ? PSZ(KD, ND) : (KD) * (ND))
 #define LDS (((2 * HP) > HDP ? (2 * HP) : HDP) + 4)                // (+ 4: rows on distinct banks)
 #define S_TAPE (6 + 2 * P5P + DPAD)
@@ -62,9 +62,9 @@ __device__ __forceinline__ void gelu_d(float x, float& y, float& d) {   // 0.5 x
   d = sg + 2.f * x * sg * (1.f - sg) * c * (1.f + 3.f * 0.044715f * x * x);
 }
 
-// Y[p][n] = sum_k X[p][k] W[k][n] (+ sum_k X2[p][k] W2[k][n]) + bias[n]; X = hi + lo staged in shared memory (row length LDS), W global.
+// Y[p][n] = sum_k X[p][k] W[k][n] (+ sum_k X2[p][k] W2[k][n]) + bias[n]; X staged in shared memory (row length LDS), W global.
 template <int KD, int KD2, int ND>
-__device__ __forceinline__ void mm(const float* X, const float* XL, const float* __restrict__ W, const float* X2, const float* XL2, const float* __restrict__ W2,
+__device__ __forceinline__ void mm(const float* X, const float* __restrict__ W, const float* X2, const float* __restrict__ W2,
                                    const float* __restrict__ bias, float* Y) {
   const int t = threadIdx.x;
   if constexpr (ND >= LANES) {
@@ -85,7 +85,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
       for (int c = 0; c < TN; c++) w[c] = __ldg(W + k * ND + nt + c * NCT);
 #pragma unroll
       for (int a = 0; a < TP; a++) {
-        const float x = X[(pt * TP + a) * LDS + k] + XL[(pt * TP + a) * LDS + k];
+        const float x = X[(pt * TP + a) * LDS + k];
 #pragma unroll
         for (int c = 0; c < TN; c++) acc[a][c] = fmaf(x, w[c], acc[a][c]);
       }
@@ -98,7 +98,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
         for (int c = 0; c < TN; c++) w[c] = __ldg(W2 + k * ND + nt + c * NCT);
 #pragma unroll
         for (int a = 0; a < TP; a++) {
-          const float x = X2[(pt * TP + a) * LDS + k] + XL2[(pt * TP + a) * LDS + k];
+          const float x = X2[(pt * TP + a) * LDS + k];
 #pragma unroll
           for (int c = 0; c < TN; c++) acc[a][c] = fmaf(x, w[c], acc[a][c]);
         }
@@ -112,32 +112,34 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
     for (int o = t; o < PB * ND; o += NT) {
       const int p = o / ND, n = o % ND;
       float s = bias ? __ldg(bias + n) : 0.f;
-      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k] + XL[p * LDS + k], __ldg(W + k * ND + n), s);
-      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k] + XL2[p * LDS + k], __ldg(W2 + k * ND + n), s);
+      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k], __ldg(W + k * ND + n), s);
+      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k], __ldg(W2 + k * ND + n), s);
       Y[p * LDS + n] = s;
     }
   }
 }
 
-// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32), transposed: the weights are the 16-row A operand (W = hi + lo, packed by
-// cbwd.py in fragment order: per 16-channel tile and 8-row k slice, each lane's 4 hi then 4 lo values), the block's patients the 8 columns of
-// B (X = hi + lo staged in shared memory); one warp per 16 channels x 8 patients
-__device__ __forceinline__ uint32_t tf32(float x) { uint32_t r; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x)); return r; }
+// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32, hi / lo split by split3 where the operands are read), transposed: the
+// weights are the 16-row A operand (packed by cbwd.py in fragment order: per 16-channel tile and 8-row k slice, one float4 per lane), the
+// block's patients the 8 columns of B (X staged in shared memory as fp32); one warp per 16 channels x 8 patients
+__device__ __forceinline__ void split3(float x, uint32_t& hi, uint32_t& lo) {   // TF32 hi = the top 19 bits of x; lo = x - hi, exact in fp32
+  hi = __float_as_uint(x) & 0xFFFFE000u;
+  lo = __float_as_uint(x - __uint_as_float(hi));
+}
 __device__ __forceinline__ void mma8(float d[4], const uint32_t a[4], const uint32_t b[2]) {
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 template <int KD, int K0 = 0, int K1 = KD>
-__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, int mt, int p0, int ln, int gid, int tq) {
-  const float4* f = reinterpret_cast<const float4*>(W) + ((size_t)mt * (KD / 8) * 32 + ln) * 2 + (K0 / 8) * 64;
+__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* __restrict__ W, int mt, int p0, int ln, int gid, int tq) {
+  const float4* f = reinterpret_cast<const float4*>(W) + (size_t)mt * (KD / 8) * 32 + ln + (K0 / 8) * 32;
 #pragma unroll 4
-  for (int k0 = K0; k0 < K1; k0 += 8, f += 64) {                     // per k slice: 32 lanes x (4 hi, 4 lo); rows K0 .. K1 - 1 of W
-    const float4 h = __ldg(f), lo = __ldg(f + 1);
-    const uint32_t ah[4] = {__float_as_uint(h.x), __float_as_uint(h.y), __float_as_uint(h.z), __float_as_uint(h.w)};
-    const uint32_t al[4] = {__float_as_uint(lo.x), __float_as_uint(lo.y), __float_as_uint(lo.z), __float_as_uint(lo.w)};
+  for (int k0 = K0; k0 < K1; k0 += 8, f += 32) {                     // per k slice: 32 lanes x 4 values; rows K0 .. K1 - 1 of W
+    const float4 w = __ldg(f);
+    uint32_t ah[4], al[4], bh[2], bl[2];
+    split3(w.x, ah[0], al[0]); split3(w.y, ah[1], al[1]); split3(w.z, ah[2], al[2]); split3(w.w, ah[3], al[3]);
     const int xi = (p0 + gid) * LDS + k0 + tq;
-    const uint32_t bh[2] = {__float_as_uint(X[xi]), __float_as_uint(X[xi + 4])};
-    const uint32_t bl[2] = {__float_as_uint(XL[xi]), __float_as_uint(XL[xi + 4])};
+    split3(X[xi], bh[0], bl[0]); split3(X[xi + 4], bh[1], bl[1]);
     mma8(d, al, bh);
     mma8(d, ah, bl);
     mma8(d, ah, bh);
@@ -147,8 +149,8 @@ __device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL
 // for 8 warps). Two uses: two products over the same X (X2 = X); one product split in two halves of K (W2 = W, KSPLIT = 1: rows KD / 2 .. KD - 1
 // into Y2, the consumer adds Y + Y2)
 template <int KD, int ND, int KSPLIT = 0>
-__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* W, const float* __restrict__ bias, float* Y,
-                                    const float* X2, const float* XL2, const float* W2, const float* __restrict__ bias2, float* Y2) {
+__device__ __forceinline__ void mmx(const float* X, const float* W, const float* __restrict__ bias, float* Y,
+                                    const float* X2, const float* W2, const float* __restrict__ bias2, float* Y2) {
   static_assert(ND % 8 == 0 && KD % 8 == 0, "cbwd: matrix sizes are multiples of 8");
   constexpr int K2 = KSPLIT && KD % 16 == 0;                          // (K = 8: not split, Y2 = 0)
   if constexpr (TCW && (K2 || !KSPLIT)) {
@@ -162,11 +164,11 @@ __device__ __forceinline__ void mmx(const float* X, const float* XL, const float
       const float b0 = bs ? __ldg(bs + c0 + gid) : 0.f, b1 = bs && up ? __ldg(bs + c0 + gid + 8) : 0.f;
       float d[4] = {b0, b0, b1, b1};
       if (!sec) {
-        if constexpr (K2) tc_k<KD, 0, KD / 2>(d, X, XL, W, mt, p0, ln, gid, tq);
-        else tc_k<KD>(d, X, XL, W, mt, p0, ln, gid, tq);
+        if constexpr (K2) tc_k<KD, 0, KD / 2>(d, X, W, mt, p0, ln, gid, tq);
+        else tc_k<KD>(d, X, W, mt, p0, ln, gid, tq);
       } else {
-        if constexpr (K2) tc_k<KD, KD / 2, KD>(d, X2, XL2, W2, mt, p0, ln, gid, tq);
-        else tc_k<KD>(d, X2, XL2, W2, mt, p0, ln, gid, tq);
+        if constexpr (K2) tc_k<KD, KD / 2, KD>(d, X2, W2, mt, p0, ln, gid, tq);
+        else tc_k<KD>(d, X2, W2, mt, p0, ln, gid, tq);
       }
       float* Yo = sec ? Y2 : Y;
       const int y0 = (p0 + 2 * tq) * LDS + c0 + gid;
@@ -174,13 +176,13 @@ __device__ __forceinline__ void mmx(const float* X, const float* XL, const float
       if (up) { Yo[y0 + 8] = d[2]; Yo[y0 + LDS + 8] = d[3]; }
     }
   } else if constexpr (KSPLIT) {                                      // whole K into Y, Y2 = 0
-    if constexpr (TCW) mmx<KD, ND>(X, XL, W, bias, Y, X, XL, W, bias, Y2);
-    else mm<KD, 0, ND>(X, XL, W, nullptr, nullptr, nullptr, bias, Y);
+    if constexpr (TCW) mmx<KD, ND>(X, W, bias, Y, X, W, bias, Y2);
+    else mm<KD, 0, ND>(X, W, nullptr, nullptr, bias, Y);
     __syncthreads();
     for (int o = threadIdx.x; o < PB * ND; o += NT) Y2[(o / ND) * LDS + o % ND] = 0.f;
   } else {
-    mm<KD, 0, ND>(X, XL, W, nullptr, nullptr, nullptr, bias, Y);
-    mm<KD, 0, ND>(X2, XL2, W2, nullptr, nullptr, nullptr, bias2, Y2);
+    mm<KD, 0, ND>(X, W, nullptr, nullptr, bias, Y);
+    mm<KD, 0, ND>(X2, W2, nullptr, nullptr, bias2, Y2);
   }
 }
 
@@ -199,9 +201,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
   float* SZG = SZV + LP * PB * HP;                  // [LP][PB][HP]
   float* SGA = SZG + LP * PB * HP;                  // [LP][PB][HP] GELU derivative at the S4D output
   float* SLN = SGA + LP * PB * HP;                  // [LP][PB][2] (mean, 1 / std)
-  float* SX = SLN + LP * PB * 2;                    // [PB][LDS] matmul input staging (TF32 hi)
-  float* SXL = SX + PB * LDS;                       // [PB][LDS] TF32 lo parts
-  float* SY = SXL + PB * LDS;                       // [PB][LDS] matmul output staging
+  float* SX = SLN + LP * PB * 2;                    // [PB][LDS] matmul input staging (fp32)
+  float* SY = SX + PB * LDS;                        // [PB][LDS] matmul output staging
   float* SY2 = SY + PB * LDS;                       // [PB][LDS] second matmul output (the other half of a product)
   float* SV = SY2 + PB * LDS;                       // [NV][HP] member vectors
   float* SHD = SV + NV * HP;                        // [2][HDP] head_b1, head_dec
@@ -240,7 +241,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
 #pragma unroll
   for (int l = 0; l < LP; l++) glv[l] = LD(gl, g * LP + l);
 #define SVv(v, j) SV[(v) * HP + lane + LANES * (j)]
-#define STX(i, v) do { const float v_ = (v); const uint32_t hb_ = tf32(v_); SX[i] = __uint_as_float(hb_); SXL[i] = __uint_as_float(tf32(v_ - __uint_as_float(hb_))); } while (0)
+#define STX(i, v) (SX[i] = (v))                        // fp32: split into TF32 hi / lo where the tensor cores read it
 
 #if GRADS
   float a_encW[4][CH], a_encb[CH], a_decl[CH], a_lng[LP][CH], a_lnb[LP][CH], a_hdec[CHD], a_p5[8][CP5];
@@ -372,8 +373,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
         }
         __syncthreads();
         const size_t wo = ((size_t)g * LP + l) * WSZ(HP, HP);
-        mmx<HP, HP>(SX, SXL, INP(L_Wv) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY,
-                    SX, SXL, INP(L_Wg) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
+        mmx<HP, HP>(SX, INP(L_Wv) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY,
+                    SX, INP(L_Wg) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
         __syncthreads();
         float v[CH], ps = 0.f;
 #pragma unroll
@@ -413,8 +414,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
 #if HEAD
       float hid[CHD], hgd[CHD];
       __syncthreads();
-      mmx<HP, HDP, 1>(SX, SXL, INP(head_W1) + (size_t)g * WSZ(HP, HDP), INP(head_b1) + g * HDP, SY,
-                      SX, SXL, INP(head_W1) + (size_t)g * WSZ(HP, HDP), nullptr, SY2);
+      mmx<HP, HDP, 1>(SX, INP(head_W1) + (size_t)g * WSZ(HP, HDP), INP(head_b1) + g * HDP, SY,
+                      SX, INP(head_W1) + (size_t)g * WSZ(HP, HDP), nullptr, SY2);
       __syncthreads();
       float poh = 0.f;
 #pragma unroll
@@ -490,7 +491,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
           }
         }
         __syncthreads();
-        mmx<HDP, HP, 1>(SX, SXL, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY, SX, SXL, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY2);
+        mmx<HDP, HP, 1>(SX, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY, SX, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY2);
         __syncthreads();
       }
 #endif
@@ -531,7 +532,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
         const float* ysk = INP(t_ys) + ((((size_t)g * LP + l) * NSTEP + k) * B + bb) * HP;
         const size_t to = ((((size_t)g * LP + l) * B + bb) * NSTEP + k) * HP;
         float* xk = OUT(t_x) + ((gB + bb) * NSTEP + k) * WX + l * 2 * HP;          // this step's (u, cy) of layer l
-        float u[CH], dv[CH], tt[CH], d_u[CH], zvv[CH], sgv[CH], ptd = 0.f;
+        float u[CH], dv[CH], tt[CH], d_u[CH], zvv[CH], sgv[CH], ptd = 0.f, ptt = 0.f;
 #pragma unroll
         for (int j = 0; j < CH; j++) {
           const int h = lane + LANES * j;
@@ -548,15 +549,13 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
 #endif
           tt[j] = d_out * SVv(VL(l, 3), j);
           ptd += tt[j] * dv[j];
+          ptt += tt[j] * mh;
         }
-        const float s_td = AR(ptd);
-        float d_dv[CH], pdd = 0.f;
+        // sum_h d_dv_h mH_h = inv sum_h tt_h mH_h, since dv sums to zero over the active channels: one round of butterflies for both sums
+        const float s_td = AR(ptd), s_dd = inv * AR(ptt) * nHi;
+        float d_dv[CH];
 #pragma unroll
-        for (int j = 0; j < CH; j++) {
-          d_dv[j] = tt[j] * inv - inv * inv * inv * s_td * dv[j] * nHi;
-          pdd += d_dv[j] * SVv(V_mH, j);
-        }
-        const float s_dd = AR(pdd) * nHi;
+        for (int j = 0; j < CH; j++) d_dv[j] = tt[j] * inv - inv * inv * inv * s_td * dv[j] * nHi;
 #pragma unroll
         for (int j = 0; j < CH; j++) {
           const int h = lane + LANES * j;
@@ -572,7 +571,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
         }
         __syncthreads();
         const size_t wo = ((size_t)g * LP + l) * WSZ(HP, HP);
-        mmx<HP, HP>(SX, SXL, INP(L_WvT) + wo, nullptr, SY, SX + HP, SXL + HP, INP(L_WgT) + wo, nullptr, SY2);
+        mmx<HP, HP>(SX, INP(L_WvT) + wo, nullptr, SY, SX + HP, INP(L_WgT) + wo, nullptr, SY2);
         __syncthreads();
         // S4D (blocked adjoint): cot(u) += e + K0 cy,  e = F_i + sum_{j > i in the block} K[j - i] cy_j
         const float* Kl = INP(b_K) + ((size_t)g * LP + l) * TBLK * HP;
@@ -739,7 +738,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
 }
 
 static size_t smem_bytes() {
-  return sizeof(float) * (4 * LP * PB * HP + LP * PB * 2 + 4 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + PB * NQ);
+  return sizeof(float) * (4 * LP * PB * HP + LP * PB * 2 + 3 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + PB * NQ);
 }
 
 static ffi::Error Impl(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, int32_t B) {

@@ -11,7 +11,6 @@ import ctypes, hashlib, math, os, subprocess
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax
 
 import model as M
 import policy as P
@@ -35,7 +34,7 @@ def smem_bytes(d, pb):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
     lds = max(2 * H, HDP) + 4
     nv = 7 + 5 * L
-    return 4 * (4 * L * pb * H + L * pb * 2 + 4 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
+    return 4 * (4 * L * pb * H + L * pb * 2 + 3 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
 
 
 def valid(d, B, pb, lanes, T):
@@ -52,25 +51,14 @@ def nsm(d):
 
 
 # ---------------------------------------------------------------- inputs (one network; under vmap every input gets the member axis)
-MM_WEIGHTS = ("head_W1", "W1T", "L_Wv", "L_Wg", "L_WvT", "L_WgT")      # the kernels' tensor-core operands: packed TF32 hi / lo fragments
-
-
-def tf32_rna(x):
-    """x rounded to TF32 (10 mantissa bits) as cvt.rna.tf32.f32: to nearest, ties away from zero"""
-    u = lax.bitcast_convert_type(x, jnp.uint32)
-    return lax.bitcast_convert_type((u + jnp.uint32(0x1000)) & jnp.uint32(0xFFFFE000), jnp.float32)
-
-
-def tf32_split(w):
-    """w ~ hi + lo, both TF32 (the 3xTF32 operand split, done once instead of per step)"""
-    hi = tf32_rna(w)
-    return hi, tf32_rna(w - hi)
+MM_WEIGHTS = ("head_W1", "W1T", "L_Wv", "L_Wg", "L_WvT", "L_WgT")      # the kernels' tensor-core operands, in fragment order
 
 
 def tf32_pack(w):
-    """w (..., KD, ND) as the kernels' tensor-core A operand (W^T, 16 x 8 tiles of m16n8k8), split into TF32 hi / lo once instead of per step:
-    per 16-column tile, per 8-row k slice, per lane (gid, tq): hi of w[k0 + tq][c0 + gid], w[k0 + tq][c0 + gid + 8], w[k0 + tq + 4][c0 + gid],
-    w[k0 + tq + 4][c0 + gid + 8], then the same lo parts. Columns padded to a multiple of 16 with zeros. Flat (..., PSZ(KD, ND))"""
+    """w (..., KD, ND) as the kernels' tensor-core A operand (W^T, 16 x 8 tiles of m16n8k8) in fragment order: per 16-column tile, per 8-row
+    k slice, per lane (gid, tq): w[k0 + tq][c0 + gid], w[k0 + tq][c0 + gid + 8], w[k0 + tq + 4][c0 + gid], w[k0 + tq + 4][c0 + gid + 8], one
+    float4 per lane and slice (the kernels split each value into TF32 hi / lo). Columns padded to a multiple of 16 with zeros. Flat (...,
+    PSZ(KD, ND))"""
     KD, ND = w.shape[-2:]
     MT = -(-ND // 16)
     w = jnp.pad(w, [(0, 0)] * (w.ndim - 1) + [(0, MT * 16 - ND)])
@@ -78,9 +66,7 @@ def tf32_pack(w):
     w = w.reshape(lead + (KD // 8, 2, 4, MT, 2, 8))                 # k = (slice, kh, tq), c = (tile, ch, gid)
     n = len(lead)
     w = jnp.transpose(w, tuple(range(n)) + tuple(n + i for i in (3, 0, 5, 2, 1, 4)))   # (tile, slice, gid, tq, kh, ch)
-    hi, lo = tf32_split(w)
-    hl = jnp.stack([hi, lo], -3)                                     # (..., gid, tq, hi / lo, kh, ch)
-    return hl.reshape(lead + (-1,))
+    return w.reshape(lead + (-1,))
 
 
 def pack_q(q):
@@ -209,7 +195,7 @@ def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, la
 # ---------------------------------------------------------------- the forward sweep (cuda/cfwd.cu, blocked S4D)
 def smem_fwd(d, pb, T):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
-    return 4 * (3 * pb * (max(2 * H, HDP) + 4) + (7 + 6 * L) * H + 2 * HDP + 8 * PP + L * T * H + pb * NQ)
+    return 4 * (2 * pb * (max(2 * H, HDP) + 4) + (7 + 6 * L) * H + 2 * HDP + 8 * PP + L * T * H + pb * NQ)
 
 
 def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):

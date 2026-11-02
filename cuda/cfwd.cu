@@ -16,7 +16,7 @@ namespace ffi = xla::ffi;
 #define CHD ((HDP + LANES - 1) / LANES)
 #define CP5 ((P5P + LANES - 1) / LANES)
 #define FULL 0xffffffffu
-#define PSZ(KD, ND) ((((ND) + 15) / 16) * 16 * (KD) * 2)            // floats of a packed tensor-core weight matrix
+#define PSZ(KD, ND) ((((ND) + 15) / 16) * 16 * (KD))            // floats of a packed tensor-core weight matrix
 #define LDS (((2 * HP) > HDP ? (2 * HP) : HDP) + 4)                // (+ 4: rows on distinct banks)
 #define S_TAPE (6 + 2 * P5P + DPAD)
 #define DPL ((DPAD + LANES - 1) / LANES)                      // delay-line entries per lane: entry lane + LANES j
@@ -47,25 +47,27 @@ __device__ __forceinline__ float gelu(float x) {                    // 0.5 x (1 
   return x * rcpa(1.f + ex2a(-c2 * (x + 0.044715f * x * x * x)));
 }
 
-__device__ __forceinline__ uint32_t tf32(float x) { uint32_t r; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x)); return r; }
+__device__ __forceinline__ void split3(float x, uint32_t& hi, uint32_t& lo) {   // TF32 hi = the top 19 bits of x; lo = x - hi, exact in fp32
+  hi = __float_as_uint(x) & 0xFFFFE000u;
+  lo = __float_as_uint(x - __uint_as_float(hi));
+}
 __device__ __forceinline__ void mma8(float d[4], const uint32_t a[4], const uint32_t b[2]) {
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
-// Y[p][c] = sum_k X[p][k] W[k][c] + bias[c] on tensor cores (3xTF32), transposed: the weights are the 16-row A operand (W = hi + lo, packed
-// by cbwd.py in fragment order: per 16-channel tile and 8-row k slice, each lane's 4 hi then 4 lo values), the block's patients the 8 columns
-// of B (X = hi + lo staged in shared memory); one warp per 16 channels x 8 patients
+// Y[p][c] = sum_k X[p][k] W[k][c] + bias[c] on tensor cores (3xTF32, hi / lo split by split3 where the operands are read), transposed: the
+// weights are the 16-row A operand (packed by cbwd.py in fragment order: per 16-channel tile and 8-row k slice, one float4 per lane), the
+// block's patients the 8 columns of B (X staged in shared memory as fp32); one warp per 16 channels x 8 patients
 template <int KD>
-__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, int mt, int p0, int ln, int gid, int tq) {
-  const float4* f = reinterpret_cast<const float4*>(W) + ((size_t)mt * (KD / 8) * 32 + ln) * 2;
+__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* __restrict__ W, int mt, int p0, int ln, int gid, int tq) {
+  const float4* f = reinterpret_cast<const float4*>(W) + (size_t)mt * (KD / 8) * 32 + ln;
 #pragma unroll 4
-  for (int k0 = 0; k0 < KD; k0 += 8, f += 64) {                      // per k slice: 32 lanes x (4 hi, 4 lo)
-    const float4 h = __ldg(f), lo = __ldg(f + 1);
-    const uint32_t ah[4] = {__float_as_uint(h.x), __float_as_uint(h.y), __float_as_uint(h.z), __float_as_uint(h.w)};
-    const uint32_t al[4] = {__float_as_uint(lo.x), __float_as_uint(lo.y), __float_as_uint(lo.z), __float_as_uint(lo.w)};
+  for (int k0 = 0; k0 < KD; k0 += 8, f += 32) {                      // per k slice: 32 lanes x 4 values
+    const float4 w = __ldg(f);
+    uint32_t ah[4], al[4], bh[2], bl[2];
+    split3(w.x, ah[0], al[0]); split3(w.y, ah[1], al[1]); split3(w.z, ah[2], al[2]); split3(w.w, ah[3], al[3]);
     const int xi = (p0 + gid) * LDS + k0 + tq;
-    const uint32_t bh[2] = {__float_as_uint(X[xi]), __float_as_uint(X[xi + 4])};
-    const uint32_t bl[2] = {__float_as_uint(XL[xi]), __float_as_uint(XL[xi + 4])};
+    split3(X[xi], bh[0], bl[0]); split3(X[xi + 4], bh[1], bl[1]);
     mma8(d, al, bh);
     mma8(d, ah, bl);
     mma8(d, ah, bh);
@@ -73,7 +75,7 @@ __device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL
 }
 // one or two products over the same X (the second when W2 != nullptr), their tiles spread over the block's warps
 template <int KD, int ND>
-__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* __restrict__ W, const float* __restrict__ bias, float* Y,
+__device__ __forceinline__ void mmx(const float* X, const float* __restrict__ W, const float* __restrict__ bias, float* Y,
                                     const float* __restrict__ W2 = nullptr, const float* __restrict__ bias2 = nullptr, float* Y2 = nullptr) {
   const int warp = threadIdx.x >> 5, ln = threadIdx.x & 31, gid = ln >> 2, tq = ln & 3;
   constexpr int MTL = (ND + 15) / 16, PT = PB / 8, NTI = MTL * PT;
@@ -86,7 +88,7 @@ __device__ __forceinline__ void mmx(const float* X, const float* XL, const float
     const bool up = ND % 16 == 0 || c0 + 8 < ND;
     const float b0 = bs ? __ldg(bs + c0 + gid) : 0.f, b1 = bs && up ? __ldg(bs + c0 + gid + 8) : 0.f;
     float d[4] = {b0, b0, b1, b1};
-    tc_k<KD>(d, X, XL, sec ? W2 : W, tl % MTL, p0, ln, gid, tq);
+    tc_k<KD>(d, X, sec ? W2 : W, tl % MTL, p0, ln, gid, tq);
     const int y0 = (p0 + 2 * tq) * LDS + c0 + gid;
     Yo[y0] = d[0]; Yo[y0 + LDS] = d[1];
     if (up) { Yo[y0 + 8] = d[2]; Yo[y0 + LDS + 8] = d[3]; }
@@ -101,9 +103,8 @@ enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em
 __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
   constexpr int B = BN;                              // patients per member (compile time: constant offsets)
   extern __shared__ float sm[];
-  float* SX = sm;                                   // [PB][LDS] matmul input staging (TF32 hi)
-  float* SXL = SX + PB * LDS;                       // [PB][LDS] TF32 lo parts
-  float* SY = SXL + PB * LDS;                       // [PB][LDS] matmul output staging
+  float* SX = sm;                                   // [PB][LDS] matmul input staging (fp32)
+  float* SY = SX + PB * LDS;                        // [PB][LDS] matmul output staging
   float* SV = SY + PB * LDS;                        // [NV][HP] member vectors
   float* SHD = SV + NV * HP;                        // [2][HDP] head_b1, head_dec
   float* SP5 = SHD + 2 * HDP;                       // [8][P5P] lamr lami Bur Bui Bwr Bwi Cor Coi
@@ -141,7 +142,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
 #pragma unroll
   for (int l = 0; l < LP; l++) glv[l] = LD(gl, g * LP + l);
 #define SVv(v, j) SV[(v) * HP + lane + LANES * (j)]
-#define STX(i, v) do { const float v_ = (v); const uint32_t hb_ = tf32(v_); SX[i] = __uint_as_float(hb_); SXL[i] = __uint_as_float(tf32(v_ - __uint_as_float(hb_))); } while (0)
+#define STX(i, v) (SX[i] = (v))                        // fp32: split into TF32 hi / lo where the tensor cores read it
 
   // carry
   float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f, ou = 0.f, up = 0.f, buf[DPL];
@@ -242,7 +243,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
         }
         __syncthreads();
         const size_t wo = ((size_t)g * LP + l) * PSZ(HP, HP);
-        mmx<HP, HP>(SX, SXL, INP(L_Wv) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY,
+        mmx<HP, HP>(SX, INP(L_Wv) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY,
                     INP(L_Wg) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
         __syncthreads();
         float v[CH], ps = 0.f;
@@ -271,7 +272,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
       float out_head = 0.f;
 #if HEAD
       __syncthreads();
-      mmx<HP, HDP>(SX, SXL, INP(head_W1) + (size_t)g * PSZ(HP, HDP), INP(head_b1) + g * HDP, SY);
+      mmx<HP, HDP>(SX, INP(head_W1) + (size_t)g * PSZ(HP, HDP), INP(head_b1) + g * HDP, SY);
       __syncthreads();
       float poh = 0.f;
 #pragma unroll
@@ -362,7 +363,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
   if (lane == 0) { OUT(sums)[gB * 3 + bb] = s_cost; OUT(sums)[gB * 3 + B + bb] = s_se; OUT(sums)[gB * 3 + 2 * B + bb] = s_v; }
 }
 
-static size_t smem_bytes() { return sizeof(float) * (3 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + LP * TBLK * HP + PB * NQ); }
+static size_t smem_bytes() { return sizeof(float) * (2 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + LP * TBLK * HP + PB * NQ); }
 
 static ffi::Error Impl(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, int32_t B, int32_t wtape) {
   Args A;
