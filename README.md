@@ -123,17 +123,18 @@ Per-patient gradient of a population of 8 networks of the selected configuration
 | backward sweep | 110 ms | 65 ms (without tapes) |
 | whole gradient | 288 ms | 110 ms (with the assembly of `cuda/casm.cu`) |
 
-The blocked CUDA kernels at the search shapes (population of 8, padded like `search.py`, 512 patients, warm GPU, the engine's choice; the
-first column is the kernels before the block-end update by Horner's rule, 8-patient thread blocks, the transposed tensor-core tiles and the
-reordered assembly grid):
+The blocked CUDA kernels at the search shapes (population of 8, padded like `search.py`, 512 patients, warm GPU, the engine's choice from
+an empty cache, median of 11 calls). The kernels pipeline the block-end loads of the S4D modes, load the tensor-core weights as packed TF32
+fragments, compute the sigmoid and GELU on the special-function unit (`ex2.approx`, `rcp.approx`: about 2^-22 relative) and are built
+for a fixed batch size; the first column is the previous kernels (`5ffcd8f`), which themselves took L3 H64 NS32 from 437 ms to 280 ms:
 
 | shape (L H NS) | before | now |
 |---|---|---|
-| 3 64 32 | 437 ms | 287 ms |
-| 2 64 32 | 245 ms | 162 ms |
-| 3 32 32 | 191 ms | 123 ms |
-| 3 32 16 | 145 ms | 107 ms |
-| 3 16 8 | 74 ms | 56 ms |
+| 3 64 32 | 280 ms | 247 ms |
+| 2 64 32 | 181 ms | 152 ms |
+| 3 32 32 | 146 ms | 117 ms |
+| 3 32 16 | 117 ms | 92 ms |
+| 3 16 8 | 60 ms | 43 ms |
 
 ## Inference engine
 `cpp/lethe_infer.hpp` is the deployed controller as a single dependency-free C++17 header: load the file written by `export_cpp.py`, then

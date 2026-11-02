@@ -17,16 +17,22 @@
 namespace ffi = xla::ffi;
 
 #define NT (PB * LANES)
+#define PD 2                                                   // block end: S4D modes loaded ahead of their use
 #define CH (HP / LANES)
 #define CHD ((HDP + LANES - 1) / LANES)
 #define CP5 ((P5P + LANES - 1) / LANES)
 #define FULL 0xffffffffu
+#define TCW (TC && PB % 8 == 0)                                       // the matmuls on tensor cores (weights packed by cbwd.py)
+#define PSZ(KD, ND) ((((ND) + 15) / 16) * 16 * (KD) * 2)            // floats of a packed weight matrix
+#define WSZ(KD, ND) (TCW ? PSZ(KD, ND) : (KD) * (ND))
 #define LDS (((2 * HP) > HDP ? (2 * HP) : HDP) + 4)                // (+ 4: rows on distinct banks)
 #define S_TAPE (6 + 2 * P5P + DPAD)
 #define DPL ((DPAD + LANES - 1) / LANES)                      // delay-line entries per lane: entry lane + LANES j
 
 #define NSM (6 * HP + HDP + 8 * P5P + 2 + 2 * LP * HP)          // packed per-patient small gradients (GRADS)
 #define WX (2 * LP * HP)                                       // row of t_x
+
+static_assert(NSP % PD == 0, "cbwd: the S4D modes come in groups of PD");
 
 struct Args { const float* in[NIN]; float* out[NOUT]; };
 #define INP(n) (A.in[I_##n])
@@ -43,20 +49,23 @@ __device__ __forceinline__ float d_max(float x, float r) { return x > r ? 1.f : 
 __device__ __forceinline__ float d_min(float x, float r) { return x < r ? 1.f : (x == r ? 0.5f : 0.f); }
 __device__ __forceinline__ float d_clip(float x, float lo, float hi) { return d_max(x, lo) * d_min(fmaxf(lo, x), hi); }
 __device__ __forceinline__ float relu(float x) { return x > 0.f ? x : 0.f; }
-__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
-__device__ __forceinline__ void gelu_d(float x, float& y, float& d) {
+// the special-function unit: 2^x and 1/x to about 2^-22 relative (no IEEE fix-up sequence; the arguments here are never denormal)
+__device__ __forceinline__ float ex2a(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
+__device__ __forceinline__ float rcpa(float x) { float y; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
+#define LOG2E 1.4426950408889634f
+__device__ __forceinline__ float sigm(float x) { return rcpa(1.f + ex2a(-LOG2E * x)); }
+__device__ __forceinline__ void gelu_d(float x, float& y, float& d) {   // 0.5 x (1 + tanh u) = x sigmoid(2u), and its derivative
   const float c = 0.7978845608028654f;
-  float u = c * (x + 0.044715f * x * x * x);
-  float th = tanhf(u);
-  float cdf = 0.5f * (1.f + th);
-  y = x * cdf;
-  d = cdf + x * 0.5f * (1.f - th * th) * c * (1.f + 3.f * 0.044715f * x * x);
+  const float u = c * (x + 0.044715f * x * x * x);
+  const float sg = rcpa(1.f + ex2a(-2.f * LOG2E * u));
+  y = x * sg;
+  d = sg + 2.f * x * sg * (1.f - sg) * c * (1.f + 3.f * 0.044715f * x * x);
 }
 
 // Y[p][n] = sum_k X[p][k] W[k][n] (+ sum_k X2[p][k] W2[k][n]) + bias[n]; X = hi + lo staged in shared memory (row length LDS), W global.
 template <int KD, int KD2, int ND>
-__device__ __forceinline__ void mm(const float* X, const float* XL, const float* __restrict__ W, const float* __restrict__ WL, const float* X2,
-                                   const float* XL2, const float* __restrict__ W2, const float* __restrict__ WL2, const float* __restrict__ bias, float* Y) {
+__device__ __forceinline__ void mm(const float* X, const float* XL, const float* __restrict__ W, const float* X2, const float* XL2, const float* __restrict__ W2,
+                                   const float* __restrict__ bias, float* Y) {
   const int t = threadIdx.x;
   if constexpr (ND >= LANES) {
     constexpr int OPT = ND / LANES;
@@ -73,7 +82,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
     for (int k = 0; k < KD; k++) {
       float w[TN];
 #pragma unroll
-      for (int c = 0; c < TN; c++) w[c] = (__ldg(W + k * ND + nt + c * NCT) + __ldg(WL + k * ND + nt + c * NCT));
+      for (int c = 0; c < TN; c++) w[c] = __ldg(W + k * ND + nt + c * NCT);
 #pragma unroll
       for (int a = 0; a < TP; a++) {
         const float x = X[(pt * TP + a) * LDS + k] + XL[(pt * TP + a) * LDS + k];
@@ -86,7 +95,7 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
       for (int k = 0; k < KD2; k++) {
         float w[TN];
 #pragma unroll
-        for (int c = 0; c < TN; c++) w[c] = (__ldg(W2 + k * ND + nt + c * NCT) + __ldg(WL2 + k * ND + nt + c * NCT));
+        for (int c = 0; c < TN; c++) w[c] = __ldg(W2 + k * ND + nt + c * NCT);
 #pragma unroll
         for (int a = 0; a < TP; a++) {
           const float x = X2[(pt * TP + a) * LDS + k] + XL2[(pt * TP + a) * LDS + k];
@@ -103,31 +112,29 @@ __device__ __forceinline__ void mm(const float* X, const float* XL, const float*
     for (int o = t; o < PB * ND; o += NT) {
       const int p = o / ND, n = o % ND;
       float s = bias ? __ldg(bias + n) : 0.f;
-      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k] + XL[p * LDS + k], __ldg(W + k * ND + n) + __ldg(WL + k * ND + n), s);
-      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k] + XL2[p * LDS + k], __ldg(W2 + k * ND + n) + __ldg(WL2 + k * ND + n), s);
+      for (int k = 0; k < KD; k++) s = fmaf(X[p * LDS + k] + XL[p * LDS + k], __ldg(W + k * ND + n), s);
+      for (int k = 0; k < KD2; k++) s = fmaf(X2[p * LDS + k] + XL2[p * LDS + k], __ldg(W2 + k * ND + n), s);
       Y[p * LDS + n] = s;
     }
   }
 }
 
-// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32), transposed: the weights are the 16-row A operand (W = hi + lo, split by
-// cbwd.py), the block's patients the 8 columns of B (X = hi + lo staged in shared memory); one warp per 16 channels x 8 patients
+// tensor cores: x * w ~ hi_x hi_w + hi_x lo_w + lo_x hi_w (3xTF32), transposed: the weights are the 16-row A operand (W = hi + lo, packed by
+// cbwd.py in fragment order: per 16-channel tile and 8-row k slice, each lane's 4 hi then 4 lo values), the block's patients the 8 columns of
+// B (X = hi + lo staged in shared memory); one warp per 16 channels x 8 patients
 __device__ __forceinline__ uint32_t tf32(float x) { uint32_t r; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x)); return r; }
 __device__ __forceinline__ void mma8(float d[4], const uint32_t a[4], const uint32_t b[2]) {
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
-template <int KD>
-__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, const float* __restrict__ WL, int ND,
-                                     int c0, int p0, int gid, int tq) {
+template <int KD, int K0 = 0, int K1 = KD>
+__device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL, const float* __restrict__ W, int mt, int p0, int ln, int gid, int tq) {
+  const float4* f = reinterpret_cast<const float4*>(W) + ((size_t)mt * (KD / 8) * 32 + ln) * 2 + (K0 / 8) * 64;
 #pragma unroll 4
-  const bool up = ND % 16 == 0 || c0 + 8 < ND;                       // rows c0 + 8 .. c0 + 15 exist (ND = 8: zero)
-  for (int k0 = 0; k0 < KD; k0 += 8) {
-    const int wa = (k0 + tq) * ND + c0 + gid, wb = wa + 4 * ND;
-    const uint32_t ah[4] = {__float_as_uint(__ldg(W + wa)), up ? __float_as_uint(__ldg(W + wa + 8)) : 0u, __float_as_uint(__ldg(W + wb)),
-                            up ? __float_as_uint(__ldg(W + wb + 8)) : 0u};
-    const uint32_t al[4] = {__float_as_uint(__ldg(WL + wa)), up ? __float_as_uint(__ldg(WL + wa + 8)) : 0u, __float_as_uint(__ldg(WL + wb)),
-                            up ? __float_as_uint(__ldg(WL + wb + 8)) : 0u};
+  for (int k0 = K0; k0 < K1; k0 += 8, f += 64) {                     // per k slice: 32 lanes x (4 hi, 4 lo); rows K0 .. K1 - 1 of W
+    const float4 h = __ldg(f), lo = __ldg(f + 1);
+    const uint32_t ah[4] = {__float_as_uint(h.x), __float_as_uint(h.y), __float_as_uint(h.z), __float_as_uint(h.w)};
+    const uint32_t al[4] = {__float_as_uint(lo.x), __float_as_uint(lo.y), __float_as_uint(lo.z), __float_as_uint(lo.w)};
     const int xi = (p0 + gid) * LDS + k0 + tq;
     const uint32_t bh[2] = {__float_as_uint(X[xi]), __float_as_uint(X[xi + 4])};
     const uint32_t bl[2] = {__float_as_uint(XL[xi]), __float_as_uint(XL[xi + 4])};
@@ -136,25 +143,44 @@ __device__ __forceinline__ void tc_k(float d[4], const float* X, const float* XL
     mma8(d, ah, bh);
   }
 }
-template <int KD, int KD2, int ND>
-__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* W, const float* WL, const float* X2, const float* XL2, const float* W2,
-                                    const float* WL2, const float* __restrict__ bias, float* Y) {
-  if constexpr (TC && ND % 8 == 0 && KD % 8 == 0 && KD2 % 8 == 0 && PB % 8 == 0) {
+// Y = X W (+ bias) and Y2 = X2 W2 (+ bias2) together, their 16 x 8 tiles spread over the block's warps (a 64-wide product alone has 4 tiles
+// for 8 warps). Two uses: two products over the same X (X2 = X); one product split in two halves of K (W2 = W, KSPLIT = 1: rows KD / 2 .. KD - 1
+// into Y2, the consumer adds Y + Y2)
+template <int KD, int ND, int KSPLIT = 0>
+__device__ __forceinline__ void mmx(const float* X, const float* XL, const float* W, const float* __restrict__ bias, float* Y,
+                                    const float* X2, const float* XL2, const float* W2, const float* __restrict__ bias2, float* Y2) {
+  static_assert(ND % 8 == 0 && KD % 8 == 0, "cbwd: matrix sizes are multiples of 8");
+  constexpr int K2 = KSPLIT && KD % 16 == 0;                          // (K = 8: not split, Y2 = 0)
+  if constexpr (TCW && (K2 || !KSPLIT)) {
     const int warp = threadIdx.x >> 5, ln = threadIdx.x & 31, gid = ln >> 2, tq = ln & 3;
-    constexpr int MTL = (ND + 15) / 16, PT = PB / 8;
-    for (int tile = warp; tile < MTL * PT; tile += NT / 32) {
-      const int c0 = (tile % MTL) * 16, p0 = (tile / MTL) * 8;
+    constexpr int MTL = (ND + 15) / 16, PT = PB / 8, NTI = MTL * PT;
+    for (int tile = warp; tile < 2 * NTI; tile += NT / 32) {
+      const bool sec = tile >= NTI;
+      const int tl = sec ? tile - NTI : tile, mt = tl % MTL, c0 = mt * 16, p0 = (tl / MTL) * 8;
+      const float* bs = sec ? bias2 : bias;
       const bool up = ND % 16 == 0 || c0 + 8 < ND;
-      const float b0 = bias ? __ldg(bias + c0 + gid) : 0.f, b1 = bias && up ? __ldg(bias + c0 + gid + 8) : 0.f;
+      const float b0 = bs ? __ldg(bs + c0 + gid) : 0.f, b1 = bs && up ? __ldg(bs + c0 + gid + 8) : 0.f;
       float d[4] = {b0, b0, b1, b1};
-      tc_k<KD>(d, X, XL, W, WL, ND, c0, p0, gid, tq);
-      if constexpr (KD2 > 0) tc_k<KD2>(d, X2, XL2, W2, WL2, ND, c0, p0, gid, tq);
+      if (!sec) {
+        if constexpr (K2) tc_k<KD, 0, KD / 2>(d, X, XL, W, mt, p0, ln, gid, tq);
+        else tc_k<KD>(d, X, XL, W, mt, p0, ln, gid, tq);
+      } else {
+        if constexpr (K2) tc_k<KD, KD / 2, KD>(d, X2, XL2, W2, mt, p0, ln, gid, tq);
+        else tc_k<KD>(d, X2, XL2, W2, mt, p0, ln, gid, tq);
+      }
+      float* Yo = sec ? Y2 : Y;
       const int y0 = (p0 + 2 * tq) * LDS + c0 + gid;
-      Y[y0] = d[0]; Y[y0 + LDS] = d[1];
-      if (up) { Y[y0 + 8] = d[2]; Y[y0 + LDS + 8] = d[3]; }
+      Yo[y0] = d[0]; Yo[y0 + LDS] = d[1];
+      if (up) { Yo[y0 + 8] = d[2]; Yo[y0 + LDS + 8] = d[3]; }
     }
+  } else if constexpr (KSPLIT) {                                      // whole K into Y, Y2 = 0
+    if constexpr (TCW) mmx<KD, ND>(X, XL, W, bias, Y, X, XL, W, bias, Y2);
+    else mm<KD, 0, ND>(X, XL, W, nullptr, nullptr, nullptr, bias, Y);
+    __syncthreads();
+    for (int o = threadIdx.x; o < PB * ND; o += NT) Y2[(o / ND) * LDS + o % ND] = 0.f;
   } else {
-    mm<KD, KD2, ND>(X, XL, W, WL, X2, XL2, W2, WL2, bias, Y);
+    mm<KD, 0, ND>(X, XL, W, nullptr, nullptr, nullptr, bias, Y);
+    mm<KD, 0, ND>(X2, XL2, W2, nullptr, nullptr, nullptr, bias2, Y2);
   }
 }
 
@@ -165,16 +191,19 @@ enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_encW3, V_dec_lin, NV_TOP };
 // per-patient constants (cbwd.py pack_q)
 enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_dmask = 32, NQ = 48 };
 
-__global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
+__global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
+  constexpr int B = BN;                              // patients per member (compile time: constant offsets)
   extern __shared__ float sm[];
   float* SU = sm;                                   // [LP][PB][HP] layer inputs
   float* SZV = SU + LP * PB * HP;                   // [LP][PB][HP]
   float* SZG = SZV + LP * PB * HP;                  // [LP][PB][HP]
-  float* SLN = SZG + LP * PB * HP;                  // [LP][PB][2] (mean, 1 / std)
+  float* SGA = SZG + LP * PB * HP;                  // [LP][PB][HP] GELU derivative at the S4D output
+  float* SLN = SGA + LP * PB * HP;                  // [LP][PB][2] (mean, 1 / std)
   float* SX = SLN + LP * PB * 2;                    // [PB][LDS] matmul input staging (TF32 hi)
   float* SXL = SX + PB * LDS;                       // [PB][LDS] TF32 lo parts
   float* SY = SXL + PB * LDS;                       // [PB][LDS] matmul output staging
-  float* SV = SY + PB * LDS;                        // [NV][HP] member vectors
+  float* SY2 = SY + PB * LDS;                       // [PB][LDS] second matmul output (the other half of a product)
+  float* SV = SY2 + PB * LDS;                       // [NV][HP] member vectors
   float* SHD = SV + NV * HP;                        // [2][HDP] head_b1, head_dec
   float* SP5 = SHD + 2 * HDP;                       // [8][P5P] lamr lami Bur Bui Bwr Bwi Cor Coi
   float* SQ = SP5 + 8 * P5P;                        // [PB][NQ] patient constants
@@ -205,6 +234,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
   const float* q = SQ + p * NQ;
   const float nH = LD(sc, g * 8 + 0), ho = LD(sc, g * 8 + 1), u0 = LD(sc, g * 8 + 2), decb = LD(sc, g * 8 + 3),
               wlow = LD(sc, g * 8 + 4), rhou = LD(sc, g * 8 + 5);
+  const float nHi = 1.f / nH;
   const float wc = 1.f / NSTEP;
   float glv[LP];
 #pragma unroll
@@ -292,10 +322,9 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         hpi[j] = n < P5P ? __ldg(cp + 6 + P5P + n) * fr : 0.f;
       }
       const float cg = powf(ce, gg);
-      const float C = expf(logc50);
-      const float Cg = powf(C, gg);
-      const float den = cg + Cg;
-      const float b = e0 - em * cg / den;
+      const float Cg = expf(gg * logc50);                                // (e^logc50)^gamma
+      const float den = cg + Cg, dni = __frcp_rn(den);
+      const float b = e0 - em * cg * dni;
       const bool first = (k == 0);
       float dmask[DPL], ysum = 0.f;
 #pragma unroll
@@ -307,12 +336,13 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         ysum += bufn * dmask[j];
       }
       const float y = AR(ysum) + sy * z0;
-      const float s_raw = (E0_ - y) / EMAX_;
+      const float s_raw = (E0_ - y) * (1.f / EMAX_);
       const float s = fminf(1.f - 1e-3f, fmaxf(1e-3f, s_raw));
-      const float ratio = s / (1.f - s);
+      const float oms = __frcp_rn(1.f - s), ratio = s * oms;
       const float wpow = C50N_ * powf(ratio, 1.f / GAMMA_);
       const float w = fminf(wpow, 3.f * C50N_);
-      const float f0 = (y - tg) / 50.f, f1 = up / (r * UMAX_), f2 = t / T_END_, f3 = w / (r * C50N_) - 1.f;
+      const float ri = __frcp_rn(r);
+      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = t * (1.f / T_END_), f3 = w * ri * (1.f / C50N_) - 1.f;
       float ul = 0.f;
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -334,27 +364,31 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           SU[(l * PB + p) * HP + h] = xx[j];
           float a, ga;
           gelu_d(__ldg(ysk + h) + SVv(VL(l, 0), j) * xx[j], a, ga);
+          SGA[(l * PB + p) * HP + h] = ga;
           STX(p * LDS + h, a);
+#if GRADS
+          OUT(t_a)[((((size_t)g * LP + l) * B + bb) * NSTEP + k) * HP + h] = a;
+#endif
         }
         __syncthreads();
-        const size_t wo = ((size_t)g * LP + l) * HP * HP;
-        mmx<HP, 0, HP>(SX, SXL, INP(L_Wv) + wo, INP(L_Wv_lo) + wo, nullptr, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY);
-        mmx<HP, 0, HP>(SX, SXL, INP(L_Wg) + wo, INP(L_Wg_lo) + wo, nullptr, nullptr, nullptr, nullptr, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
+        const size_t wo = ((size_t)g * LP + l) * WSZ(HP, HP);
+        mmx<HP, HP>(SX, SXL, INP(L_Wv) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 1) * HP, SY,
+                    SX, SXL, INP(L_Wg) + wo, INP(L_vec) + (((size_t)g * LP + l) * 5 + 2) * HP, SY + HP);
         __syncthreads();
         float v[CH], ps = 0.f;
 #pragma unroll
         for (int j = 0; j < CH; j++) {
           const int h = lane + LANES * j;
-          const float zv = SY[p * LDS + h], zg = SY[p * LDS + HP + h];
-          SZV[(l * PB + p) * HP + h] = zv; SZG[(l * PB + p) * HP + h] = zg;
-          v[j] = xx[j] + zv * sigm(zg);
+          const float zv = SY[p * LDS + h], sg = sigm(SY[p * LDS + HP + h]);
+          SZV[(l * PB + p) * HP + h] = zv; SZG[(l * PB + p) * HP + h] = sg;          // (the gate's sigmoid)
+          v[j] = xx[j] + zv * sg;
           ps += v[j] * SVv(V_mH, j);
         }
-        const float m = AR(ps) / nH;
+        const float m = AR(ps) * nHi;
         float pv = 0.f;
 #pragma unroll
         for (int j = 0; j < CH; j++) { const float d = (v[j] - m) * SVv(V_mH, j); pv += d * d; }
-        const float inv = 1.f / sqrtf(AR(pv) / nH + 1e-5f);
+        const float inv = rsqrtf(AR(pv) * nHi + 1e-5f);
         if (lane == 0) { SLN[(l * PB + p) * 2] = m; SLN[(l * PB + p) * 2 + 1] = inv; }
         const float gl = glv[l];
 #pragma unroll
@@ -379,13 +413,14 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #if HEAD
       float hid[CHD], hgd[CHD];
       __syncthreads();
-      mmx<HP, 0, HDP>(SX, SXL, INP(head_W1) + (size_t)g * HP * HDP, INP(head_W1_lo) + (size_t)g * HP * HDP, nullptr, nullptr, nullptr, nullptr, INP(head_b1) + g * HDP, SY);
+      mmx<HP, HDP, 1>(SX, SXL, INP(head_W1) + (size_t)g * WSZ(HP, HDP), INP(head_b1) + g * HDP, SY,
+                      SX, SXL, INP(head_W1) + (size_t)g * WSZ(HP, HDP), nullptr, SY2);
       __syncthreads();
       float poh = 0.f;
 #pragma unroll
       for (int j = 0; j < CHD; j++) {
         const int n = lane + LANES * j;
-        if (n < HDP) { gelu_d(SY[p * LDS + n], hid[j], hgd[j]); poh += hid[j] * SHD[HDP + n]; }
+        if (n < HDP) { gelu_d(SY[p * LDS + n] + SY2[p * LDS + n], hid[j], hgd[j]); poh += hid[j] * SHD[HDP + n]; }
         else { hid[j] = 0.f; hgd[j] = 0.f; }
       }
       out_head = AR(poh);
@@ -393,10 +428,10 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
       const float o = (1.f - ho) * out_lin + ho * out_head + decb;
       const float mean = r * (u_lin + 10.f * o);
       const float uapp = fminf(UMAX_, fmaxf(0.f, mean));
-      const float un = uapp / r, wn = w / r;
+      const float un = uapp * ri, wn = w * ri;
       // ======================== backward ========================
-      float d_b = wc * (2.f * (b - tg) / 100.f - wlow * 2.f * relu(40.f - b) / 100.f);
-      float d_uapp = wc * rhou * 2.f * uapp / (UMAX_ * UMAX_);
+      float d_b = wc * (0.02f * (b - tg) - wlow * 0.02f * relu(40.f - b));
+      float d_uapp = wc * rhou * 2.f * uapp * (1.f / (UMAX_ * UMAX_));
       float d_x[4];
 #pragma unroll
       for (int jj = 0; jj < 4; jj++) {
@@ -426,8 +461,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #endif
         } else { d_hpr[j] = 0.f; d_hpi[j] = 0.f; }
       }
-      float d_w = AR(pwn) / r;
-      d_uapp += ctup + AR(pun) / r;
+      float d_w = AR(pwn) * ri;
+      d_uapp += ctup + AR(pun) * ri;
       float d_bufn[DPL];
 #pragma unroll
       for (int j = 0; j < DPL; j++) d_bufn[j] = ctbuf[j];
@@ -455,7 +490,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           }
         }
         __syncthreads();
-        mmx<HDP, 0, HP>(SX, SXL, INP(W1T) + (size_t)g * HDP * HP, INP(W1T_lo) + (size_t)g * HDP * HP, nullptr, nullptr, nullptr, nullptr, nullptr, SY);
+        mmx<HDP, HP, 1>(SX, SXL, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY, SX, SXL, INP(W1T) + (size_t)g * WSZ(HDP, HP), nullptr, SY2);
         __syncthreads();
       }
 #endif
@@ -464,7 +499,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
       for (int j = 0; j < CH; j++) {
         const int h = lane + LANES * j;
 #if HEAD
-        d_xx[j] = SY[p * LDS + h] + d_outlin * SVv(V_dec_lin, j);
+        d_xx[j] = SY[p * LDS + h] + SY2[p * LDS + h] + d_outlin * SVv(V_dec_lin, j);
 #else
         d_xx[j] = d_outlin * SVv(V_dec_lin, j);
         (void)h;
@@ -502,7 +537,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           const int h = lane + LANES * j;
           u[j] = SU[(l * PB + p) * HP + h];
           zvv[j] = SZV[(l * PB + p) * HP + h];
-          sgv[j] = sigm(SZG[(l * PB + p) * HP + h]);
+          sgv[j] = SZG[(l * PB + p) * HP + h];
           const float mh = SVv(V_mH, j);
           dv[j] = (u[j] + zvv[j] * sgv[j] - m) * mh;
           const float d_out = gl * d_xx[j];
@@ -518,10 +553,10 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
         float d_dv[CH], pdd = 0.f;
 #pragma unroll
         for (int j = 0; j < CH; j++) {
-          d_dv[j] = tt[j] * inv - inv * inv * inv * s_td * dv[j] / nH;
+          d_dv[j] = tt[j] * inv - inv * inv * inv * s_td * dv[j] * nHi;
           pdd += d_dv[j] * SVv(V_mH, j);
         }
-        const float s_dd = AR(pdd) / nH;
+        const float s_dd = AR(pdd) * nHi;
 #pragma unroll
         for (int j = 0; j < CH; j++) {
           const int h = lane + LANES * j;
@@ -536,8 +571,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           STX(p * LDS + h, d_zv); STX(p * LDS + HP + h, d_zg);
         }
         __syncthreads();
-        const size_t wo = ((size_t)g * LP + l) * HP * HP;
-        mmx<HP, HP, HP>(SX, SXL, INP(L_WvT) + wo, INP(L_WvT_lo) + wo, SX + HP, SXL + HP, INP(L_WgT) + wo, INP(L_WgT_lo) + wo, nullptr, SY);
+        const size_t wo = ((size_t)g * LP + l) * WSZ(HP, HP);
+        mmx<HP, HP>(SX, SXL, INP(L_WvT) + wo, nullptr, SY, SX + HP, SXL + HP, INP(L_WgT) + wo, nullptr, SY2);
         __syncthreads();
         // S4D (blocked adjoint): cot(u) += e + K0 cy,  e = F_i + sum_{j > i in the block} K[j - i] cy_j
         const float* Kl = INP(b_K) + ((size_t)g * LP + l) * TBLK * HP;
@@ -545,9 +580,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #pragma unroll
         for (int j = 0; j < CH; j++) {
           const int h = lane + LANES * j;
-          float a, ga;
-          gelu_d(__ldg(ysk + h) + SVv(VL(l, 0), j) * u[j], a, ga);
-          const float d_pa = SY[p * LDS + h] * ga;
+          const float d_pa = (SY[p * LDS + h] + SY2[p * LDS + h]) * SGA[(l * PB + p) * HP + h];
           float ds = OUT(s_F)[((((size_t)g * LP + l) * TBLK + i) * B + bb) * HP + h];
 #pragma unroll
           for (int jj = 1; jj < TBLK; jj++)
@@ -559,7 +592,6 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #endif
 #if GRADS
           xk[h] = u[j];
-          OUT(t_a)[to + h] = a;
 #endif
           d_xx[j] = d_u[j];
         }
@@ -583,13 +615,13 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #endif
       }
       const float d_f0 = AR(pf[0]), d_f1 = AR(pf[1]), d_f3 = AR(pf[3]);
-      float d_y = d_f0 / 50.f;
-      const float d_up = d_f1 / (r * UMAX_);
-      d_w += d_f3 / (r * C50N_);
+      float d_y = d_f0 * 0.02f;
+      const float d_up = d_f1 * ri * (1.f / UMAX_);
+      d_w += d_f3 * ri * (1.f / C50N_);
       // monitor
       const float d_wpow = d_w * d_min(wpow, 3.f * C50N_);
-      const float d_ratio = d_wpow * C50N_ * (1.f / GAMMA_) * powf(ratio, 1.f / GAMMA_ - 1.f);
-      const float d_s = d_ratio / ((1.f - s) * (1.f - s));
+      const float d_ratio = d_wpow * wpow * (1.f / GAMMA_) / ratio;     // C50 ratio^(1/gamma - 1) = wpow / ratio
+      const float d_s = d_ratio * oms * oms;
       d_y += d_s * d_clip(s_raw, 1e-3f, 1.f - 1e-3f) * (-1.f / EMAX_);
       float d_buf[DPL], sb = 0.f;
 #pragma unroll
@@ -607,10 +639,10 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
           d_buf[j] = e < DPAD - 1 ? (lane < LANES - 1 ? dn : nx) : 0.f;
         }
       }
-      const float d_cg = -em * d_b * Cg / (den * den);
-      const float d_Cg = em * d_b * cg / (den * den);
-      const float d_ce = d_cg * gg * powf(ce, gg - 1.f);
-      const float d_logc50 = d_Cg * gg * powf(C, gg - 1.f) * C;
+      const float d_cg = -em * d_b * Cg * dni * dni;
+      const float d_Cg = em * d_b * cg * dni * dni;
+      const float d_ce = d_cg * gg * (ce > 0.f ? cg * __frcp_rn(ce) : powf(ce, gg - 1.f));     // ce^(gamma - 1)
+      const float d_logc50 = d_Cg * gg * Cg;                            // d (e^logc50)^gamma = gamma C^gamma
       d_x[3] += d_ce * d_max(x[3], 0.f);
       d_ou += d_logc50;
 #pragma unroll
@@ -633,12 +665,27 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 #pragma unroll
         for (int ii = 0; ii < TBLK; ii++) { cy[ii] = 2.f * cyb[ii * WX]; F[ii] = 0.f; }
         const size_t gl_ = (size_t)g * LP + l;
-        for (int n = 0; n < NSP; n++) {
-          const size_t so = (((gl_ * 2) * B + bb) * NSP + n) * HP + h, so2 = so + (size_t)B * NSP * HP;
-          const size_t ao = (gl_ * 6 * NSP + n) * HP + h, as = (size_t)NSP * HP;
-          const float Ar = LD(b_S4, ao), Ai = LD(b_S4, ao + as), Br = LD(b_S4, ao + 2 * as), Bi = LD(b_S4, ao + 3 * as),
-                      Cr = LD(b_S4, ao + 4 * as), Ci = LD(b_S4, ao + 5 * as);
-          float nr = OUT(s_l)[so], ni = OUT(s_l)[so2];
+        const size_t so0 = (((gl_ * 2) * B + bb) * NSP) * HP + h, s2 = (size_t)B * NSP * HP, ao0 = (gl_ * 6 * NSP) * HP + h, as = (size_t)NSP * HP;
+        float c_[PD][8];                                               // modes n .. n + PD - 1: dA, dB, C and adjoint state, loaded PD modes ahead
+#pragma unroll
+        for (int d = 0; d < PD; d++) {
+#pragma unroll
+          for (int k = 0; k < 6; k++) c_[d][k] = LD(b_S4, ao0 + k * as + d * HP);
+          c_[d][6] = OUT(s_l)[so0 + d * HP]; c_[d][7] = OUT(s_l)[so0 + s2 + d * HP];
+        }
+#pragma unroll 2
+        for (int n0 = 0; n0 < NSP; n0 += PD)
+#pragma unroll
+        for (int d = 0; d < PD; d++) {
+          const int n = n0 + d;
+          const size_t so = so0 + (size_t)n * HP, so2 = so + s2;
+          const float Ar = c_[d][0], Ai = c_[d][1], Br = c_[d][2], Bi = c_[d][3], Cr = c_[d][4], Ci = c_[d][5];
+          float nr = c_[d][6], ni = c_[d][7];
+          if (n + PD < NSP) {
+#pragma unroll
+            for (int k = 0; k < 6; k++) c_[d][k] = LD(b_S4, ao0 + k * as + (n + PD) * HP);
+            c_[d][6] = OUT(s_l)[so + PD * HP]; c_[d][7] = OUT(s_l)[so2 + PD * HP];
+          }
 #pragma unroll
           for (int ii = TBLK - 1; ii >= 0; ii--) {                       // (lam + cy_i conj(C)) conj(dA), i = T-1 .. 0
             const float ar = nr + cy[ii] * Cr, ai = ni - cy[ii] * Ci;
@@ -692,7 +739,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A, int B) {
 }
 
 static size_t smem_bytes() {
-  return sizeof(float) * (3 * LP * PB * HP + LP * PB * 2 + 3 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + PB * NQ);
+  return sizeof(float) * (4 * LP * PB * HP + LP * PB * 2 + 4 * PB * LDS + NV * HP + 2 * HDP + 8 * P5P + PB * NQ);
 }
 
 static ffi::Error Impl(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, int32_t B) {
@@ -716,7 +763,8 @@ static ffi::Error Impl(cudaStream_t stream, ffi::RemainingArgs args, ffi::Remain
     attr = true;
   }
   dim3 grid(B / PB, G);
-  cbwd_kernel<<<grid, NT, smem, stream>>>(A, B);
+  if (B != BN) return ffi::Error::InvalidArgument("cbwd: built for another batch size");
+  cbwd_kernel<<<grid, NT, smem, stream>>>(A);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
   return ffi::Error::Success();

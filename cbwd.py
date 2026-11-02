@@ -36,7 +36,7 @@ def smem_bytes(d, pb):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
     lds = max(2 * H, HDP) + 4
     nv = 7 + 5 * L
-    return 4 * (3 * L * pb * H + L * pb * 2 + 3 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
+    return 4 * (4 * L * pb * H + L * pb * 2 + 4 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
 
 
 def valid(d, B, pb, lanes, T):
@@ -53,7 +53,7 @@ def nsm(d):
 
 
 # ---------------------------------------------------------------- inputs (one network; under vmap every input gets the member axis)
-MM_WEIGHTS = ("head_W1", "W1T", "L_Wv", "L_Wg", "L_WvT", "L_WgT")      # the kernels' tensor-core operands: passed as TF32 hi / lo parts
+MM_WEIGHTS = ("head_W1", "W1T", "L_Wv", "L_Wg", "L_WvT", "L_WgT")      # the kernels' tensor-core operands: packed TF32 hi / lo fragments
 
 
 def tf32_rna(x):
@@ -68,6 +68,22 @@ def tf32_split(w):
     return hi, tf32_rna(w - hi)
 
 
+def tf32_pack(w):
+    """w (..., KD, ND) as the kernels' tensor-core A operand (W^T, 16 x 8 tiles of m16n8k8), split into TF32 hi / lo once instead of per step:
+    per 16-column tile, per 8-row k slice, per lane (gid, tq): hi of w[k0 + tq][c0 + gid], w[k0 + tq][c0 + gid + 8], w[k0 + tq + 4][c0 + gid],
+    w[k0 + tq + 4][c0 + gid + 8], then the same lo parts. Columns padded to a multiple of 16 with zeros. Flat (..., PSZ(KD, ND))"""
+    KD, ND = w.shape[-2:]
+    MT = -(-ND // 16)
+    w = jnp.pad(w, [(0, 0)] * (w.ndim - 1) + [(0, MT * 16 - ND)])
+    lead = w.shape[:-2]
+    w = w.reshape(lead + (KD // 8, 2, 4, MT, 2, 8))                 # k = (slice, kh, tq), c = (tile, ch, gid)
+    n = len(lead)
+    w = jnp.transpose(w, tuple(range(n)) + tuple(n + i for i in (3, 0, 5, 2, 1, 4)))   # (tile, slice, gid, tq, kh, ch)
+    hi, lo = tf32_split(w)
+    hl = jnp.stack([hi, lo], -3)                                     # (..., gid, tq, hi / lo, kh, ch)
+    return hl.reshape(lead + (-1,))
+
+
 def pack_q(q):
     B = q["mu"].shape[0]
     cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc")]
@@ -75,7 +91,7 @@ def pack_q(q):
     return jnp.concatenate([cols, jnp.zeros((B, 32 - cols.shape[1]), cols.dtype), q["dmask"]], 1)
 
 
-def inputs(kp, q, st, ftape, T, tapes=True):
+def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
     d = dims(kp)
     H, L, dt = d["H"], d["L"], kp["sc"].dtype
     if "mH" in kp:                                                       # masked layout
@@ -100,8 +116,11 @@ def inputs(kp, q, st, ftape, T, tapes=True):
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho")])
     ins["b_K"] = jnp.stack([K.block_mats(lp, T)["K"].T for lp in ly])
     ins["b_S4"] = jnp.stack([jnp.stack([lp[k].T for k in ("Ar", "Ai", "Br", "Bi", "Cr", "Ci")]) for lp in ly])    # (L, 6, NS, H): channels fastest
-    for k in [k for k in MM_WEIGHTS if k in ins]:
-        ins[k], ins[k + "_lo"] = tf32_split(jnp.asarray(ins[k], jnp.float32))
+    at = [K.block_mats(lp, T)["AT"] for lp in ly]
+    ins["b_AT"] = jnp.stack([jnp.stack([jnp.real(a).T, jnp.imag(a).T]) for a in at])                    # dA^T (L, 2, NS, H) for cfwd.cu
+    if packed:                                                           # the tensor-core path (the plain weights otherwise)
+        for k in [k for k in MM_WEIGHTS if k in ins]:
+            ins[k] = tf32_pack(jnp.asarray(ins[k], jnp.float32))
     if tapes:                                                            # the forward kernel's native tapes when there (no repacking)
         ins["c_tape"] = ftape["packed"] if "packed" in ftape else KC.pack_tape(ftape["c"])
         ins["t_ys"] = ftape["ys_all"] if "ys_all" in ftape else jnp.stack(ftape["ys"])
@@ -120,10 +139,10 @@ def outputs(d, B, T, grads, lam):
 
 
 # ---------------------------------------------------------------- build
-def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam=True):
+def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam=True, B=0):
     f = lambda v: f"{float(v)!r}f"
     lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}", f"#define HEAD {int(d['HD'] > 0)}",
-             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {M.N}", f"#define PB {pb}", f"#define DPAD {K.DP}",
+             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {M.N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
              f"#define LANES {lanes}", f"#define TC {int(tc)}", f"#define GRADS {int(grads)}", f"#define LAMOUT {int(lam)}"]
     for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX), ("T_END_", M.T_END)):
         lines.append(f"#define {n} {f(v)}")
@@ -175,9 +194,9 @@ def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, la
     lanes = lanes or default_lanes(d["H"])
     if not valid(d, B, pb, lanes, T):
         raise ValueError(f"cbwd: pb={pb} lanes={lanes} T={T} not valid for {d} (shared memory {smem_bytes(d, pb)} B)")
-    ins = inputs(kp, q, st, ftape, T)
+    ins = inputs(kp, q, st, ftape, T, packed=tc and pb % 8 == 0)
     outs = outputs(d, B, T, grads, lam)
-    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, grads, tc, lam))
+    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, grads, tc, lam, B))
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s, jnp.float32) for s in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B))
     r = dict(zip(outs, res))
@@ -203,11 +222,11 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
         raise ValueError(f"cfwd: pb={pb} lanes={lanes} T={T} not valid for {d}")
     full = inputs(kp, q, st, dict(c=None, ys=None), T, tapes=False)
     ins = {k: full[k] for k in ("sc", "gl", "mH", "enc_b", "encW", "dec_lin", "head_W1", "head_b1", "head_dec", "p5", "L_vec", "L_Wv", "L_Wg",
-                                "q_c", "b_K", "b_S4", "L_Wv_lo", "L_Wg_lo", "head_W1_lo") if k in full}
+                                "q_c", "b_K", "b_S4", "b_AT") if k in full}
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1")]).astype(jnp.float32)
     N, L, H, NS = M.N, d["L"], d["H"], d["NS"]
     outs = dict(tape=(N, B, 6 + 2 * d["PP"] + K.DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))
-    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True), SRC_FWD, "CfwdHandler", "cfwd")
+    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True, B), SRC_FWD, "CfwdHandler", "cfwd")
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s_, jnp.float32) for s_ in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B), wtape=np.int32(1 if tape else 0))
     r = dict(zip(outs, res))
