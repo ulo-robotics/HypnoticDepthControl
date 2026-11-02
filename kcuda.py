@@ -16,7 +16,40 @@ import kstep as K
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "sweep.cu")
 CACHE = os.path.join(os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1"), "cuda")
 _LOADED = {}
-_BUILD_LOCK = threading.Lock()                # engine.py compiles candidates in parallel threads
+_BUILD_LOCK = threading.Lock()                # the registry (_LOADED, _INFLIGHT, FFI registration): engine.py builds candidates in parallel threads
+_INFLIGHT = {}
+
+
+def once(key, build):
+    """build() for key once per process: concurrent callers of the same key wait for the first one, different keys build in parallel (nvcc is
+    a process of its own; only the registry is locked)"""
+    with _BUILD_LOCK:
+        if key in _LOADED:
+            return _LOADED[key]
+        ev = _INFLIGHT.get(key)
+        first = ev is None
+        if first:
+            ev = _INFLIGHT[key] = threading.Event()
+    if not first:
+        ev.wait()
+        with _BUILD_LOCK:
+            if key in _LOADED:
+                return _LOADED[key]
+        raise RuntimeError(f"build of {key[:2]} failed in another thread")
+    try:
+        val = build()
+        with _BUILD_LOCK:
+            _LOADED[key] = val
+        return val
+    finally:
+        with _BUILD_LOCK:
+            _INFLIGHT.pop(key, None)
+        ev.set()
+
+
+def register(name, capsule):
+    with _BUILD_LOCK:
+        jax.ffi.register_ffi_target(name, capsule, platform="CUDA")
 
 
 def nvcc():
@@ -46,10 +79,7 @@ def dims(kp):
 def build(d, wpb, stage=0):
     """compile (or load from the cache) the library for these sizes and launch options; returns the FFI target names"""
     key = tuple(sorted(d.items())) + (("WPB", wpb), ("STAGE", int(stage)))
-    with _BUILD_LOCK:
-        if key not in _LOADED:
-            _LOADED[key] = _build(key)
-        return _LOADED[key]
+    return once(key, lambda: _build(key))
 
 
 def _build(key):
@@ -69,8 +99,8 @@ def _build(key):
         os.replace(f"{so}.{os.getpid()}.tmp", so)
     lib = ctypes.cdll.LoadLibrary(so)
     names = (f"pkpd_fwd_{tag}", f"pkpd_bwd_{tag}")
-    jax.ffi.register_ffi_target(names[0], jax.ffi.pycapsule(lib.PkpdFwd), platform="CUDA")
-    jax.ffi.register_ffi_target(names[1], jax.ffi.pycapsule(lib.PkpdBwd), platform="CUDA")
+    register(names[0], jax.ffi.pycapsule(lib.PkpdFwd))
+    register(names[1], jax.ffi.pycapsule(lib.PkpdBwd))
     return names
 
 
@@ -135,10 +165,7 @@ NSC = 16
 
 def build_asm(d, wpb, nseg, stage=0):
     key = tuple(sorted(d.items())) + (("WPB", wpb), ("NSEG", nseg), ("STAGE", int(stage)))
-    with _BUILD_LOCK:
-        if ("asm",) + key not in _LOADED:
-            _LOADED[("asm",) + key] = _build_src(ASM_SRC, key, ("PkpdAsm",), "asm")[0]
-        return _LOADED[("asm",) + key]
+    return once(("asm",) + key, lambda: _build_src(ASM_SRC, key, ("PkpdAsm",), "asm")[0])
 
 
 def _build_src(src_path, key, symbols, prefix):
@@ -160,7 +187,7 @@ def _build_src(src_path, key, symbols, prefix):
     names = []
     for sym in symbols:
         name = f"pkpd_{sym.lower()}_{tag}"
-        jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, sym)), platform="CUDA")
+        register(name, jax.ffi.pycapsule(getattr(lib, sym)))
         names.append(name)
     return names
 
@@ -284,10 +311,7 @@ S4_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "s4gra
 def build_s4grad(H, NS, NL):
     cg = min(H, max(1, 256 // NS))
     key = (("CG", cg), ("H", H), ("NL", NL), ("NS", NS))
-    with _BUILD_LOCK:
-        if ("s4",) + key not in _LOADED:
-            _LOADED[("s4",) + key] = _build_src(S4_SRC, key, ("PkpdS4grad",), "s4grad")[0]
-        return _LOADED[("s4",) + key]
+    return once(("s4",) + key, lambda: _build_src(S4_SRC, key, ("PkpdS4grad",), "s4grad")[0])
 
 
 def s4d_grads(tp, mS, X, ou, oc, lstride):

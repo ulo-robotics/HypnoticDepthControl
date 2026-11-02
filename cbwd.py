@@ -24,7 +24,6 @@ SRC_ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "casm
 SMEM_MAX = 101376                     # dynamic shared memory per block (sm_89)
 NQ = 48
 ASM_PREC = K.HI                       # precision of the assembly GEMMs
-_LOADED = {}
 
 
 def dims(kp):
@@ -154,35 +153,36 @@ def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam=True, B=0):
 
 
 def _build(header, src_path=SRC, symbol="CbwdHandler", prefix="cbwd"):
-    with KC._BUILD_LOCK:
-        if (header, prefix) in _LOADED:
-            return _LOADED[(header, prefix)]
-        src = open(src_path).read()
-        arch = KC._arch()
-        tag = hashlib.sha1((header + src + arch).encode()).hexdigest()[:16]
-        so = os.path.join(KC.CACHE, f"{prefix}_{tag}.so")
-        if not os.path.exists(so):
-            os.makedirs(KC.CACHE, exist_ok=True)
-            hf = os.path.join(KC.CACHE, f"{prefix}_{tag}.h")
-            open(hf, "w").write(header)
-            cmd = [KC.nvcc(), "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-arch={arch}", "-Xlinker", "--exclude-libs,ALL",
-                   "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-diag-suppress", "177,550",
-                   "-I" + jax.ffi.include_dir(), "-include", hf, src_path, "-o", f"{so}.{os.getpid()}.tmp"]
-            if os.environ.get("CBWD_VERBOSE"):
-                cmd += ["-Xptxas", "-v"]
-            if os.environ.get("CBWD_LINEINFO"):
-                cmd += ["-lineinfo"]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"nvcc failed:\n{res.stderr[-4000:]}")
-            if os.environ.get("CBWD_VERBOSE"):
-                print("\n".join(l for l in res.stderr.splitlines() if "registers" in l or "spill" in l), flush=True)
-            os.replace(f"{so}.{os.getpid()}.tmp", so)
-        lib = ctypes.cdll.LoadLibrary(so)
-        name = f"pkpd_{prefix}_{tag}"
-        jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, symbol)), platform="CUDA")
-        _LOADED[(header, prefix)] = name
-        return name
+    return KC.once((prefix, header), lambda: _compile(header, src_path, symbol, prefix))
+
+
+def _compile(header, src_path, symbol, prefix):
+    """nvcc into the content-addressed cache (or load from it) and register the FFI target"""
+    src = open(src_path).read()
+    arch = KC._arch()
+    tag = hashlib.sha1((header + src + arch).encode()).hexdigest()[:16]
+    so = os.path.join(KC.CACHE, f"{prefix}_{tag}.so")
+    if not os.path.exists(so):
+        os.makedirs(KC.CACHE, exist_ok=True)
+        hf = os.path.join(KC.CACHE, f"{prefix}_{tag}.h")
+        open(hf, "w").write(header)
+        cmd = [KC.nvcc(), "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-arch={arch}", "-Xlinker", "--exclude-libs,ALL",
+               "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-diag-suppress", "177,550",
+               "-I" + jax.ffi.include_dir(), "-include", hf, src_path, "-o", f"{so}.{os.getpid()}.tmp"]
+        if os.environ.get("CBWD_VERBOSE"):
+            cmd += ["-Xptxas", "-v"]
+        if os.environ.get("CBWD_LINEINFO"):
+            cmd += ["-lineinfo"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"nvcc failed:\n{res.stderr[-4000:]}")
+        if os.environ.get("CBWD_VERBOSE"):
+            print("\n".join(l for l in res.stderr.splitlines() if "registers" in l or "spill" in l), flush=True)
+        os.replace(f"{so}.{os.getpid()}.tmp", so)
+    lib = ctypes.cdll.LoadLibrary(so)
+    name = f"pkpd_{prefix}_{tag}"
+    KC.register(name, jax.ffi.pycapsule(getattr(lib, symbol)))
+    return name
 
 
 # ---------------------------------------------------------------- the sweep

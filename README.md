@@ -91,9 +91,11 @@ Per-patient gradients through a 360-step closed loop are the whole cost of train
     which replaces the backward sweep); `cuda/casm.cu` does that whole assembly in one pass over each patient's tapes. Other assemblies: the XLA one with `cuda/s4grad.cu`, and `cuda/asm.cu`.
 
 **How the engine is chosen.** For each shape (sizes, population size, batch), the candidates are compiled, checked against the XLA
-reference on stable patients, and timed on the real batch. A shape is tuned once: another population size of it only re-checks the choice
-made there. A new shape first tries the candidates that won at every measured shape (blocked CUDA sweeps, CUDA tape assembly) and tunes
-every candidate only if one of them does not work; `PKPD_TUNE=full` always tunes every candidate. The forward and backward sweeps are chosen independently; anything that fails to
+reference on stable patients, and timed on the real batch. A shape is tuned once: another population size of it, or a decision recorded by an earlier
+version of the kernels, only re-checks the choice made there. A new shape first tries the candidates that won at every measured shape (blocked CUDA sweeps, CUDA tape assembly) and tunes
+every candidate only if one of them does not work (the plain CUDA backward sweeps are then compiled only if no joint backward + assembly
+works); `PKPD_TUNE=full` always tunes every candidate. The candidates are traced in parallel (nvcc builds of the kernels run concurrently,
+`PKPD_BUILD_THREADS`, default min(16, cores)) and compiled by `PKPD_COMPILE_THREADS` (default 3) threads. The forward and backward sweeps are chosen independently; anything that fails to
 compile or disagrees is never used. The Pallas, XLA and blocked CUDA sweeps run on populations; the `kcuda.py` sweeps serve a single unpadded
 network. Assemblies are checked against the XLA assembly per patient and parameter; a joint backward + assembly competes on the whole gradient.
 Raw JAX is used when no adjoint candidate works (it was slower than the adjoint path at every measured shape, and vmapped over a population it
@@ -166,7 +168,9 @@ time, as one jitted program, each with its own hyperparameters and optimizer:
   exactly its own network: padded entries get exactly zero gradients, so a member trains like the same configuration alone (`selftest.py`);
 - every hyperparameter is an array, the optimizer is a switch over the members' update rules, and 100 iterations run per jitted call, so one
   compilation serves every population of that shape, in every rung: populations are padded to the full size of their shape (copies,
-  discarded; `--no-pad-pop`: to the next power of two), and a process reuses a compiled program for every population that has it;
+  discarded; `--no-pad-pop`: to the next power of two), and a process reuses a compiled program for every population that has it. A
+  population at most half full that still trains 1000 iterations or more (the final stage) is padded only to the next power of two of its
+  size: there, the extra compilation costs less than training the copies;
 - many recurrences at once keep the GPU busy, where one trial's 512 patients leave most of it idle.
 
 One process owns the GPU (the JAX model: a device belongs to one process). A population that does not fit in memory is split in two. The search

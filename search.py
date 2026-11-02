@@ -58,18 +58,21 @@ def screen(designs, n, stimulus):
     names, specs = list(M.VAL), M.val_specs(stimulus)
     keys = _keys()
 
+    stacked = {k: jnp.asarray([specs[s][k] for s in names], jnp.float32) for k in M.SPEC_NOMINAL}
+    w = jnp.asarray([M.VAL[s][1] for s in names])
+
     @jax.jit
     def scores(phs):
-        def per_scen(i):
-            sp = {k: jnp.float32(v) for k, v in specs[names[i]].items()}
+        def per_scen(inp):                                         # one scenario's patients, every design at once (traced once)
+            i, sp = inp
             pts = M.sample_patients(jax.random.fold_in(jax.random.fold_in(keys["val"], 999), i), n, sp)
 
             def one(ph):
                 _, b, _ = P.rollout(dict(params, phys=ph), pts)
                 return jnp.mean((b - pts["tgt"].T) ** 2) + 2.0 * jnp.mean(jax.nn.relu(40 - b) ** 2)
-            return jax.lax.map(one, phs)
-        w = jnp.asarray([M.VAL[s][1] for s in names])
-        return sum(w[i] * per_scen(i) for i in range(len(names))) / w.sum()
+            return jax.vmap(one)(phs)
+        per = jax.lax.map(per_scen, (jnp.arange(len(names)), stacked))     # (scenarios, designs)
+        return (w[:, None] * per).sum(0) / w.sum()
 
     G = 32
     for g0 in range(0, len(ok), G):
@@ -112,6 +115,9 @@ def shape_key(c):
 def group_shape(g):
     """padded (L, H, NS) of a population: the largest of its members'"""
     return tuple(max(x) for x in zip(*(shape_key(t["cfg"]) for t in g)))
+
+
+TIGHT = 1000                                  # iterations from which a small population is not padded to its shape's full size (Search.members)
 
 
 def p2(n):
@@ -165,9 +171,13 @@ class Search:
         """the most trials a population of g's shape holds (--pop, or less after an out-of-memory split)"""
         return min(self.max_pop.get(str(group_shape(g)), self.a.pop), self.a.pop)
 
-    def members(self, g):
-        """members of g's compiled population: padded to its shape's full size (one program per shape), or to the next power of two"""
-        return p2(self.cap(g)) if self.a.pad_pop else p2(len(g))
+    def members(self, g, iters=0):
+        """members of g's compiled population: padded to its shape's full size (one program per shape), or to the next power of two. A
+        population at most half full that still trains TIGHT iterations or more is padded only to the next power of two of its own size:
+        the padding's compute would outweigh a compile (and an engine check) of its own"""
+        if self.a.pad_pop and not (iters >= TIGHT and 2 * len(g) <= self.cap(g)):
+            return p2(self.cap(g))
+        return p2(len(g))
 
     def populations(self, todo):
         """the trials in populations of up to --pop, in size order so that neighbours share a padded shape: populations stay full when the
@@ -192,12 +202,12 @@ class Search:
         t0, seen, i = time.time(), set(), 0
         while i < len(queue):                                                         # engine choices (cached across rungs and runs)
             g = queue[i]
-            key = (group_shape(g), self.members(g))
+            key = (group_shape(g), self.members(g, budget - g[0].get("it", 0)))
             if key not in seen:
                 try:
                     self.prepare(g, budget, train_seed, compile=False)
                 except Exception as e:
-                    if not _oom(e) or self.members(g) == 1:
+                    if not _oom(e) or key[1] == 1:
                         raise
                     self.shrink(g, tag)
                     queue, seen, i = self.populations(todo), set(), 0                 # the shape's populations re-formed at the smaller size
@@ -248,7 +258,7 @@ class Search:
         for t in g:
             p = self.spath(t)
             states.append(pickle.load(open(p, "rb")) if os.path.exists(p) else T.new_state(t["cfg"], jax.random.PRNGKey(t["id"] % SEED_STRIDE)))
-        n = self.members(g)
+        n = self.members(g, budget - g[0].get("it", 0))
         cfgs = [t["cfg"] for t in g] + [g[0]["cfg"]] * (n - len(g))                  # copies of the first member fill the population
         states += [states[0]] * (n - len(g))
         L, H, NS = group_shape(g)

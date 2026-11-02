@@ -210,26 +210,49 @@ def _time(f, *a, reps=3, warm=1.0):
     return best
 
 
+@jax.jit
+def _diff(a, b):
+    """max |a - b|, max |b| and whether a is finite, on the device (only the three scalars come to the host)"""
+    a, b = jnp.asarray(a, jnp.float32), jnp.asarray(b, jnp.float32)
+    return jnp.max(jnp.abs(a - b)), jnp.max(jnp.abs(b)), jnp.all(jnp.isfinite(a))
+
+
 def _rel(a, b):
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    if not np.all(np.isfinite(a)):
-        return float("inf")
-    return float(np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1e-30))
+    d, s, fin = (float(x) for x in _diff(a, b))
+    return d / (s + 1e-30) if fin else float("inf")
 
 
 def _rel_tree(a, b):
     """largest per-leaf relative error (each leaf against its own scale, floored at 1e-6 of the largest leaf)"""
-    la = [np.asarray(x, np.float64) for x in jax.tree_util.tree_leaves(a)]
-    lb = [np.asarray(x, np.float64) for x in jax.tree_util.tree_leaves(b)]
-    if not all(np.all(np.isfinite(x)) for x in la):
+    r = [tuple(float(x) for x in _diff(x, y)) for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))]
+    if not all(fin for _, _, fin in r):
         return float("inf")
-    top = max(float(np.max(np.abs(y))) for y in lb) + 1e-30
-    return max(float(np.max(np.abs(x - y))) / (float(np.max(np.abs(y))) + 1e-6 * top) for x, y in zip(la, lb))
+    top = max(s for _, s, _ in r) + 1e-30
+    return max(d / (s + 1e-6 * top) for d, s, _ in r)
 
 
 def _aot(fn, *args):
     """ahead-of-time compile (runs in a worker thread: XLA / Triton compilation releases the GIL)"""
     return jax.jit(fn).lower(*args).compile()
+
+
+def _compile_jobs(jobs):
+    """{key: (fn, args)} -> {key: executable or the exception}: every job traced first in a wide thread pool (tracing builds the CUDA
+    libraries, an nvcc process each), then compiled ahead of time in a narrower one (XLA compiles take host memory)"""
+    from concurrent.futures import ThreadPoolExecutor
+    trace = lambda fa: jax.eval_shape(fa[0], *fa[1])
+    with ThreadPoolExecutor(int(os.environ.get("PKPD_BUILD_THREADS", "") or min(16, os.cpu_count() or 4))) as ex:
+        for f in [ex.submit(trace, fa) for fa in jobs.values()]:
+            f.exception()                                           # (a failure shows again, and is kept, when compiled)
+    with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
+        fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
+        exe = {}
+        for k, f in fut.items():
+            try:
+                exe[k] = f.result()
+            except Exception as err:                                # compile failure, resources, missing toolchain: not a candidate
+                exe[k] = _bare(err)
+    return exe
 
 
 def _bare(e):
@@ -256,11 +279,15 @@ def _free():
 
 
 def _other_size(sig):
-    """a decision cached for the same shape at another population size (the sizes of a search share their engine)"""
+    """a decision cached for the same shape at another population size (the sizes of a search share their engine), or by an earlier version
+    of the engine code (an edit does not cost a full re-tune: the choice is re-checked against the reference and re-timed); entries of the
+    same code first"""
     size = lambda k: int(re.search(r"_x(\d+)_", k).group(1))
-    shape = lambda k: re.sub(r"_x\d+_", "_x_", k, count=1)
+    code = lambda k: (re.search(r"_([0-9a-f]{12})_[a-z]+$", k) or re.search(r"$", k)).group(0)
+    shape = lambda k: re.sub(r"_[0-9a-f]{12}_([a-z]+)$", r"_\1", re.sub(r"_x\d+_", "_x_", k, count=1))
     hits = [(k, v) for k, v in _load().items() if k != sig and shape(k) == shape(sig) and v.get("engine") == "adjoint"]
-    return max(hits, key=lambda kv: size(kv[0]))[1] if hits else None
+    same = [kv for kv in hits if code(kv[0]) == code(sig)]
+    return max(same or hits, key=lambda kv: size(kv[0]))[1] if hits else None
 
 
 def _preferred(cands, acands):
@@ -273,7 +300,6 @@ def _preferred(cands, acands):
 def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
     """compile every candidate (in parallel threads), check it against the XLA reference on stable (nominal) patients, time it with that same
     executable (run time does not depend on the patients). Returns the decision record (engine raw when no adjoint path works)"""
-    from concurrent.futures import ThreadPoolExecutor
     t0 = time.perf_counter()
     chk = M.sample_patients(jax.random.PRNGKey(4242), B, M.VAL["nominal"][0])
     kp = pop_map(lambda t, s, w, r: K.to_kp(t, s, w, r, plain), n, (0, 0, 0, 0))(tp, sz, w_low, rho_u)
@@ -281,27 +307,23 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
     sweeps = lambda f, tape: pop_map(lambda k_, t_=None: f(k_, q, st) if t_ is None else f(k_, q, st, t_), n, (0,) if tape is None else (0, 0))
     ft_shape = jax.eval_shape(sweeps(K.xla_forward, None), kp)[0]
     bt_shape = jax.eval_shape(sweeps(K.xla_backward, 1), kp, ft_shape)
-    jobs = {}
+    jobs, later = {}, {}
     for kind, opt in cands:
         fwd, bwd = sweep_fns(kind, opt)
         jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
-        jobs[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
+        # a CUDA backward alone is needed only when no joint backward + assembly works: built then (each is an nvcc build)
+        (later if kind in ("cuda", "cblk") else jobs)[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
     for kind, opt in acands:
         af = asm_fn(kind, opt)
         jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
                                           (tp, sz, w_low, rho_u, ft_shape, bt_shape))
-    with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
-        fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
-        exe = {}
-        for k, f in fut.items():
-            try:
-                exe[k] = f.result()
-            except Exception as e:                                  # compile failure, resources, missing toolchain: not a candidate
-                exe[k] = _bare(e)
+    exe = _compile_jobs(jobs)
     t_compile = time.perf_counter() - t0
 
     def timed(k, *a):
-        e = exe[k]
+        e = exe.get(k)
+        if e is None:
+            raise LookupError("not built")
         if isinstance(e, Exception):
             raise e
         need, free = _need(e), _free()
@@ -331,16 +353,19 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
                 err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
                             [_rel(s2["cost"], s["cost"])])
                 del ft2, s2
-                tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
-                err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
-                del bt2
+                tb, err_b = float("inf"), 0.0                          # (deferred: see later)
+                if (kind, repr(opt), "bwd") in exe:
+                    tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+                    err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
+                    del bt2
             except Exception as e:
                 log(f"[engine] {kind} {opt}: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
                 continue
             if not (err_f < TOL and err_b < TOL):
                 log(f"[engine] {kind} {opt}: REJECTED (error vs reference fwd {err_f:.1e}, bwd {err_b:.1e})")
                 continue
-            log(f"[engine] {kind} {opt}: fwd {1000 * tf:.1f} ms, bwd {1000 * tb:.1f} ms (error fwd {err_f:.1e}, bwd {err_b:.1e})")
+            log(f"[engine] {kind} {opt}: fwd {1000 * tf:.1f} ms, bwd {1000 * tb:.1f} ms (error fwd {err_f:.1e}, bwd {err_b:.1e})"
+                if tb < float("inf") else f"[engine] {kind} {opt}: fwd {1000 * tf:.1f} ms (error {err_f:.1e}; its backward alone deferred)")
             res.append((kind, opt, (tf, tb)))
     if mode not in ("auto", "adjoint"):
         res = [x for x in res if x[0] == mode] or res
@@ -366,6 +391,22 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
                 continue
             log(f"[engine] assembly {kind} {opt}: {1000 * ta:.1f} ms (error {err:.1e})")
             ares.append((kind, opt, ta))
+        if ares and not any(x[0] == "tapes" for x in ares) and later:   # no joint candidate: the CUDA backward sweeps alone after all
+            exe.update(_compile_jobs({k: v for k, v in later.items() if any((k[0], k[1]) == (x[0], repr(x[1])) for x in res)}))
+            for i, (kind, opt, (tf, _)) in enumerate(res):
+                if (kind, repr(opt), "bwd") not in exe:
+                    continue
+                try:
+                    tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+                    err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
+                    del bt2
+                except Exception as e:
+                    log(f"[engine] {kind} {opt} backward: unavailable ({type(e).__name__}: {str(e).splitlines()[0][:110]})")
+                    continue
+                if err_b < TOL:
+                    log(f"[engine] {kind} {opt}: bwd {1000 * tb:.1f} ms (error {err_b:.1e})")
+                    res[i] = (kind, opt, (tf, tb))
+            bb = min(res, key=lambda x: x[2][1])
         if ares:                                       # a joint candidate includes its backward: compare whole gradients
             total = lambda x: fb[2][0] + x[2] + (0.0 if x[0] == "tapes" else bb[2][1])
             ab = min(ares, key=total)
@@ -375,13 +416,19 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
             if len(fin_f) * len(fin_a) > 1:            # the stages timed alone carry their own output copies: the finalists as whole gradients
                 ft = bt = g_ref = None
                 gc.collect()
-                times = {}
+                times, combos = {}, {}
                 for f_ in fin_f:
                     for a_ in fin_a:
                         bwd = _no_backward if a_[0] == "tapes" else sweep_fns(bb[0], bb[1])[1]
-                        g = population(adjoint_fn(sweep_fns(f_[0], f_[1])[0], bwd, plain, chunk, asm_fn(a_[0], a_[1])), n)
+                        combos[(id(f_), id(a_))] = (population(adjoint_fn(sweep_fns(f_[0], f_[1])[0], bwd, plain, chunk, asm_fn(a_[0], a_[1])), n),
+                                                    (tp, sz, chk, w_low, rho_u))
+                cexe = _compile_jobs(combos)                       # (in parallel; timed one at a time below)
+                for f_ in fin_f:
+                    for a_ in fin_a:
                         try:
-                            e = _aot(g, tp, sz, chk, w_low, rho_u)
+                            e = cexe.pop((id(f_), id(a_)))
+                            if isinstance(e, Exception):
+                                raise e
                             need, free = _need(e), _free()
                             if need is not None and free is not None and need > FIT * free:
                                 raise RuntimeError(f"needs {need / 2**30:.2f} GiB of {free / 2**30:.2f} GiB free: not run")
@@ -393,6 +440,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
                                 f"({type(err).__name__}: {str(err).splitlines()[0][:110]})")
                         e = None
                         gc.collect()
+                cexe = combos = None
                 if times:
                     whole, fb, ab = min(times.values(), key=lambda x: x[0])
             joint = ab[0] == "tapes"
@@ -403,7 +451,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
             log("[engine] gradient assembly unavailable: raw JAX")
     rec["tune_s"] = time.perf_counter() - t0
     rec["compile_s"] = t_compile
-    del exe, kp, ft, bt, res, timed, chk
+    del exe, later, kp, ft, bt, res, timed, chk
     gc.collect()                                                    # every candidate's executable and outputs released before the next stage
     return rec
 
@@ -435,7 +483,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
         if prev is not None and not full:                                      # the same shape at another population size
             keep = lambda lst, ch: [x for x in lst if (x[0] == "xla" and not x[1]) or [x[0], x[1]] == ch]
-            log(f"[engine] this shape was tuned at another population size: checking its choice")
+            log(f"[engine] this shape was tuned at another population size or by an earlier engine version: checking its choice")
             rec = tune(keep(cands, prev["fwd"]) + [x for x in keep(cands, prev["bwd"]) if x not in keep(cands, prev["fwd"])],
                        keep(acands, prev["asm"]))
             rec = rec if rec["engine"] == "adjoint" and [rec["fwd"], rec["asm"]] == [prev["fwd"], prev["asm"]] else None
