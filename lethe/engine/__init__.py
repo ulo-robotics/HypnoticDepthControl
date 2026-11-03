@@ -54,7 +54,7 @@ TAPES_CANDS = [dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, p
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("xla/__init__.py", "xla/layout.py", "xla/step.py", "xla/sweeps.py", "xla/assemble.py", "cuda.py", "kernels/cbwd.cu",
+    for f in ("xla/__init__.py", "xla/layout.py", "xla/step.py", "xla/sweeps.py", "xla/assembly.py", "cuda.py", "kernels/cbwd.cu",
               "kernels/cfwd.cu", "kernels/casm.cu", "../core/policy.py", "../core/model.py", "__init__.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):

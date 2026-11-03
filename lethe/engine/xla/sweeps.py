@@ -9,7 +9,8 @@ backward   k = N-1 .. 0: replays step k from the tape (S4D outputs taken from it
 
 T > 0 blocks the S4D over T steps: one contraction gives the state part of a block's outputs (Wb = C dA^(i+1)), the outputs within the
 block add the impulse response of the block's earlier inputs (a strictly lower Toeplitz matrix of K_m = 2 Re sum C dB dA^m), and the state
-is read and written once per block. Same results as T = 0 up to rounding. The steps within a block are an inner scan.
+is read and written once per block. Same results as T = 0 up to rounding. The steps within a block are an inner scan, unrolled (its
+length T is static); unroll > 1 also unrolls the outer scan over the steps (or blocks) by that factor.
 
 S4D adjoint (per step, h' = dA h + dB u, ys = 2 Re sum C h'): with lam the cotangent of h' (as lam = dL/dRe h' + i dL/dIm h'),
 e = Re sum conj(lam) dB, and the cotangent of h is (lam + 2 cy conj(C)) conj(dA), cy the cotangent of ys.
@@ -107,7 +108,7 @@ def _blk_block(carry, xs, inner):
     T = ks.shape[0]
     base = 2.0 * jnp.real(jnp.einsum("lbhn,lhnt->lbht", h, bm.Wb, precision=HI))
     ubuf = jnp.zeros(base.shape, base.dtype)
-    (_, _, _, _, c2, ubuf), out = lax.scan(inner, (net, pat, bm, base, c, ubuf), (jnp.arange(T), ks, sb))
+    (_, _, _, _, c2, ubuf), out = lax.scan(inner, (net, pat, bm, base, c, ubuf), (jnp.arange(T), ks, sb), unroll=True)
     h2 = bm.AT[:, None] * h + jnp.einsum("lbht,lhnt->lbhn", ubuf.astype(h.dtype), bm.Wu, precision=HI)
     return (net, pat, bm, c2, h2), out
 
@@ -126,7 +127,7 @@ def _flat(a):
 
 
 # ---------------------------------------------------------------- forward
-def _forward(net, pat, steps, tape=True, T=0):
+def _forward(net, pat, steps, tape=True, T=0, unroll=1):
     """forward sweep of one network: (Tape or None, Sums). tape: write the tape; T > 0: blocked S4D"""
     B, N = pat.mu.shape[0], nsteps(steps)
     L, H, NS = net.layers.dA.shape
@@ -135,16 +136,16 @@ def _forward(net, pat, steps, tape=True, T=0):
     ks = jnp.arange(N)
     if T:
         bm = block_mats(net.layers, T)
-        _, out = lax.scan(_blk_body_tape if tape else _blk_body, (net, pat, bm, c0, h0), (ks.reshape(N // T, T), blocks(steps, T)))
+        _, out = lax.scan(_blk_body_tape if tape else _blk_body, (net, pat, bm, c0, h0), (ks.reshape(N // T, T), blocks(steps, T)), unroll=unroll)
         out = jax.tree_util.tree_map(_flat, out)
     else:
-        _, out = lax.scan(_fwd_body_tape if tape else _fwd_body, (net, pat, c0, h0), (ks, steps))
+        _, out = lax.scan(_fwd_body_tape if tape else _fwd_body, (net, pat, c0, h0), (ks, steps), unroll=unroll)
     rows = out[0] if tape else out
     sums = Sums(cost=rows[0].sum(0), se=rows[1].sum(0), viol=rows[2].sum(0))
     return (Tape(c=out[1], ys=jnp.moveaxis(out[2], 1, 0)) if tape else None), sums
 
 
-forward = jax.jit(_forward, static_argnames=("tape", "T"))
+forward = jax.jit(_forward, static_argnames=("tape", "T", "unroll"))
 
 
 # ---------------------------------------------------------------- backward
@@ -202,7 +203,7 @@ def _bblk_body(carry, xs):
     E = jnp.real(jnp.einsum("lbhn,lhnt->lbht", jnp.conj(lh), bm.Wu, precision=HI))
     cybuf = jnp.zeros(E.shape, E.dtype)
     (_, _, _, _, _, lc2, cybuf), out = lax.scan(_bblk_inner, (net, pat, bm, inv_n, E, lc, cybuf), (jnp.arange(T), ks, sb, cb, ysb),
-                                                reverse=True)
+                                                reverse=True, unroll=True)
     G = jnp.einsum("lbht,lhnt->lbhn", 2.0 * cybuf.astype(lh.dtype), bm.Wb, precision=HI)
     return (net, pat, bm, inv_n, lc2, lh * jnp.conj(bm.AT)[:, None] + jnp.conj(G)), out
 
@@ -212,7 +213,7 @@ def _blocked(a, T):
     return a.reshape((a.shape[0] // T, T) + a.shape[1:])
 
 
-def _backward(net, pat, steps, tape, T=0):
+def _backward(net, pat, steps, tape, T=0, unroll=1):
     """backward sweep of one network from the forward tape: Adjoint. T > 0: blocked S4D adjoint"""
     B, N = pat.mu.shape[0], nsteps(steps)
     L, H, NS = net.layers.dA.shape
@@ -224,12 +225,12 @@ def _backward(net, pat, steps, tape, T=0):
     if T:
         bm = block_mats(net.layers, T)
         xs = (ks.reshape(N // T, T), blocks(steps, T), Carry(*[_blocked(a, T) for a in tape.c]), _blocked(ys, T))
-        _, (lam, e) = lax.scan(_bblk_body, (net, pat, bm, inv_n, lc0, lh0), xs, reverse=True)
+        _, (lam, e) = lax.scan(_bblk_body, (net, pat, bm, inv_n, lc0, lh0), xs, reverse=True, unroll=unroll)
         lam, e = jax.tree_util.tree_map(_flat, lam), _flat(e)
     else:
-        _, (lam, e) = lax.scan(_bwd_body, (net, pat, inv_n, lc0, lh0), (ks, steps, tape.c, ys), reverse=True)
+        _, (lam, e) = lax.scan(_bwd_body, (net, pat, inv_n, lc0, lh0), (ks, steps, tape.c, ys), reverse=True, unroll=unroll)
     return Adjoint(lam=lam, e=jnp.moveaxis(e, 1, 0))
 
 
-backward = jax.jit(_backward, static_argnames=("T",))
+backward = jax.jit(_backward, static_argnames=("T", "unroll"))
 

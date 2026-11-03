@@ -6,7 +6,7 @@ reference the CUDA engine is checked against).
                patient batch
   step.py      the closed-loop step in stages (monitor, layer, post) and the replayed S4D layer (s4d_tap)
   sweeps.py    forward and backward sweeps, per step or with the S4D blocked over T steps
-  assemble.py  the per-patient gradients from the two tapes
+  assembly.py  the per-patient gradients from the two tapes
 
 Every function is a module-level function and every public one is jitted (static: tape, T, chunk); scan bodies get their constants through
 the carry. adjoint_grads is the whole gradient of one network. The *_k functions are the engine's interface (lethe/engine): the same sweeps
@@ -15,7 +15,7 @@ and assembly on the CUDA kernels' tape format, so that a forward and a backward 
 import jax
 import jax.numpy as jnp
 
-from lethe.engine.xla.assemble import assemble
+from lethe.engine.xla.assembly import assemble
 from lethe.engine.xla.layout import (DP, HI, Adjoint, Carry, Layers, Net, Patients, Steps, Sums, Tape, complex_of, net_of, nsteps,
                                      patients_of, steps_of)
 from lethe.engine.xla.sweeps import backward, forward
