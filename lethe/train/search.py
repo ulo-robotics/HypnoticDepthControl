@@ -5,16 +5,15 @@ Meta-optimization of the policy's training configuration (the procedure of the p
   1. prior screen    score --prior-screen prior designs (q_theta, sy_scale, rho_lqr, q_x) at iteration 0 (forward only: the untrained policy
                      IS the prior compensator) and keep the best --prior-keep share as the pool the trials draw their prior design from
   2. trials          --trials configurations: trial 0 = trainer.SEARCH_BASE, the rest a scrambled Sobol sequence over trainer.SPACE
-  3. rungs           successive halving: train every trial to the rung budget (--rungs, cumulative iterations), keep the best 1/--eta (at
-                     least --final-top). A trial's score is that of its best snapshot so far: every --eval-every iterations its EMA is
-                     validated on new patients (a new key at every evaluation point, the same patients for every trial), and at the end of a
-                     rung on the rung's own validation key; the best EMA is kept (<out>/store/b<id>.pkl). --eval-every 0: the EMA at the end
-                     of the rung only
+  3. rungs           successive halving: train every trial to the rung budget (--rungs, cumulative iterations), score its EMA on new patients
+                     (a fresh validation key per rung), keep the best 1/--eta (at least --final-top). Besides, every --eval-every iterations
+                     every trial's EMA is validated on new patients (a new key at every evaluation point, the same patients for every trial)
+                     and each trial keeps its best snapshot (<out>/store/b<id>.pkl; the end of a rung is a candidate too, on the rung key)
   4. final stage     the --final-top survivors continue for --final-iters with --final-seeds training-data seeds each (seed copies share the
                      trial's state at the start of the stage)
-  5. re-rank / test  the best snapshots of all final models on a fresh key with --rerank-batch patients per scenario, the configuration with
-                     the best mean over seeds wins (its best seed is the model); the winner is scored ONCE on the test key against the
-                     untrained base prior
+  5. re-rank / test  the best snapshots of all final models (--eval-every 0: their EMA at the end) on a fresh key with --rerank-batch patients
+                     per scenario, the configuration with the best mean over seeds wins (its best seed is the model); the winner is scored
+                     ONCE on the test key against the untrained base prior
 All trials see the same training patients (common random numbers). Score = weighted mean over model.VAL of J + 2 viol (lower is better).
 Training and scoring use the fixed stimulus (--stimulus, model.STIM_FIXED); finetune.py then moves the winner to the random one.
 
@@ -317,10 +316,9 @@ class Search:
         for t, st, (per, sc) in zip(g, pop.member_states(), res):
             T.save(st, self.spath(t))
             failed = not np.isfinite(sc)
-            score = t.get("best_score", float("inf")) if every else (float(sc) if not failed else float("inf"))
-            t.update(it=st["it"], end_score=float(sc), score=score, per=t.get("best_per", per) if every else per, failed=failed, done=tag)
-            self.log(dict(trial=t["id"], stage=tag, it=t["it"], score=t["score"], end_score=t["end_score"], best_it=t.get("best_it"),
-                          cfg=t["cfg"], per=t["per"], engine=pop.engine.get("engine")))
+            t.update(it=st["it"], score=float(sc) if not failed else float("inf"), per=per, failed=failed, done=tag)
+            self.log(dict(trial=t["id"], stage=tag, it=t["it"], score=t["score"], best_score=t.get("best_score"), best_it=t.get("best_it"),
+                          cfg=t["cfg"], per=per, engine=pop.engine.get("engine")))
         self.save()
         e = pop.engine
         eng = f"{e['fwd'][0]}/{e['bwd'][0]}" if e.get("engine") == "adjoint" else e.get("engine")
@@ -473,8 +471,8 @@ def main():
     ap.add_argument("--prior-keep", type=float, default=0.25)
     ap.add_argument("--pop", type=int, default=8, help="trials per population (at most; a population that does not fit is split)")
     ap.add_argument("--block", type=int, default=100, help="training iterations per jitted call")
-    ap.add_argument("--eval-every", type=int, default=100, help="snapshot validation every N iterations (a multiple of --block; 0: score the "
-                    "EMA at the end of each rung only)")
+    ap.add_argument("--eval-every", type=int, default=100, help="snapshot validation every N iterations (a multiple of --block; the re-rank "
+                    "takes each final model's best snapshot; 0: its EMA at the end)")
     ap.add_argument("--no-pad-pop", dest="pad_pop", action="store_false", help="pad a population only to the next power of two (fewer discarded "
                     "copies in a rung's last population, but one more program and engine choice per population size)")
     ap.add_argument("--seed", type=int, default=0, help="Sobol scrambling seed")
