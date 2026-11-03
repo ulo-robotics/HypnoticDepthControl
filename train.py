@@ -17,6 +17,7 @@ of search.py.
 import argparse, json, os, pickle, signal, time
 import jax
 
+import model as M
 import policy as P
 import trainer as T
 
@@ -64,7 +65,7 @@ def main():
         if sc < best["score"]:
             best = dict(score=sc, it=it)
             ema = jax.tree_util.tree_map(lambda a: a[0], T.to_np(pop.state["ema"]))
-            T.save(dict(params=P.shrink(ema, c), cfg=c, it=it, score=sc, val=st), os.path.join(args.out, "best_model.pkl"))
+            T.save(dict(params=P.shrink(ema, c), cfg=c, it=it, score=sc, val=st, semantics=M.SEMANTICS["current"]), os.path.join(args.out, "best_model.pkl"))
         train = None if m is None else {k: float(v[0]) for k, v in m.items()}
         log.write(json.dumps(dict(it=it, score=sc, val=st, train=train, time=time.time())) + "\n")
         log.flush()

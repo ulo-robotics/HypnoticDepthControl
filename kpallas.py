@@ -143,7 +143,7 @@ def forward(kp, q, st, tape=True, kb=16, nw=4, lazy=False, interpret=False):
                     o["ys"][l][k] = ys
                 return ys, None
             c2, cost, b, _, _ = K.step(kpk, qv, c, k, s, s4d)
-            return c2, s_cost + cost, s_se + (b - s["tg"]) ** 2, s_v + jax.nn.relu(40 - b) ** 2
+            return c2, s_cost + cost * s["w"], s_se + (b - s["tg"]) ** 2, s_v + jax.nn.relu(40 - b) ** 2
 
         z = jnp.zeros((kb,), dt)
         _, s_cost, s_se, s_v = lax.fori_loop(0, M.N, body, (K.carry0(kb, Pp, dt), z, z, z))

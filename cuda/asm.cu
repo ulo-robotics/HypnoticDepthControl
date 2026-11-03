@@ -10,7 +10,7 @@
 // Layouts (kcuda.py packs / unpacks them):
 //   kp   (M, KTOT): sc[16] = u0 dec_b w_low rho_u nH head gate[NL] | lamr lami Bur Bui Bwr Bwi Cor Coi [PP each] | enc0..enc3 enc_b mH decl [H each] |
 //        dec [HDV] | (HD > 0) hW [H*HD] hWT [HD*H] hb [HD] | per layer: K0 D [H] Wv WvT Wg WgT [H*H] bv bg g beta [H]
-//   q    (M, B, 44), st (M, 6, N, B), tape / lam (M, N, B, S), ys / e (M, NL, N, B, H)    (M: population members; broadcast inputs are copies)
+//   q    (M, B, 48), st (M, 6, N, B), tape / lam (M, N, B, S), ys / e (M, NL, N, B, H)    (M: population members; broadcast inputs are copies)
 //   gs   (M, NSEG, B, NSM): small-parameter cotangents per segment: u0 dec_b | lamr lami Bur Bui Bwr Bwi Cor Coi [PP] | enc0..3 enc_b decl [H] |
 //        dec [HDV] | hb [HD] | per layer: D bv bg g beta [H]
 //   ops  (M, B, N, NOP): per layer: a zvb zgb u cy [H each] | head input xl [H] | head pre-activation cotangent dph [HD]
@@ -26,7 +26,10 @@ namespace ffi = xla::ffi;
 #ifndef STAGE
 #define STAGE 0
 #endif
-constexpr int NSTEP = 360, DP = 16, NQ = 44, NSC = 16;
+#ifndef NSTEP
+#define NSTEP 360
+#endif
+constexpr int DP = 16, NQ = 48, NSC = 16;
 constexpr float DT = 5.0f / 60.0f, T_END = 30.0f, UMAX = 100.0f, E0N = 100.0f, EMAXN = 100.0f, GAMN = 2.0f, C50N = 4.5f;
 constexpr int CH = (H + 31) / 32;
 constexpr int HDV = HD > 0 ? HD : H;
@@ -79,7 +82,7 @@ __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x))
 __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
 struct Patient {
-  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4], stim_t;
+  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4], stim_t, stim2, stim_t2, stim3, stim_t3;
   __device__ void load(const float* r) {
     mu = r[0]; a_ou = r[1]; osc = r[2]; stim = r[3]; gam = r[4]; e0 = r[5]; emax = r[6];
 #pragma unroll
@@ -88,7 +91,7 @@ struct Patient {
     for (int j = 0; j < 16; j++) A[j] = r[23 + j];
 #pragma unroll
     for (int j = 0; j < 4; j++) Bd[j] = r[39 + j];
-    stim_t = r[43];
+    stim_t = r[43]; stim2 = r[44]; stim_t2 = r[45]; stim3 = r[46]; stim_t3 = r[47];
   }
 };
 
@@ -97,7 +100,7 @@ __device__ __forceinline__ void pre_stage(const Patient& P, int k, float x3, flo
                                           float r, float& b, float& w, float& f0, float& f1, float& f2, float& f3) {
   float t = k * DT;
   float ce = fmaxf(x3, 0.0f);
-  float l50 = P.mu + ou + P.stim * (t > P.stim_t ? 1.0f : 0.0f);
+  float l50 = P.mu + ou + P.stim * (t > P.stim_t ? 1.0f : 0.0f) + P.stim2 * (t > P.stim_t2 ? 1.0f : 0.0f) + P.stim3 * (t > P.stim_t3 ? 1.0f : 0.0f);
   float cg = powf(ce, P.gam), eg = powf(expf(l50), P.gam);
   b = P.e0 - P.emax * cg / (cg + eg);
   float bd = 0.0f;
@@ -114,7 +117,7 @@ __device__ __forceinline__ void pre_stage(const Patient& P, int k, float x3, flo
   w = fminf(C50N * powf(s / (1.0f - s), 1.0f / GAMN), 3.0f * C50N);
   f0 = (y - tg) / 50.0f;
   f1 = up / (r * UMAX);
-  f2 = t / T_END;
+  f2 = 0.0f;
   f3 = w / (r * C50N) - 1.0f;
 }
 
@@ -189,7 +192,7 @@ __global__ void __launch_bounds__(32 * WPB) asm_kernel(const float* __restrict__
   const int seg = item / B, b = item % B;
   const float* kp = kp_all + (size_t)m * KTOT;
   const float* q = q_all + (size_t)m * B * NQ;
-  const float* st = st_all + (size_t)m * 6 * NSTEP * B;
+  const float* st = st_all + (size_t)m * 7 * NSTEP * B;
   const float* tape = tape_all + (size_t)m * NSTEP * B * S;
   const float* lamt = lam_all + (size_t)m * NSTEP * B * S;
   const float* yst = ys_all + (size_t)m * NL * NSTEP * B * H;
@@ -199,7 +202,7 @@ __global__ void __launch_bounds__(32 * WPB) asm_kernel(const float* __restrict__
   Patient P; P.load(q + (size_t)b * NQ);
   const float u0 = ld(kp + O_SC), dec_b = ld(kp + O_SC + 1), w_low = ld(kp + O_SC + 2), rho_u = ld(kp + O_SC + 3), nH = ld(kp + O_SC + 4);
   const bool head = HD > 0 && ld(kp + O_SC + 5) > 0.0f;
-  const float cbar = 1.0f / NSTEP;
+  const float cbar = 1.0f / NSTEP;                                   // (times the step's weight wk)
   const bool own_mode = lane < PP;
   const float lamr = own_mode ? ld(kp + O_LAMR + lane) : 0.0f, lami = own_mode ? ld(kp + O_LAMI + lane) : 0.0f;
   float mH[CH];
@@ -232,7 +235,7 @@ __global__ void __launch_bounds__(32 * WPB) asm_kernel(const float* __restrict__
     for (int j = 0; j < DP; j++) buf[j] = tp[6 + 2 * PP + j];
     const float hpr = own_mode ? tp[6 + lane] : 0.0f, hpi = own_mode ? tp[6 + PP + lane] : 0.0f;
     const float z0 = st[sb], tg = st[2 * (size_t)NSTEP * B + sb], sy = st[3 * (size_t)NSTEP * B + sb],
-                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb];
+                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb], wk = st[6 * (size_t)NSTEP * B + sb];
     float bb, w, f0, f1, f2, f3;
     pre_stage(P, k, x3, ou, up, buf, z0, sy, tg, r, bb, w, f0, f1, f2, f3);
     const float hqr = hpr * rho, hqi = hpi * rho;
@@ -290,7 +293,7 @@ __global__ void __launch_bounds__(32 * WPB) asm_kernel(const float* __restrict__
     // ---- post stage backward (carry adjoint after the step from the backward tape)
     const float lx0 = lp[0], lx1 = lp[1], lx2 = lp[2], lx3 = lp[3], lup = lp[5];
     const float lhr = own_mode ? lp[6 + lane] : 0.0f, lhi = own_mode ? lp[6 + PP + lane] : 0.0f;
-    float uub = P.Bd[0] * lx0 + P.Bd[1] * lx1 + P.Bd[2] * lx2 + P.Bd[3] * lx3 + lup + cbar * rho_u * 2.0f * uu / (UMAX * UMAX);
+    float uub = P.Bd[0] * lx0 + P.Bd[1] * lx1 + P.Bd[2] * lx2 + P.Bd[3] * lx3 + lup + cbar * wk * rho_u * 2.0f * uu / (UMAX * UMAX);
     uub += wsum(own_mode ? lhr * ld(kp + O_BUR + lane) + lhi * ld(kp + O_BUI + lane) : 0.0f) / r;
     const float meanb = (mean > 0.0f && mean < UMAX) ? uub : 0.0f;
     const float ulb = meanb * r, ob = meanb * r * 10.0f;

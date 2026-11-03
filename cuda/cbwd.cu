@@ -191,7 +191,7 @@ enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_encW3, V_dec_lin, NV_TOP };
 #define VL(l, k) (NV_TOP + (l) * 5 + (k))                 // per layer: D, bv, bg, ln_g, ln_b
 #define NV (NV_TOP + 5 * LP)
 // per-patient constants (cbwd.py pack_q)
-enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_dmask = 32, NQ = 48 };
+enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_stim2 = 28, Q_stimt2, Q_stim3, Q_stimt3, Q_dmask = 32, NQ = 48 };
 
 __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
   constexpr int B = BN;                              // patients per member (compile time: constant offsets)
@@ -309,12 +309,14 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
       float bufc[DPL];
 #pragma unroll
       for (int j = 0; j < DPL; j++) bufc[j] = lane + LANES * j < DPAD ? __ldg(cp + 6 + 2 * P5P + lane + LANES * j) : 0.f;
-      const size_t si = ((size_t)g * 5 * NSTEP + k) * B + bb, sstr = (size_t)NSTEP * B;
+      const size_t si = ((size_t)g * 6 * NSTEP + k) * B + bb, sstr = (size_t)NSTEP * B;
       const float z0 = LD(s_in, si), tg = LD(s_in, si + sstr), sy = LD(s_in, si + 2 * sstr), r = LD(s_in, si + 3 * sstr), fr = LD(s_in, si + 4 * sstr);
+      const float wck = wc * LD(s_in, si + 5 * sstr);                  // this step's cost weight (episode length)
       const float gg = q[Q_gam], e0 = q[Q_e0], em = q[Q_em];
       // ======== forward recompute: monitor, features ========
       const float ce = fmaxf(x[3], 0.f);
-      const float logc50 = q[Q_mu] + ou + q[Q_stim] * (t > q[Q_stimt] ? 1.f : 0.f);
+      const float logc50 = q[Q_mu] + ou + q[Q_stim] * (t > q[Q_stimt] ? 1.f : 0.f) + q[Q_stim2] * (t > q[Q_stimt2] ? 1.f : 0.f)
+                           + q[Q_stim3] * (t > q[Q_stimt3] ? 1.f : 0.f);
       float hpr[CP5], hpi[CP5];
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -343,7 +345,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
       const float wpow = C50N_ * powf(ratio, 1.f / GAMMA_);
       const float w = fminf(wpow, 3.f * C50N_);
       const float ri = __frcp_rn(r);
-      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = t * (1.f / T_END_), f3 = w * ri * (1.f / C50N_) - 1.f;
+      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = 0.f, f3 = w * ri * (1.f / C50N_) - 1.f;
       float ul = 0.f;
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -431,8 +433,8 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
       const float uapp = fminf(UMAX_, fmaxf(0.f, mean));
       const float un = uapp * ri, wn = w * ri;
       // ======================== backward ========================
-      float d_b = wc * (0.02f * (b - tg) - wlow * 0.02f * relu(40.f - b));
-      float d_uapp = wc * rhou * 2.f * uapp * (1.f / (UMAX_ * UMAX_));
+      float d_b = wck * (0.02f * (b - tg) - wlow * 0.02f * relu(40.f - b));
+      float d_uapp = wck * rhou * 2.f * uapp * (1.f / (UMAX_ * UMAX_));
       float d_x[4];
 #pragma unroll
       for (int jj = 0; jj < 4; jj++) {

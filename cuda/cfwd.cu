@@ -98,7 +98,7 @@ __device__ __forceinline__ void mmx(const float* X, const float* __restrict__ W,
 enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_encW3, V_dec_lin, NV_TOP };
 #define VL(l, k) (NV_TOP + (l) * 6 + (k))                 // per layer: D, bv, bg, ln_g, ln_b, K0
 #define NV (NV_TOP + 6 * LP)
-enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_osc, Q_dmask = 32, NQ = 48 };
+enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_osc, Q_stim2, Q_stimt2, Q_stim3, Q_stimt3, Q_dmask = 32, NQ = 48 };
 
 __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
   constexpr int B = BN;                              // patients per member (compile time: constant offsets)
@@ -187,12 +187,13 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
 #pragma unroll
         for (int j = 0; j < DPL; j++) if (lane + LANES * j < DPAD) tp[6 + 2 * P5P + lane + LANES * j] = buf[j];
       }
-      const size_t si = ((size_t)g * 6 * NSTEP + k) * B + bb, sstr = (size_t)NSTEP * B;
+      const size_t si = ((size_t)g * 7 * NSTEP + k) * B + bb, sstr = (size_t)NSTEP * B;
       const float z0 = LD(s_in, si), tg = LD(s_in, si + sstr), sy = LD(s_in, si + 2 * sstr), r = LD(s_in, si + 3 * sstr),
-                  fr = LD(s_in, si + 4 * sstr), z1 = LD(s_in, si + 5 * sstr);
+                  fr = LD(s_in, si + 4 * sstr), z1 = LD(s_in, si + 5 * sstr), wk = LD(s_in, si + 6 * sstr);
       // monitor, features
       const float ce = fmaxf(x3, 0.f);
-      const float logc50 = q[Q_mu] + ou + q[Q_stim] * (t > q[Q_stimt] ? 1.f : 0.f);
+      const float logc50 = q[Q_mu] + ou + q[Q_stim] * (t > q[Q_stimt] ? 1.f : 0.f) + q[Q_stim2] * (t > q[Q_stimt2] ? 1.f : 0.f)
+                           + q[Q_stim3] * (t > q[Q_stimt3] ? 1.f : 0.f);
       const float cg = powf(ce, q[Q_gam]);
       const float Cg = expf(q[Q_gam] * logc50);                         // (e^logc50)^gamma
       const float b = q[Q_e0] - q[Q_em] * cg / (cg + Cg);
@@ -215,7 +216,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
       const float s = fminf(1.f - 1e-3f, fmaxf(1e-3f, (E0_ - y) * (1.f / EMAX_)));
       const float w = fminf(C50N_ * powf(s / (1.f - s), 1.f / GAMMA_), 3.f * C50N_);
       const float ri = __frcp_rn(r);
-      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = t * (1.f / T_END_), f3 = w * ri * (1.f / C50N_) - 1.f;
+      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = 0.f, f3 = w * ri * (1.f / C50N_) - 1.f;
       float hqr[CP5], hqi[CP5], ul = 0.f;
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -295,7 +296,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
         }
       }
       const float lo = relu(40.f - b);
-      s_cost += (b - tg) * (b - tg) * 0.01f + wlow * lo * lo * 0.01f + rhou * (uu * (1.f / UMAX_)) * (uu * (1.f / UMAX_));
+      s_cost += wk * ((b - tg) * (b - tg) * 0.01f + wlow * lo * lo * 0.01f + rhou * (uu * (1.f / UMAX_)) * (uu * (1.f / UMAX_)));
       s_se += (b - tg) * (b - tg);
       s_v += lo * lo;
       const float n0 = q[0] * x0 + q[1] * x1 + q[2] * x2 + q[3] * x3 + q[Q_Bd] * uu;

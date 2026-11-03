@@ -68,7 +68,7 @@ def f64(tree):
 
 
 def main():
-    pts = f64(M.sample_patients(jax.random.PRNGKey(3), 32, M.VAL["mixed_hard"][0]))
+    pts = f64(M.sample_patients(jax.random.PRNGKey(3), 32, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=M.N * M.DT)))
     pn = M.to_numpy(pts)
     ok = []
 
@@ -102,7 +102,7 @@ def main():
     # 4. per-patient gradients averaged without clipping == batch gradient
     c = dict(T.CONFIG, patient_clip=0.0)
     gp = jax.vmap(jax.grad(lambda p, pt: jnp.mean(P.rollout(p, {kk: (v[:, :, None] if kk == "z" else v[None]) for kk, v in pt.items()},
-                                                            c["w_low"], c["rho_u"])[0])), in_axes=(None, P.PATIENT_AXES))(p1, ptn)
+                                                            c["w_low"], c["rho_u"])[0])), in_axes=(None, P.patient_axes(ptn)))(p1, ptn)
     ga, _ = T.aggregate(gp, 0.0)
     gb = jax.grad(lambda p: jnp.mean(P.rollout(p, ptn, c["w_low"], c["rho_u"])[0]))(p1)
     num = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(jax.tree_util.tree_leaves(ga), jax.tree_util.tree_leaves(gb)))
@@ -198,7 +198,7 @@ def engines():
     ok, n_run, n_asm = [], 0, 0
     noisy = lambda cfg: jax.tree_util.tree_map(lambda x: x + 0.05 * jax.random.normal(jax.random.PRNGKey(1), x.shape, x.dtype),
                                                P.init_params(jax.random.PRNGKey(0), cfg))
-    pts = M.sample_patients(jax.random.PRNGKey(3), 64, M.VAL["mixed_hard"][0])
+    pts = M.sample_patients(jax.random.PRNGKey(3), 64, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=M.N * M.DT))
     q, st = K.to_kq(pts)
     cases = []
     for cfg in (dict(P.ARCH_DEFAULTS, H=16, NS=8, L=1, head=0), dict(P.ARCH_DEFAULTS, H=32, NS=4, L=2, head=32, n_extra=3), dict(P.ARCH_DEFAULTS)):

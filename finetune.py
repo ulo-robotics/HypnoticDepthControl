@@ -27,9 +27,9 @@ LR_MULTS = (1.0, 1 / 3, 1 / 10, 1 / 30)
 DECAY_AT = (1 / 3, 2 / 3)                     # wsd: constant learning rate until this share of --iters, then down to the floor in half that time
 
 
-def variants(cfg, iters):
-    return [dict(cfg, stimulus="random", delay_ramp=0, lr=cfg["lr"] * m, sched="wsd", tc=d * iters, warm=100)
-            for m in LR_MULTS for d in DECAY_AT]
+def variants(cfg, iters, lr_mults=LR_MULTS, decay_at=DECAY_AT):
+    return [dict(cfg, stimulus="signed", len_lo=30.0, delay_ramp=0, lr=cfg["lr"] * m, sched="wsd", tc=d * iters, warm=100)
+            for m in lr_mults for d in decay_at]
 
 
 def main():
@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--val-batch", type=int, default=1024)
     ap.add_argument("--rerank-batch", type=int, default=4096)
     ap.add_argument("--test-batch", type=int, default=4096)
+    ap.add_argument("--lr-mults", default=",".join(map(str, LR_MULTS)), help="learning-rate multipliers of the variants (fewer: less GPU memory)")
+    ap.add_argument("--decay-at", default=",".join(map(str, DECAY_AT)))
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run")
     a = ap.parse_args()
     if a.smoke:
@@ -51,7 +53,7 @@ def main():
 
     win = pickle.load(open(os.path.join(a.search, "best_model.pkl"), "rb"))
     sargs = json.load(open(os.path.join(a.search, "manifest.json")))["args"]
-    cfgs = variants(win["cfg"], a.iters)
+    cfgs = variants(win["cfg"], a.iters, [float(x) for x in a.lr_mults.split(",")], [float(x) for x in a.decay_at.split(",")])
     if a.smoke:
         cfgs = [dict(c, batch=32) for c in cfgs]
     with jax.default_device(T.HOST):
@@ -80,7 +82,7 @@ def main():
     print(f"trained in {(time.time() - t0) / 60:.1f} min", flush=True)
 
     # re-rank the best snapshots and the winner itself on a fresh key; the best one is tested once
-    names = [f"lr x{m:.3g}, decay at {d:.2f}" for m in LR_MULTS for d in DECAY_AT] + ["search winner (not fine-tuned)"]
+    names = [f"lr x{m:.3g}, decay at {d:.2f}" for m in (float(x) for x in a.lr_mults.split(",")) for d in (float(x) for x in a.decay_at.split(","))] + ["search winner (not fine-tuned)"]
     models = [b["params"] for b in best] + [win["params"]]
     w = np.array([M.VAL[s][1] for s in M.VAL])
     comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
@@ -105,7 +107,7 @@ def main():
                test_improvement=float((test[2] - test[0]).mean()), test_improvement_ci=ci(test[2] - test[0]),
                gain_over_winner=float((test[1] - test[0]).mean()), gain_over_winner_ci=ci(test[1] - test[0]))
     json.dump(res, open(os.path.join(a.out, "results.json"), "w"), indent=1, default=float)
-    T.save(dict(params=models[bi], cfg=cfg), os.path.join(a.out, "best_model.pkl"))
+    T.save(dict(params=models[bi], cfg=cfg, semantics=M.SEMANTICS["current"]), os.path.join(a.out, "best_model.pkl"))
     print(f"\nmodel: {names[bi]}; test score (random stimulus) {res['test_score']:.3f}, search winner {res['winner_score']:.3f} "
           f"(gain {res['gain_over_winner']:.3f} +- {res['gain_over_winner_ci']:.3f}), untrained base prior {res['base_prior_score']:.3f} "
           f"(improvement {res['test_improvement']:.3f} +- {res['test_improvement_ci']:.3f})\n-> {os.path.join(a.out, 'best_model.pkl')}", flush=True)

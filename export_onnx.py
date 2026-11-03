@@ -33,6 +33,7 @@ import numpy as np
 import export_cpp
 
 DT, T_END, UMAX, E0, EMAX, GAMMA, C50N = 5.0 / 60.0, 30.0, 100.0, 100.0, 100.0, 2.0, 4.5
+SEM = None                            # the model's semantics (model.SEMANTICS), set in main
 INPUTS = ("step", "y", "tgt", "tgt_prev", "u_prev", "phys_re", "phys_im", "s4d_re", "s4d_im")
 OUTPUTS = ("u", "phys_re_out", "phys_im_out", "s4d_re_out", "s4d_im_out")
 QUANT = ("mix0", "mix1", "mix2", "head")                           # the int8 matmuls
@@ -45,7 +46,7 @@ def build(params, quant=None, taps=None, half=False):
     activation operand (for calibration)"""
     import onnx
     from onnx import TensorProto, helper as oh, numpy_helper as onh
-    d, a = export_cpp.discretized(params)
+    d, a = export_cpp.discretized(params, SEM)
     H, NS, L, HD, P = d["H"], d["NS"], d["L"], d["head"], d["modes"]
     nodes, inits, n, reg = [], [], [0], ["in"]
     kind_of = {x: np.float32 for x in INPUTS}                      # tensor -> np.float32 / np.float16 / None (not floating point)
@@ -115,7 +116,7 @@ def build(params, quant=None, taps=None, half=False):
     s = op("Clip", op("Div", op("Sub", const(E0), "y"), const(EMAX)), const(1e-3), const(1.0 - 1e-3))
     w = op("Min", op("Mul", const(C50N), op("Pow", op("Div", s, op("Sub", const(1.0), s)), const(1.0 / GAMMA))), const(3.0 * C50N))
     f = [op("Div", op("Sub", "y", "tgt"), const(50.0)), op("Div", "u_prev", op("Mul", r, const(UMAX))),
-         op("Mul", "step", const(DT / T_END)), op("Sub", op("Div", w, op("Mul", r, const(C50N))), const(1.0))]
+         op("Mul", "step", const(DT / T_END if SEM["time_feature"] else 0.0)), op("Sub", op("Div", w, op("Mul", r, const(C50N))), const(1.0))]
     f = op("Concat", *[unsq(v, (1,)) for v in f], axis=1)
     reg[0] = "rec"
     pr, pi = op("Mul", "phys_re", rho), op("Mul", "phys_im", rho)
@@ -261,7 +262,7 @@ def calibrate(params, d, n, seed=1000):
         return out[:5]
     for pts in scenarios(n, seed).values():
         loop(run, pts, d)
-    _, a = export_cpp.discretized(params)
+    _, a = export_cpp.discretized(params, SEM)
     W = {f"mix{l}": a[f"l{l}_W_mix"] for l in range(d["L"])}
     if d["head"]:
         W["head"] = a["head_W1"]
@@ -396,10 +397,16 @@ def main():
     ap.add_argument("--tensorrt", default="", help="comma-separated: fp32, fp16, int8 (TensorRT Python API and cuda-python)")
     ap.add_argument("--litert", default="", help="comma-separated: fp32, dynamic (onnx2tf, TensorFlow, ai-edge-litert)")
     ap.add_argument("--no-int8", dest="int8", action="store_false", help="do not write policy_int8.onnx")
+    ap.add_argument("--semantics", choices=["legacy", "current"], default=None, help="see export_cpp.py")
     a = ap.parse_args()
+    global SEM
     import onnx
     os.makedirs(a.out, exist_ok=True)
-    params = pickle.load(open(a.model, "rb"))["params"]
+    mdl = pickle.load(open(a.model, "rb"))
+    SEM = export_cpp.semantics(mdl, a.semantics)
+    import policy as Pol
+    Pol.use_semantics(SEM)                                                  # the JAX reference of the checks, with the same semantics
+    params = mdl["params"]
     m, d = build(params)
     path = os.path.join(a.out, "policy.onnx")
     onnx.save(m, path)

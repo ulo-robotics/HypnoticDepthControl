@@ -14,7 +14,9 @@ namespace ffi = xla::ffi;
 #ifndef H
 #error "compile with -DH=.. -DNS=.. -DNL=.. -DCG=.."
 #endif
-constexpr int NSTEP = 360;
+#ifndef NSTEP
+#define NSTEP 360
+#endif
 static_assert(H % CG == 0, "CG must divide H");
 
 __global__ void __launch_bounds__(CG * NS) s4grad_kernel(const float* __restrict__ dA, const float* __restrict__ X, float* __restrict__ out, int B, int W,

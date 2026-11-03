@@ -78,7 +78,7 @@ def dims(kp):
 
 def build(d, wpb, stage=0):
     """compile (or load from the cache) the library for these sizes and launch options; returns the FFI target names"""
-    key = tuple(sorted(d.items())) + (("WPB", wpb), ("STAGE", int(stage)))
+    key = tuple(sorted(d.items())) + (("WPB", wpb), ("STAGE", int(stage)), ("NSTEP", M.N))
     return once(key, lambda: _build(key))
 
 
@@ -117,7 +117,7 @@ def pack_kp(kp):
 
 def pack_q(q):
     cols = [q[k][:, None] for k in ("mu", "a_ou", "osc", "stim", "gamma", "e0", "emax")] + [q["dmask"]]
-    cols += [q[f"A{i}"][:, None] for i in range(16)] + [q[f"B{i}"][:, None] for i in range(4)] + [q["stim_t"][:, None]]
+    cols += [q[f"A{i}"][:, None] for i in range(16)] + [q[f"B{i}"][:, None] for i in range(4)] + [q["stim_t"][:, None]] + [q[k][:, None] for k in ("stim2", "stim_t2", "stim3", "stim_t3")]
     return jnp.concatenate(cols, 1).astype(jnp.float32)
 
 
@@ -164,7 +164,7 @@ NSC = 16
 
 
 def build_asm(d, wpb, nseg, stage=0):
-    key = tuple(sorted(d.items())) + (("WPB", wpb), ("NSEG", nseg), ("STAGE", int(stage)))
+    key = tuple(sorted(d.items())) + (("WPB", wpb), ("NSEG", nseg), ("STAGE", int(stage)), ("NSTEP", M.N))
     return once(("asm",) + key, lambda: _build_src(ASM_SRC, key, ("PkpdAsm",), "asm")[0])
 
 
@@ -310,7 +310,7 @@ S4_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "s4gra
 
 def build_s4grad(H, NS, NL):
     cg = min(H, max(1, 256 // NS))
-    key = (("CG", cg), ("H", H), ("NL", NL), ("NS", NS))
+    key = (("CG", cg), ("H", H), ("NL", NL), ("NS", NS), ("NSTEP", M.N))
     return once(("s4",) + key, lambda: _build_src(S4_SRC, key, ("PkpdS4grad",), "s4grad")[0])
 
 
@@ -319,8 +319,7 @@ def s4d_grads(tp, mS, X, ou, oc, lstride):
     cotangents cy of all steps: X (B, N, W), layer l's u at column ou + l * lstride, its cy at oc + l * lstride"""
     ly = tp["extra"]["layers"]
     L, H, NS = ly["log_A_re"].shape
-    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
-    dlt = jnp.exp(ly["log_dt"])[..., None]
+    dlt, A = M.s4d_A(ly["log_dt"], ly["log_A_re"], ly["A_im"])          # the moments at the reference discretization (time constants bounded)
     dA = jnp.exp(dlt * A)
     name = build_s4grad(H, NS, L)
     pq = jax.ffi.ffi_call(name, jax.ShapeDtypeStruct((X.shape[0], L, H, NS, 4), jnp.float32), vmap_method="broadcast_all")(
@@ -330,18 +329,19 @@ def s4d_grads(tp, mS, X, ou, oc, lstride):
 
 
 def s4d_from_moments(tp, mS, pq):
-    """per-patient gradients of log_dt, log_A_re, A_im, C from the moments (B, L, H, NS, 4): Re P, Im P, Re P', Im P'"""
+    """per-patient gradients of log_dt, log_A_re, A_im, C from the moments (B, L, H, NS, 4): Re P, Im P, Re P', Im P'.
+    The S4D kernel's contribution is 2 Re sum_n C dB P(dA) with P(dA) known to first order from the moments (P, P'): its gradient is the
+    gradient of the surrogate 2 Re sum_n C dB (P + P' (dA - dA_0)) at the current parameters, taken by JAX through the same discretization as
+    the reference (model.s4d_A: time constants bounded), so the chain rule through the bound cannot drift from it"""
     ly = tp["extra"]["layers"]
-    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
-    dlt = jnp.exp(ly["log_dt"])[..., None]
-    dA = jnp.exp(dlt * A)
+    p0 = {k: ly[k] for k in ("log_dt", "log_A_re", "A_im", "C")}
+
+    def surrogate(p, Pz, Pd):
+        dt, A = M.s4d_A(p["log_dt"], p["log_A_re"], p["A_im"])
+        dA = jnp.exp(dt * A)
+        dB = (dA - 1) / A * mS
+        C = p["C"][..., 0] + 1j * p["C"][..., 1]
+        return jnp.sum(2 * jnp.real(C * dB * (Pz + Pd * (dA - lax.stop_gradient(dA)))))
+
     Pz, Pd = pq[..., 0] + 1j * pq[..., 1], pq[..., 2] + 1j * pq[..., 3]
-    # k[m] = 2 Re sum_n C dB dA^m  ->  loss = 2 Re F,  F = sum_n C dB P(dA)
-    dB = (dA - 1) / A * mS
-    C = ly["C"][..., 0] + 1j * ly["C"][..., 1]
-    gCc = dB * Pz
-    dBdA = (dlt * dA * A - (dA - 1)) / (A * A) * mS
-    dFdA = C * (dBdA * Pz + dB * Pd * dlt * dA)
-    dFdD = C * (dA * mS * Pz + dB * Pd * A * dA)
-    return dict(log_dt=jnp.sum(2 * jnp.real(dFdD), -1) * dlt[..., 0], log_A_re=2 * jnp.real(dFdA * (-jnp.exp(ly["log_A_re"]))),
-                A_im=-2 * jnp.imag(dFdA), C=jnp.stack([2 * jnp.real(gCc), -2 * jnp.imag(gCc)], -1))
+    return jax.vmap(jax.grad(surrogate), in_axes=(None, 0, 0))(p0, Pz, Pd)

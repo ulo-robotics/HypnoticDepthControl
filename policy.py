@@ -180,8 +180,8 @@ def prep(tp, mk):
     ph, ly = tp["phys"], tp["extra"]["layers"]
     cx = lambda m: m[..., 0] + 1j * m[..., 1]
     phys = (jnp.exp(-jnp.exp(ph["a"]) + 1j * ph["b"]), cx(ph["Bu"]), cx(ph["Bw"]), cx(ph["Cout"]))
-    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
-    dA = jnp.exp(jnp.exp(ly["log_dt"])[..., None] * A)
+    dt, A = M.s4d_A(ly["log_dt"], ly["log_A_re"], ly["A_im"])          # time constants bounded by TAU_MAX
+    dA = jnp.exp(dt * A)
     return phys, (dA, (dA - 1) / A * mk["mS"], cx(ly["C"]))
 
 
@@ -213,6 +213,16 @@ def s4d_layer(lp, pre, x, h, mk):
     return dv / jnp.sqrt(jnp.sum(dv * dv, -1, keepdims=True) / mk["nH"] + 1e-5) * lp["ln_g"] + lp["ln_b"], h
 
 
+TIME_FEATURE = False                  # the time input t / T_END (legacy models only; see model.SEMANTICS and use_semantics)
+
+
+def use_semantics(sem):
+    """run (trace) the policy with a model's semantics, dict(time_feature, tau_max) from model.SEMANTICS; read when functions are traced"""
+    global TIME_FEATURE
+    TIME_FEATURE = bool(sem["time_feature"])
+    M.TAU_MAX = float(sem["tau_max"])
+
+
 def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
     """one control step for a batch: measured BIS y, previous infusion u_prev, time t (min), reference now / at the previous step.
     Returns (infusion in [0, UMAX], new state)."""
@@ -222,7 +232,8 @@ def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
     hp = hp * (w_ref(tgt_prev) / w_ref(tgt))[:, None]               # re-express the physics state when the reference moves
     w = w_from_y(y)
     ex = tp["extra"]
-    feat = jnp.stack([(y - tgt) / 50, u_prev / (r * M.UMAX), jnp.full_like(y, t / M.T_END), w / (r * M.C50N) - 1.0], -1)
+    tf = jnp.full_like(y, t / M.T_END) if TIME_FEATURE else jnp.zeros_like(y)
+    feat = jnp.stack([(y - tgt) / 50, u_prev / (r * M.UMAX), tf, w / (r * M.C50N) - 1.0], -1)
     x = feat @ ex["enc_W"] + ex["enc_b"]
     new = []
     for l, h in enumerate(hs):
@@ -237,7 +248,12 @@ def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
 
 
 # ---------------------------------------------------------------- closed loop in JAX (training and evaluation)
-PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "stim_t", "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
+PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "stim_t", "stim2", "stim_t2", "stim3", "stim_t3", "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
+
+
+def patient_axes(pts):
+    """the batch axis of every field a patient batch carries (the noise is time-major; optional fields such as len included)"""
+    return {k: (2 if k == "z" else 0) for k in pts}
 
 
 def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
@@ -254,7 +270,8 @@ def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
         x, ou, state, u_prev, buf = carry
         k, z = inp
         t = k * M.DT
-        b = M.hill(x[:, 3], pts["mu"] + ou + pts["stim"] * (t > pts["stim_t"]), pts["gamma"], pts["e0"], pts["emax"])
+        l50 = (pts["mu"] + ou + pts["stim"] * (t > pts["stim_t"]) + pts["stim2"] * (t > pts["stim_t2"]) + pts["stim3"] * (t > pts["stim_t3"]))
+        b = M.hill(x[:, 3], l50, pts["gamma"], pts["e0"], pts["emax"])
         buf = jnp.where(k == 0, b[:, None], jnp.concatenate([b[:, None], buf[:, :-1]], 1))   # buf[:, j] = BIS j steps ago (first reading before that)
         y = jnp.sum(buf * dmask, -1) + pts["sy"][:, k] * z[0]
         tg, tgp = pts["tgt"][:, k], pts["tgt"][:, jnp.maximum(k - 1, 0)]
@@ -274,6 +291,9 @@ def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
     zs = pts["z"].reshape(M.N // chunk, chunk, 2, B)
     _, (cost, b, u) = lax.scan(chunk_fn, carry, (ks, zs))
     cost, b, u = (a.reshape(M.N, B) for a in (cost, b, u))
+    if "len" in pts:                                                       # variable-length episodes: each patient's own steps
+        on = jnp.arange(M.N)[:, None] < pts["len"][None, :]
+        return jnp.sum(jnp.where(on, cost, 0.0), 0) / pts["len"], b, u
     return cost.mean(0), b, u
 
 

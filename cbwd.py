@@ -71,7 +71,7 @@ def tf32_pack(w):
 
 def pack_q(q):
     B = q["mu"].shape[0]
-    cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc")]
+    cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc", "stim2", "stim_t2", "stim3", "stim_t3")]
     cols = jnp.stack(cols, 1)
     return jnp.concatenate([cols, jnp.zeros((B, 32 - cols.shape[1]), cols.dtype), q["dmask"]], 1)
 
@@ -98,7 +98,7 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
     ins["L_WvT"] = jnp.swapaxes(ins["L_Wv"], 1, 2)
     ins["L_WgT"] = jnp.swapaxes(ins["L_Wg"], 1, 2)
     ins["q_c"] = pack_q(q)
-    ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho")])
+    ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "w")])
     ins["b_K"] = jnp.stack([K.block_mats(lp, T)["K"].T for lp in ly])
     ins["b_S4"] = jnp.stack([jnp.stack([lp[k].T for k in ("Ar", "Ai", "Br", "Bi", "Cr", "Ci")]) for lp in ly])    # (L, 6, NS, H): channels fastest
     at = [K.block_mats(lp, T)["AT"] for lp in ly]
@@ -209,7 +209,7 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
     full = inputs(kp, q, st, dict(c=None, ys=None), T, tapes=False)
     ins = {k: full[k] for k in ("sc", "gl", "mH", "enc_b", "encW", "dec_lin", "head_W1", "head_b1", "head_dec", "p5", "L_vec", "L_Wv", "L_Wg",
                                 "q_c", "b_K", "b_S4", "b_AT") if k in full}
-    ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1")]).astype(jnp.float32)
+    ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1", "w")]).astype(jnp.float32)
     N, L, H, NS = M.N, d["L"], d["H"], d["NS"]
     outs = dict(tape=(N, B, 6 + 2 * d["PP"] + K.DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))
     name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True, B), SRC_FWD, "CfwdHandler", "cfwd")
@@ -240,8 +240,8 @@ def casm(tp, btape, ck=None, nt=256):
     nm = L * H * NS
     rm = min(6, -(-nm // nt))
     ms = -(-nm // (nt * rm))
-    A = -jnp.exp(ly["log_A_re"]) + 1j * ly["A_im"]
-    dA = jnp.exp(jnp.exp(ly["log_dt"])[..., None] * A)
+    dt_, A = M.s4d_A(ly["log_dt"], ly["log_A_re"], ly["A_im"])        # the moments at the reference discretization (time constants bounded)
+    dA = jnp.exp(dt_ * A)
     ins = dict(dA=jnp.stack([jnp.real(dA), jnp.imag(dA)], -1), t_x=btape["t_x"], t_a=btape["t_a"], t_dzv=btape["t_dzv"], t_dzg=btape["t_dzg"])
     outs = dict(pq=(B, L, H, NS, 4), g_w=(B, L, 2, H, H), g_b=(B, L, 3, H))
     if HD:

@@ -152,13 +152,14 @@ class Search:
 
     # ---- phases
     def prior_screen(self, SPACE, BASE, PRIOR_KEYS):
+        import model as M
         a = self.a
         rng = {n: (lo, hi) for n, k, lo, hi in SPACE if n in PRIOR_KEYS}
         pts = sobol(a.prior_screen, len(PRIOR_KEYS), a.seed + 1)
         designs = [{k: BASE[k] for k in PRIOR_KEYS}] + [
             {k: float(math.exp(math.log(rng[k][0]) + u * (math.log(rng[k][1]) - math.log(rng[k][0])))) for k, u in zip(PRIOR_KEYS, p)} for p in pts]
         t0 = time.time()
-        scores = np.asarray(screen(designs, a.val_batch, a.stimulus))
+        scores = np.asarray(screen(designs, a.val_batch, M.score_stimulus(a.stimulus)))
         order = np.argsort(scores)
         keep = max(8, int(np.isfinite(scores).sum() * a.prior_keep))
         pool = [designs[i] for i in order[:keep]]
@@ -362,7 +363,7 @@ class Search:
         models = [P.shrink(pickle.load(open(self.spath(t), "rb"))["ema"], t["cfg"]) for t in live]
         w = np.array([M.VAL[s][1] for s in M.VAL])
         comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
-        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True, stimulus=a.stimulus)])
+        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True, stimulus=M.score_stimulus(a.stimulus))])
         mean, se = sc.mean(1), sc.std(1, ddof=1) / math.sqrt(sc.shape[1])
         rows = []
         for p in sorted({t["parent"] for t in live}):
@@ -376,7 +377,7 @@ class Search:
         for r in sorted(rows, key=lambda r: r["mean"]):
             print(f"  config {r['parent']:5d}: {r['mean']:.3f} +- {r['se']:.3f} over {r['n_seeds']} seeds")
         test = np.stack([comb(st) for st in T.evaluate([models[bi], P.init_params(jax.random.PRNGKey(0), dict(BASE, **fix))], a.test_batch,
-                                                        _keys()["test"], per_patient=True, stimulus=a.stimulus)])
+                                                        _keys()["test"], per_patient=True, stimulus=M.score_stimulus(a.stimulus))])
         d = test[1] - test[0]
         res = dict(best_model=best["id"], best_parent=best["parent"], cfg=best["cfg"], iters=best["it"],
                    rerank=[dict(id=t["id"], parent=t["parent"], seed=t["seed"], mean=float(mean[i]), se=float(se[i]),
@@ -384,7 +385,7 @@ class Search:
                    test_score=float(test[0].mean()), base_prior_score=float(test[1].mean()),
                    test_improvement=float(d.mean()), test_improvement_ci=float(1.96 * d.std(ddof=1) / math.sqrt(len(d))))
         json.dump(res, open(os.path.join(self.out, "results.json"), "w"), indent=1, default=float)
-        T.save(dict(params=models[bi], cfg=best["cfg"]), os.path.join(self.out, "best_model.pkl"))
+        T.save(dict(params=models[bi], cfg=best["cfg"], semantics=M.SEMANTICS["current"]), os.path.join(self.out, "best_model.pkl"))
         self.save(phase="done")
         print(f"\nwinner: trial {best['id']} (config {best['parent']}), test score {res['test_score']:.3f}, untrained base prior "
               f"{res['base_prior_score']:.3f} (improvement {res['test_improvement']:.3f} +- {res['test_improvement_ci']:.3f})\n"
@@ -421,7 +422,7 @@ def main():
     ap.add_argument("--final-iters", type=int, default=3000)
     ap.add_argument("--final-seeds", type=int, default=3)
     ap.add_argument("--batch", type=int, default=512, help="training patients per iteration")
-    ap.add_argument("--stimulus", default="fixed", choices=["fixed", "random"], help="stimulus of training and scoring (model.STIM_FIXED: "
+    ap.add_argument("--stimulus", default="fixed", choices=["fixed", "random", "signed"], help="stimulus of training and scoring (model.STIM_FIXED: "
                     "the paper's search; finetune.py then moves the winner to the random one)")
     ap.add_argument("--val-batch", type=int, default=1024, help="patients per validation scenario (rung scores)")
     ap.add_argument("--rerank-batch", type=int, default=4096)

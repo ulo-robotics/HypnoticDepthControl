@@ -47,7 +47,7 @@ SPACE = [
     ("q_theta", "log", 2e-4, 2e-2), ("sy_scale", "log", 0.5, 2.0), ("rho_lqr", "log", 1e-5, 1e-2), ("q_x", "log", 1e-5, 1e-3),
 ]
 PRIOR_KEYS = ("q_theta", "sy_scale", "rho_lqr", "q_x")
-SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="random")
+SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="signed", len_lo=0.0)
 
 # the selected configuration (winner of the paper's search, runs/search_full: config 171): train.py's default
 SELECTED = dict(opt="nadamw", lr=7.38e-3, phys_mult=0.024, ssm_mult=0.954, clip=2.0, omb1=0.0538, omb2=8.17e-4, wd=1.55e-2, sched="wsd",
@@ -173,7 +173,10 @@ def new_state(c, init_key):
 
 def train_spec(setup, it):
     dmax = jnp.minimum(setup["max_delay"], jnp.floor(setup["max_delay"] * it / max(setup["delay_ramp"], 1)))
-    return dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax)
+    sp = dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax)
+    if setup.get("len_lo", 0.0) > 0:                                       # episodes of len_lo .. the simulated length, stimuli across them
+        sp.update(len_lo=setup["len_lo"], len_hi=M.N * M.DT, stim_thi=M.N * M.DT - 2.0)
+    return sp
 
 
 def make_validate(n, stats_fn, scenarios=None, per_patient=False):
@@ -281,7 +284,7 @@ class Population:
 
     def _validator(self):
         def build():
-            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(self.setup["stimulus"]))
+            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(M.score_stimulus(self.setup["stimulus"])))
             v.compile(self.state["ema"], self.sz, VAL_KEY)
             return v
         return _program(("val", self._sig(self.val_batch)), build)

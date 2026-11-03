@@ -35,7 +35,7 @@ DP = M.DMAX_ALL + 1              # delay line length (16)
 f32 = jnp.float32
 HI = lax.Precision.HIGHEST
 SMALL = ("x0", "x1", "x2", "x3", "ou", "up", "hpr", "hpi", "buf")     # the small carry (tape) leaves
-STEP_IN = ("z0", "z1", "tg", "sy", "r", "rho")                          # per-step inputs, (N, B) each
+STEP_IN = ("z0", "z1", "tg", "sy", "r", "rho", "w")                     # per-step inputs, (N, B) each (w: the cost weight, N [k < len] / len)
 
 
 def p2(n):
@@ -61,8 +61,8 @@ def kp_dims(tp):
 
 def s4d_mats(lp, mS=None):
     """discretized S4D (dA, dB, C) as planes, and the zero-lag tap K0 = 2 Re sum C dB; mS masks the inputs of padded states"""
-    A = -jnp.exp(lp["log_A_re"]) + 1j * lp["A_im"]
-    dA = jnp.exp(jnp.exp(lp["log_dt"])[:, None] * A)
+    dt, A = M.s4d_A(lp["log_dt"], lp["log_A_re"], lp["A_im"])
+    dA = jnp.exp(dt * A)
     dB = (dA - 1) / A if mS is None else (dA - 1) / A * mS
     C = lp["C"][..., 0] + 1j * lp["C"][..., 1]
     return dict(Ar=jnp.real(dA), Ai=jnp.imag(dA), Br=jnp.real(dB), Bi=jnp.imag(dB), Cr=jnp.real(C), Ci=jnp.imag(C),
@@ -102,7 +102,7 @@ def to_kq(pts):
     """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
     B = pts["mu"].shape[0]
     a = jnp.exp(-M.DT / pts["tau"])
-    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], stim_t=pts["stim_t"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], stim_t=pts["stim_t"], stim2=pts["stim2"], stim_t2=pts["stim_t2"], stim3=pts["stim3"], stim_t3=pts["stim_t3"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
              dmask=jax.nn.one_hot(pts["delay"], DP, dtype=pts["mu"].dtype))
     Ad = pts["Ad"].reshape(B, 16)
     for i in range(16):
@@ -112,7 +112,12 @@ def to_kq(pts):
     wr = lambda t: M.cref(M.C50N, M.GAMMA, M.E0, M.EMAX, t)
     tg = pts["tgt"].T
     tgp = jnp.concatenate([tg[:1], tg[:-1]], 0)
-    st = dict(z0=pts["z"][:, 0], z1=pts["z"][:, 1], tg=tg, sy=pts["sy"].T, r=wr(tg) / M.C50N, rho=wr(tgp) / wr(tg))
+    if "len" in pts:                                                    # variable-length episodes: each patient's own steps, its mean cost
+        on = jnp.arange(M.N)[:, None] < pts["len"][None, :]
+        w = jnp.where(on, M.N / pts["len"][None, :].astype(tg.dtype), 0.0).astype(tg.dtype)
+    else:
+        w = jnp.ones_like(tg)
+    st = dict(z0=pts["z"][:, 0], z1=pts["z"][:, 1], tg=tg, sy=pts["sy"].T, r=wr(tg) / M.C50N, rho=wr(tgp) / wr(tg), w=w)
     return q, st
 
 
@@ -150,7 +155,8 @@ def step_pre(kp, q, c, k, st):
     dt = q["mu"].dtype
     t = k.astype(dt) * M.DT if hasattr(k, "astype") else jnp.asarray(k * M.DT, dt)
     ce = jnp.maximum(c["x3"], 0.0)
-    l50 = q["mu"] + c["ou"] + q["stim"] * (t > q["stim_t"]).astype(dt)
+    l50 = (q["mu"] + c["ou"] + q["stim"] * (t > q["stim_t"]).astype(dt) + q["stim2"] * (t > q["stim_t2"]).astype(dt)
+           + q["stim3"] * (t > q["stim_t3"]).astype(dt))
     cg = jnp.power(ce, q["gamma"])
     b = q["e0"] - q["emax"] * cg / (cg + jnp.power(jnp.exp(l50), q["gamma"]))
     sh = (_iota((DP, DP), 0) + 1 == _iota((DP, DP), 1)).astype(dt)              # buf[:, j] -> buf[:, j + 1]
@@ -163,7 +169,7 @@ def step_pre(kp, q, c, k, st):
     w = jnp.minimum(M.C50N * jnp.power(s / (1 - s), 1.0 / M.GAMMA), 3 * M.C50N)
     r, rho, tg = st["r"], st["rho"], st["tg"]
     f0, f1, f3 = (y - tg) / 50, c["up"] / (r * M.UMAX), w / (r * M.C50N) - 1.0
-    x = f0[:, None] * kp["enc0"] + f1[:, None] * kp["enc1"] + (t / M.T_END)[..., None] * kp["enc2"] + f3[:, None] * kp["enc3"] + kp["enc_b"]
+    x = f0[:, None] * kp["enc0"] + f1[:, None] * kp["enc1"] + (0.0 * t)[..., None] * kp["enc2"] + f3[:, None] * kp["enc3"] + kp["enc_b"]
     return x, dict(b=b, buf=buf, w=w, hpr=c["hpr"] * rho[:, None], hpi=c["hpi"] * rho[:, None])
 
 
@@ -261,7 +267,7 @@ def bwd_core(kp, q, c, k, st, ys, e, lam_c, inv_n):
         us.append(x)
         x = layer(kp, l, x, ys[l])                           # forward recompute: the tap's value is the taped output
     (c2, cost), post_vjp = jax.vjp(lambda cc, xx, au: step_post(kp, q, cc, st, xx, au), c, x, aux)
-    c_bar, cx, caux = post_vjp((lam_c, jnp.full_like(cost, inv_n)))
+    c_bar, cx, caux = post_vjp((lam_c, inv_n * st["w"]))
     cy = [None] * L
     for l in reversed(range(L)):
         def lf(uu, yy, l=l):
@@ -313,7 +319,7 @@ def xla_forward(kp, q, st, tape=True, T=0):
             ys, h2 = s4d_update(kp["layers"][l], *h[l], u)
             return ys, (ys, h2)
         c2, cost, b, _, ex = step(kp, q, c, k, s, s4d)
-        out = (cost, (b - s["tg"]) ** 2, jax.nn.relu(40 - b) ** 2)
+        out = (cost * s["w"], (b - s["tg"]) ** 2, jax.nn.relu(40 - b) ** 2)
         if tape:
             out = out + (c, [y for y, _ in ex])
         return (c2, [hh for _, hh in ex]), out
@@ -343,7 +349,7 @@ def _forward_blocked(kp, q, st, tape, T):
                 us[l].append(u)
                 return ys, ys
             c2, cost, b, _, ex = step(kp, q, c, k, s, s4d)
-            out = (cost, (b - s["tg"]) ** 2, jax.nn.relu(40 - b) ** 2)
+            out = (cost * s["w"], (b - s["tg"]) ** 2, jax.nn.relu(40 - b) ** 2)
             outs.append(out + (c, ex) if tape else out)
             c = c2
         h2 = []
@@ -421,8 +427,8 @@ def xla_backward(kp, q, st, tape, T=0):
 # ---------------------------------------------------------------- assembly of the per-patient gradients (XLA, parallel over steps)
 def s4d_kernel(lp, mS, n=M.N):
     """K_m = 2 Re sum_n C dB dA^m, m = 0..n-1: (H, n)"""
-    A = -jnp.exp(lp["log_A_re"]) + 1j * lp["A_im"]
-    dtA = jnp.exp(lp["log_dt"])[:, None] * A
+    dt, A = M.s4d_A(lp["log_dt"], lp["log_A_re"], lp["A_im"])
+    dtA = dt * A
     dB = (jnp.exp(dtA) - 1) / A * mS
     C = lp["C"][..., 0] + 1j * lp["C"][..., 1]
     pw = jnp.exp(dtA[..., None] * jnp.arange(n))                                  # (H, NS, n)
@@ -449,7 +455,7 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, s4=No
         qr = {n: jnp.broadcast_to(v, (M.N,) + v.shape) for n, v in qb.items()}
         f = lambda kp_, ys_: replay(kp_, qr, cb, ks, stb, ys_, eb)
         (_, _), vjp, us = jax.vjp(f, kp, ysb, has_aux=True)
-        g_kp, cy = vjp((lamb, jnp.full((M.N,), 1.0 / M.N, q["mu"].dtype)))
+        g_kp, cy = vjp((lamb, stb["w"] / M.N))
         return g_kp, cy, us
 
     def chunk_fn(i):

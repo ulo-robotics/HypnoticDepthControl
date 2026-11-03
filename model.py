@@ -9,7 +9,7 @@ Cost       J = mean_k (BIS_k - target_k)^2 on the TRUE BIS; viol = mean relu(40 
 Every patient draws its own values from a scenario spec (ranges; lo == hi is a fixed value), so one scenario mixes many conditions.
 The patient population is sampled in JAX (`sample_patients`); the same batch, converted to numpy, drives the numpy plant used for the baselines.
 """
-import math
+import math, os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -17,7 +17,22 @@ from scipy.linalg import expm
 
 DT = 5.0 / 60.0                      # min
 T_END = 30.0
-N = int(round(T_END / DT))           # 360 steps
+N = int(os.environ.get("PKPD_N", round(T_END / DT)))    # steps simulated (360 = the 30 min scenarios; PKPD_N: longer episodes)
+TAU_MAX = 30.0                       # min: the slowest S4D mode's time constant (the scale of the shortest training episode); 0: unbounded
+# what a trained model computes beyond its parameters: legacy = models trained before these changes (time feature, unbounded time constants)
+SEMANTICS = dict(legacy=dict(time_feature=True, tau_max=0.0), current=dict(time_feature=False, tau_max=30.0))
+
+
+def semantics_of(saved, name=None):
+    """the semantics of a saved model (a best_model.pkl dict): the one it records, or SEMANTICS[name]; never guessed. Raises SystemExit when
+    neither is given or they disagree"""
+    rec = saved.get("semantics") if isinstance(saved, dict) else None
+    if name is None and rec is None:
+        raise SystemExit("the model does not record its semantics: pass --semantics legacy (trained before the time feature was dropped) "
+                         "or --semantics current")
+    if rec is not None and name is not None and dict(rec) != dict(SEMANTICS[name]):
+        raise SystemExit(f"--semantics {name} contradicts the semantics recorded in the model: {rec}")
+    return dict(SEMANTICS[name] if name is not None else rec)
 UMAX, TARGET, GAMMA, E0, EMAX = 100.0, 50.0, 2.0, 100.0, 100.0
 PK_KEYS = ("V1", "V2", "V3", "Cl1", "Cl2", "Cl3", "ke0")
 NOM = dict(V1=4.27, V2=18.9, V3=238.0, Cl1=1.89, Cl2=1.29, Cl3=0.836, ke0=0.456)     # Schnider, 40 y, 70 kg, 170 cm
@@ -28,7 +43,7 @@ KMAX = 8                             # most target / noise-level changes per epi
 IND = np.arange(N) * DT <= 10.0      # induction phase (first 10 min)
 
 # ---------------------------------------------------------------- scenarios
-SPEC_NOMINAL = dict(tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0,
+SPEC_NOMINAL = dict(tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0, stim_neg=0.0, stim_nmax=1,
                     dmin=0, dmax=0,
                     gamma_lo=GAMMA, gamma_hi=GAMMA, e0_lo=E0, e0_hi=E0, emax_lo=EMAX, emax_hi=EMAX,
                     tgt_lo=TARGET, tgt_hi=TARGET, pk_shift=0.0, sy_lo=SY, sy_hi=SY,
@@ -74,6 +89,8 @@ STRESS = {
     "everything_ood":   spec(tau_lo=3.0, tau_hi=60.0, sd_lo=0.05, sd_hi=0.35, stim_p=0.7, dmin=3, dmax=15, gamma_lo=1.0, gamma_hi=6.0,
                              e0_lo=85.0, e0_hi=100.0, emax_lo=70.0, emax_hi=100.0, tgt_lo=42.0, tgt_hi=65.0, pk_shift=0.8,
                              sy_lo=1.5, sy_hi=8.0, tgt_changes=8, tgt_dmax=20.0, sy_changes=8),
+    "stimulus_neg":     spec(stim_p=1.0, stim_neg=1.0),          # the stimulus lowers C50 (e.g. stimulation ending): overdose risk
+    "stimulus_signed":  spec(stim_p=1.0, stim_neg=0.5, stim_nmax=3),   # 1 to 3 steps, each raising or lowering C50
 }
 # the stimulus of the meta-optimization (search.py): +0.3 in log C50 after 20 min. A policy can learn to anticipate a fixed time, so the
 # selected model is fine-tuned (finetune.py) and evaluated on the random stimulus of the specs above.
@@ -81,9 +98,17 @@ STIM_FIXED = dict(stim_lo=0.3, stim_hi=0.3, stim_tlo=20.0, stim_thi=20.0)
 
 
 def with_stimulus(sp, stimulus):
-    """spec `sp` with the "random" (as specified) or the "fixed" (STIM_FIXED) stimulus"""
-    assert stimulus in ("random", "fixed"), stimulus
-    return {**sp, **STIM_FIXED} if stimulus == "fixed" else dict(sp)
+    """spec `sp` with the "random" (as specified), the "signed" (1 to 3 steps, each of random size, time and sign, half raising and half
+    lowering C50: training) or the "fixed" (STIM_FIXED) stimulus"""
+    assert stimulus in ("random", "signed", "fixed"), stimulus
+    if stimulus == "fixed":
+        return {**sp, **STIM_FIXED}
+    return {**sp, "stim_neg": 0.5, "stim_nmax": 3} if stimulus == "signed" else dict(sp)
+
+
+def score_stimulus(stimulus):
+    """the stimulus the selection score is taken with: "signed" is a training distribution, the score keeps the standard validation scenarios"""
+    return "random" if stimulus == "signed" else stimulus
 
 
 def val_specs(stimulus="random"):
@@ -130,6 +155,15 @@ def pk_disc(p):
     return E[:, :4, :4], E[:, :4, 4]
 
 
+def s4d_A(log_dt, log_A_re, A_im):
+    """continuous S4D eigenvalues with the decay per step floored at DT / TAU_MAX (no mode slower than TAU_MAX): (dt (..., 1), A)"""
+    dt = jnp.exp(log_dt)[..., None]
+    if TAU_MAX <= 0:                                                      # unbounded (legacy models): the original expression, bit for bit
+        return dt, -jnp.exp(log_A_re) + 1j * A_im
+    rate = jnp.maximum(dt * jnp.exp(log_A_re), DT / TAU_MAX)
+    return dt, -rate / dt + 1j * A_im
+
+
 def hill(ce, logc50, gamma, e0, emax, xp=jnp):
     ce = xp.maximum(ce, 0.0)
     return e0 - emax * ce ** gamma / (ce ** gamma + xp.exp(logc50) ** gamma)
@@ -147,6 +181,7 @@ def sample_patients(key, B, sp, nom_frac=0.0):
     (nominal drift, no stimulus / delay / PD or PK shift, target 50, noise SY); only their PK / C50 inter-individual variability remains.
     Returns a dict of arrays, all batch-first, plus the noise of the whole episode (N, 2, B): [measurement, drift]."""
     f = lambda v: jnp.asarray(v, jnp.float32)
+    lens = "len_hi" in sp                                                # per-patient episode lengths: only training specs carry len_lo / len_hi (min)
     sp = {k: f(v) for k, v in sp.items()}
     ks = jax.random.split(key, 16)
     u = lambda k, shape=(B,): jax.random.uniform(k, shape)
@@ -187,12 +222,24 @@ def sample_patients(key, B, sp, nom_frac=0.0):
     delay = jnp.floor(sp["dmin"] + u(ks[8]) * (sp["dmax"] - sp["dmin"] + 1)).astype(jnp.int32)
     kst = jax.random.split(jax.random.fold_in(key, 2), 2)                  # stimulus: whether (ks[12]), how large (log C50 step), when (min)
     stim = jnp.where(u(ks[12]) < sp["stim_p"], un(kst[0], sp["stim_lo"], sp["stim_hi"]), 0.0)
+    neg = jax.random.uniform(jax.random.fold_in(key, 3), (B,)) < sp["stim_neg"]     # its own stream: stim_neg = 0 leaves every draw unchanged
+    stim = pick(jnp.where(neg, -stim, stim), 0.0)
+    # further steps (stim_nmax > 1): a stimulated patient has 1 .. stim_nmax steps, each with its own size, sign and time (own streams)
+    nst = 1.0 + jnp.floor(jax.random.uniform(jax.random.fold_in(key, 4), (B,)) * sp["stim_nmax"])
+    more = {}
+    for j in (2, 3):
+        kj = jax.random.split(jax.random.fold_in(key, 3 + 2 * j), 3)
+        aj = un(kj[0], sp["stim_lo"], sp["stim_hi"])
+        aj = jnp.where(u(kj[1]) < sp["stim_neg"], -aj, aj)
+        more[f"stim{j}"] = jnp.where((stim != 0) & (nst >= j), aj, 0.0)
+        more[f"stim_t{j}"] = un(kj[2], sp["stim_tlo"], sp["stim_thi"])
     return dict(
         pk=pk, Ad=Ad, Bd=Bd,
         mu=math.log(C50N) + C50_CV * jax.random.normal(ks[9], (B,)),
         tau=pick(lu(ks[10], sp["tau_lo"], sp["tau_hi"]), 20.0),
         sd=pick(un(ks[11], sp["sd_lo"], sp["sd_hi"]), 0.15),
-        stim=pick(stim, 0.0), stim_t=un(kst[1], sp["stim_tlo"], sp["stim_thi"]),
+        stim=stim, stim_t=un(kst[1], sp["stim_tlo"], sp["stim_thi"]), **more,
+        **({"len": jnp.clip(jnp.floor(un(jax.random.fold_in(key, 11), sp["len_lo"], sp["len_hi"]) / DT), 1, N).astype(jnp.int32)} if lens else {}),
         delay=jnp.where(nom, 0, delay),
         gamma=pick(lu(ks[13], sp["gamma_lo"], sp["gamma_hi"]), GAMMA),
         e0=pick(un(ks[14], sp["e0_lo"], sp["e0_hi"]), E0),
@@ -226,7 +273,9 @@ class Plant:
 
     def logc50(self, k=None):
         k = self.k if k is None else k
-        return self.p["mu"] + self.ou + self.p["stim"] * (k * DT > self.p["stim_t"])
+        p = self.p
+        return (p["mu"] + self.ou + p["stim"] * (k * DT > p["stim_t"]) + p.get("stim2", 0.0) * (k * DT > p.get("stim_t2", 0.0))
+                + p.get("stim3", 0.0) * (k * DT > p.get("stim_t3", 0.0)))
 
     def bis(self):
         return hill(self.x[:, 3], self.logc50(), self.p["gamma"], self.p["e0"], self.p["emax"], xp=np)

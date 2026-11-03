@@ -40,12 +40,15 @@ def main():
     ap.add_argument("model")
     ap.add_argument("--out", default="")
     ap.add_argument("--repeats", type=int, default=2000)
+    ap.add_argument("--semantics", choices=["legacy", "current"], default=None, help="see export_cpp.py")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.model)), "cpp")
     os.makedirs(out, exist_ok=True)
-    params = pickle.load(open(a.model, "rb"))["params"]
-    export_cpp.write_model(params, os.path.join(out, "model.bin"))
-    export_cpp.write_trace(params, os.path.join(out, "trace.bin"))
+    mdl = pickle.load(open(a.model, "rb"))
+    sem = export_cpp.semantics(mdl, a.semantics)
+    params = mdl["params"]
+    export_cpp.write_model(params, os.path.join(out, "model.bin"), sem)
+    export_cpp.write_trace(params, os.path.join(out, "trace.bin"), sem)
     exe = os.path.join(out, "bench")
     subprocess.run(["g++", "-O3", "-march=native", "-std=c++17", "-o", exe, os.path.join(HERE, "cpp", "bench.cpp")], check=True)
     res = json.loads(subprocess.run([exe, os.path.join(out, "model.bin"), os.path.join(out, "trace.bin"), str(a.repeats)],

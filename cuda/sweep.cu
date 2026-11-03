@@ -5,8 +5,8 @@
 // Layouts (kcuda.py packs / unpacks them):
 //   kp   flat parameters: sc[4] | lamr lami Bur Bui Bwr Bwi Cor Coi [PP each] | enc0..enc3 enc_b [H each] | dec [HD or H] |
 //        (HD > 0) hW [H*HD] hWT [HD*H] hb [HD] | per layer: Ar Ai Br Bi Cr Ci [H*NS] K0 D [H] Wv WvT Wg WgT [H*H] bv bg g beta [H]
-//   q    (B, 44): mu a_ou osc stim gamma e0 emax | dmask[16] | Ad[16] (row major) | Bd[4] | stim_t
-//   st   (6, N, B): z0 z1 tg sy r rho
+//   q    (B, 48): mu a_ou osc stim gamma e0 emax | dmask[16] | Ad[16] (row major) | Bd[4] | stim_t | stim2 stim_t2 stim3 stim_t3
+//   st   (7, N, B): z0 z1 tg sy r rho w   (w: the cost weight of the step, N [k < len] / len)
 //   tape (N, B, S), S = 6 + 2 PP + 16: x0 x1 x2 x3 ou up | hpr[PP] | hpi[PP] | buf[16]   (forward: carry before step k; backward: adjoint of the carry after step k)
 //   ys / e  (NL, N, B, H);  sums (3, B): cost, (b - tg)^2, relu(40 - b)^2 summed over the episode
 #include <cuda_runtime.h>
@@ -18,7 +18,10 @@ namespace ffi = xla::ffi;
 #ifndef H
 #error "compile with -DH=.. -DNS=.. -DNL=.. -DHD=.. -DPP=.. -DWPB=.."
 #endif
-constexpr int NSTEP = 360, DP = 16, NQ = 44;
+#ifndef NSTEP
+#define NSTEP 360
+#endif
+constexpr int DP = 16, NQ = 48;
 constexpr float DT = 5.0f / 60.0f, T_END = 30.0f, UMAX = 100.0f, E0N = 100.0f, EMAXN = 100.0f, GAMN = 2.0f, C50N = 4.5f;
 constexpr int CH = (H + 31) / 32;                       // channels per lane
 constexpr int HDV = HD > 0 ? HD : H;                    // length of the decoder vector
@@ -69,7 +72,7 @@ __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x))
 __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
 struct Patient {      // per-patient constants (warp-uniform)
-  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4], stim_t;
+  float mu, a_ou, osc, stim, gam, e0, emax, dmask[DP], A[16], Bd[4], stim_t, stim2, stim_t2, stim3, stim_t3;
   __device__ void load(const float* q, int b) {
     const float* r = q + (size_t)b * NQ;
     mu = r[0]; a_ou = r[1]; osc = r[2]; stim = r[3]; gam = r[4]; e0 = r[5]; emax = r[6];
@@ -79,7 +82,7 @@ struct Patient {      // per-patient constants (warp-uniform)
     for (int j = 0; j < 16; j++) A[j] = r[23 + j];
 #pragma unroll
     for (int j = 0; j < 4; j++) Bd[j] = r[39 + j];
-    stim_t = r[43];
+    stim_t = r[43]; stim2 = r[44]; stim_t2 = r[45]; stim3 = r[46]; stim_t3 = r[47];
   }
 };
 
@@ -92,7 +95,7 @@ __device__ __forceinline__ void pre_stage(const Patient& P, int k, float x3, flo
                                           Pre& o) {
   float t = k * DT;
   o.ce = fmaxf(x3, 0.0f);
-  float l50 = P.mu + ou + P.stim * (t > P.stim_t ? 1.0f : 0.0f);
+  float l50 = P.mu + ou + P.stim * (t > P.stim_t ? 1.0f : 0.0f) + P.stim2 * (t > P.stim_t2 ? 1.0f : 0.0f) + P.stim3 * (t > P.stim_t3 ? 1.0f : 0.0f);
   o.cg = powf(o.ce, P.gam);
   o.eg = powf(expf(l50), P.gam);
   o.b = P.e0 - P.emax * o.cg / (o.cg + o.eg);
@@ -114,7 +117,7 @@ __device__ __forceinline__ void pre_stage(const Patient& P, int k, float x3, flo
   o.w = fminf(o.w0, 3.0f * C50N);
   o.f0 = (o.y - tg) / 50.0f;
   o.f1 = up / (r * UMAX);
-  o.f2 = t / T_END;
+  o.f2 = 0.0f;
   o.f3 = o.w / (r * C50N) - 1.0f;
 }
 
@@ -246,7 +249,7 @@ __global__ void __launch_bounds__(32 * WPB) fwd_kernel(const float* __restrict__
       }
     }
     const float z0 = st[sb], z1 = st[(size_t)NSTEP * B + sb], tg = st[2 * (size_t)NSTEP * B + sb], sy = st[3 * (size_t)NSTEP * B + sb],
-                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb];
+                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb], wk = st[6 * (size_t)NSTEP * B + sb];
     Pre pr;
     pre_stage(P, k, x3, ou, up, buf, z0, sy, tg, r, pr);
     float hqr = hpr * rho, hqi = hpi * rho;
@@ -294,7 +297,7 @@ __global__ void __launch_bounds__(32 * WPB) fwd_kernel(const float* __restrict__
       hpr = nr; hpi = ni;
     }
     float bb = pr.b, lo = relu(40.0f - bb);
-    s_cost += (bb - tg) * (bb - tg) / 100.0f + w_low * lo * lo / 100.0f + rho_u * (uu / UMAX) * (uu / UMAX);
+    s_cost += wk * ((bb - tg) * (bb - tg) / 100.0f + w_low * lo * lo / 100.0f + rho_u * (uu / UMAX) * (uu / UMAX));
     s_se += (bb - tg) * (bb - tg);
     s_v += lo * lo;
     float n0 = P.A[0] * x0 + P.A[1] * x1 + P.A[2] * x2 + P.A[3] * x3 + P.Bd[0] * uu;
@@ -354,7 +357,7 @@ __global__ void __launch_bounds__(32 * WPB) bwd_kernel(const float* __restrict__
     for (int j = 0; j < DP; j++) buf[j] = tp[6 + 2 * PP + j];
     const float hpr = own_mode ? tp[6 + lane] : 0.0f, hpi = own_mode ? tp[6 + PP + lane] : 0.0f;
     const float z0 = st[sb], tg = st[2 * (size_t)NSTEP * B + sb], sy = st[3 * (size_t)NSTEP * B + sb],
-                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb];
+                r = st[4 * (size_t)NSTEP * B + sb], rho = st[5 * (size_t)NSTEP * B + sb], wk = st[6 * (size_t)NSTEP * B + sb];
     Pre pr;
     pre_stage(P, k, x3, ou, up, buf, z0, sy, tg, r, pr);
     const float hqr = hpr * rho, hqi = hpi * rho;
@@ -394,12 +397,12 @@ __global__ void __launch_bounds__(32 * WPB) bwd_kernel(const float* __restrict__
     const float uu = fminf(fmaxf(mean, 0.0f), UMAX);
 
     // ---- post stage backward
-    float uub = P.Bd[0] * lx0 + P.Bd[1] * lx1 + P.Bd[2] * lx2 + P.Bd[3] * lx3 + lup + cbar * rho_u * 2.0f * uu / (UMAX * UMAX);
+    float uub = P.Bd[0] * lx0 + P.Bd[1] * lx1 + P.Bd[2] * lx2 + P.Bd[3] * lx3 + lup + cbar * wk * rho_u * 2.0f * uu / (UMAX * UMAX);
     uub += wsum(own_mode ? lhr * ld(kp + O_BUR + lane) + lhi * ld(kp + O_BUI + lane) : 0.0f) / r;
     float wb = wsum(own_mode ? lhr * ld(kp + O_BWR + lane) + lhi * ld(kp + O_BWI + lane) : 0.0f) / r;
     float hqrb = lamr * lhr + lami * lhi, hqib = lamr * lhi - lami * lhr;
     const float bb = pr.b;
-    float bbar = cbar * (2.0f * (bb - tg) / 100.0f - w_low * 2.0f * relu(40.0f - bb) / 100.0f);
+    float bbar = cbar * wk * (2.0f * (bb - tg) / 100.0f - w_low * 2.0f * relu(40.0f - bb) / 100.0f);
     const float meanb = (mean > 0.0f && mean < UMAX) ? uub : 0.0f;
     const float ulb = meanb * r, ob = meanb * r * 10.0f;
     if (own_mode) { hqrb += ulb * ld(kp + O_COR + lane); hqib -= ulb * ld(kp + O_COI + lane); }

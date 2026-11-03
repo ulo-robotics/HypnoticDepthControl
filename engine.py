@@ -176,7 +176,7 @@ def raw_grads(tp, sz, pts, w_low, rho_u):
         one = {k: (v[:, :, None] if k == "z" else v[None]) for k, v in pt.items()}
         loss, b, _ = P.rollout(p, one, w_low, rho_u, sz=sz)
         return loss[0], jnp.mean((b[:, 0] - pt["tgt"]) ** 2)
-    (loss, J), g = jax.vmap(jax.value_and_grad(loss1, has_aux=True), in_axes=(None, P.PATIENT_AXES))(tp, pts)
+    (loss, J), g = jax.vmap(jax.value_and_grad(loss1, has_aux=True), in_axes=(None, P.patient_axes(pts)))(tp, pts)
     return g, loss, J
 
 
