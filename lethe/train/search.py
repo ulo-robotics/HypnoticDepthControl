@@ -37,14 +37,16 @@ AHEAD = 2                                     # populations prepared ahead of th
 
 def _keys():
     import jax
-    import trainer as T
+    from lethe.train import trainer as T
     return dict(val=T.VAL_KEY, rerank=jax.random.PRNGKey(424242), test=jax.random.PRNGKey(99999))
 
 
 def screen(designs, n, stimulus):
     """iteration-0 scores of prior designs (vmapped over designs: only the physics layer differs, the residual output is zero)"""
     import jax, jax.numpy as jnp
-    import model as M, policy as P, trainer as T
+    from lethe.core import model as M
+    from lethe.core import policy as P
+    from lethe.train import trainer as T
     base = dict(T.SEARCH_BASE, H=8, NS=4, L=1, head=0, n_extra=0)
     out = np.full(len(designs), np.inf)
     ok, phys = [], []
@@ -85,7 +87,7 @@ def screen(designs, n, stimulus):
 
 
 def space():
-    import trainer as T
+    from lethe.train import trainer as T
     return T.SPACE, T.SEARCH_BASE, T.PRIOR_KEYS
 
 
@@ -152,7 +154,7 @@ class Search:
 
     # ---- phases
     def prior_screen(self, SPACE, BASE, PRIOR_KEYS):
-        import model as M
+        from lethe.core import model as M
         a = self.a
         rng = {n: (lo, hi) for n, k, lo, hi in SPACE if n in PRIOR_KEYS}
         pts = sobol(a.prior_screen, len(PRIOR_KEYS), a.seed + 1)
@@ -253,7 +255,7 @@ class Search:
     def prepare(self, g, budget, train_seed, compile=True):
         """the population of trials g (states from the store, or new), with its gradient engine; compiled ahead of time unless compile=False"""
         import jax
-        import trainer as T
+        from lethe.train import trainer as T
         t0 = time.time()
         states = []
         for t in g:
@@ -272,7 +274,7 @@ class Search:
 
     def train_population(self, g, pop, t_prep, budget, val_idx, tag):
         import jax
-        import trainer as T
+        from lethe.train import trainer as T
         t1, it0 = time.time(), pop.it
 
         def ckpt(it, m, dt):
@@ -357,7 +359,9 @@ class Search:
 
     def finish(self, trials, BASE, fix):
         import jax
-        import model as M, policy as P, trainer as T
+        from lethe.core import model as M
+        from lethe.core import policy as P
+        from lethe.train import trainer as T
         a = self.a
         live = [t for t in trials if not t.get("failed")]
         models = [P.shrink(pickle.load(open(self.spath(t), "rb"))["ema"], t["cfg"]) for t in live]

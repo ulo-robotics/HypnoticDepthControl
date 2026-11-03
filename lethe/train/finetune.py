@@ -18,10 +18,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-import model as M
-import policy as P
-import trainer as T
-import search as S
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.train import trainer as T
+from lethe.train import search as S
 
 LR_MULTS = (1.0, 1 / 3, 1 / 10, 1 / 30)
 DECAY_AT = (1 / 3, 2 / 3)                     # wsd: constant learning rate until this share of --iters, then down to the floor in half that time

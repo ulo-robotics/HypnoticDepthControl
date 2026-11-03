@@ -5,21 +5,22 @@ one 5 s control step at a time (what a monitor-side controller does).
 
   python bench_infer.py runs/lethe/best_model.pkl [--out runs/lethe/cpp] [--repeats 2000]
 
-Exports the model and reference episodes (export_cpp.py), builds cpp/bench.cpp with g++ -O3 -march=native, checks the C++ outputs against
+Exports the model and reference episodes (deploy/cpp.py), builds cpp/bench.cpp with g++ -O3 -march=native, checks the C++ outputs against
 the JAX policy step by step (max |du| in mg/min) and reports the median / p99 latency per step; then times policy.act through JAX on the CPU
 and (if present) the GPU. Writes <out>/bench.json.
 """
 import argparse, json, os, pickle, subprocess, time
 import numpy as np
 
-import export_cpp
+from lethe.deploy import cpp as export_cpp
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repository (cpp/)
 
 
 def jax_latency(params, device, steps=360, reps=5):
     import jax, jax.numpy as jnp
-    import model as M, policy as P
+    from lethe.core import model as M
+    from lethe.core import policy as P
     with jax.default_device(device):
         ctrl = P.PolicyController(params)
         pts = M.to_numpy(M.sample_patients(jax.random.PRNGKey(0), 1, M.VAL["nominal"][0]))
@@ -43,12 +44,12 @@ def main():
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.model)), "cpp")
     os.makedirs(out, exist_ok=True)
-    import policy as P
+    from lethe.core import policy as P
     params = P.load_model(a.model)["params"]
     export_cpp.write_model(params, os.path.join(out, "model.bin"))
     export_cpp.write_trace(params, os.path.join(out, "trace.bin"))
     exe = os.path.join(out, "bench")
-    subprocess.run(["g++", "-O3", "-march=native", "-std=c++17", "-o", exe, os.path.join(HERE, "cpp", "bench.cpp")], check=True)
+    subprocess.run(["g++", "-O3", "-march=native", "-std=c++17", "-o", exe, os.path.join(ROOT, "cpp", "bench.cpp")], check=True)
     res = json.loads(subprocess.run([exe, os.path.join(out, "model.bin"), os.path.join(out, "trace.bin"), str(a.repeats)],
                                     check=True, capture_output=True, text=True).stdout)
     import jax

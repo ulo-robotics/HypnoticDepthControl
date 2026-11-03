@@ -2,7 +2,7 @@
 """
 Export a trained policy for the C++ inference engine (cpp/lethe_infer.hpp), and record reference episodes to check it against.
 
-  python export_cpp.py runs/lethe/best_model.pkl --out runs/lethe/cpp        # -> model.bin, trace.bin
+  python deploy/cpp.py runs/lethe/best_model.pkl --out runs/lethe/cpp        # -> model.bin, trace.bin
 
 model.bin: "LETHE03\\0", int32 H, NS, L, head, modes, then float64 arrays (the discretized matrices, computed here in float64):
   u0, dec_b | lam re / im, Bu re / im, Bw re / im, Cout re / im [modes] | enc_W (3, H), enc_b | per layer: dA re / im, dB re / im,
@@ -16,8 +16,8 @@ import numpy as np
 
 def discretized(params):
     """the deployed model in float64: sizes (H, NS, L, head, modes) and the arrays of model.bin in their order, by name (the discretized
-    matrices, S4D time constants bounded as model.s4d_A; shared with export_onnx.py)"""
-    import model as M
+    matrices, S4D time constants bounded as model.s4d_A; shared with deploy/onnx_export.py)"""
+    from lethe.core import model as M
     ph, ex = params["phys"], params["extra"]
     f64 = lambda a: np.asarray(a, np.float64)
     lam = np.exp(-np.exp(f64(ph["a"])) + 1j * f64(ph["b"]))
@@ -55,7 +55,8 @@ def write_model(params, path):
 
 def write_trace(params, path, n=8, seed=0):
     import jax
-    import model as M, policy as P
+    from lethe.core import model as M
+    from lethe.core import policy as P
     jax.config.update("jax_default_matmul_precision", "highest")      # the reference in exact float32 (GPUs default to TF32 matmuls)
     pts = M.to_numpy(M.sample_patients(jax.random.PRNGKey(seed), n, M.VAL["mixed_hard"][0]))
     ctrl = P.PolicyController(params)
@@ -81,7 +82,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--patients", type=int, default=8)
     a = ap.parse_args()
-    import policy as P
+    from lethe.core import policy as P
     os.makedirs(a.out, exist_ok=True)
     m = P.load_model(a.model)
     write_model(m["params"], os.path.join(a.out, "model.bin"))

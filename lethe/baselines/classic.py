@@ -12,7 +12,7 @@ Baseline controllers on the numpy plant (model.run_numpy), vectorized over a pat
 import numpy as np
 from scipy.linalg import solve_discrete_are
 
-import model as M
+from lethe.core import model as M
 
 
 def lqr_gain(Ad, Bd, q=1.0, rho=1e-4):
@@ -206,7 +206,7 @@ BASELINES = {
 
 
 def tune(n=300):
-    """UKF-MM's q_theta, rho, lam, beta on patients of their own (python baselines.py tune): grid, score = model.score over the validation
+    """UKF-MM's q_theta, rho, lam, beta on patients of their own (python baselines/classic.py tune): grid, score = model.score over the validation
     scenarios (random stimulus). The defaults of UKFMM are the result."""
     import itertools, jax
     key = jax.random.PRNGKey(7_000_000)

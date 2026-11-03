@@ -4,14 +4,14 @@ Export a trained policy as an ONNX model of one control step (the math of cpp/le
 from it reduced-precision models and engines for other runtimes. Every model is checked in its own runtime, in closed loops on the numpy
 reference plant over every validation scenario, against the float32 model.
 
-  python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx                        # policy.onnx, policy_int8.onnx (onnxruntime)
-  python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx --tensorrt fp32,fp16,int8      # + policy_<p>.plan
-  python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx --litert fp32,dynamic          # + policy_<p>.tflite
+  python deploy/onnx_export.py runs/lethe/best_model.pkl --out runs/lethe/onnx                        # policy.onnx, policy_int8.onnx (onnxruntime)
+  python deploy/onnx_export.py runs/lethe/best_model.pkl --out runs/lethe/onnx --tensorrt fp32,fp16,int8      # + policy_<p>.plan
+  python deploy/onnx_export.py runs/lethe/best_model.pkl --out runs/lethe/onnx --litert fp32,dynamic          # + policy_<p>.tflite
 
 policy.onnx (opset 18, float32, batch B dynamic). Inputs: y (B) measured BIS, tgt / tgt_prev (B) the
 reference now / at the previous step, u_prev (B) the previous infusion, phys_re / phys_im (B, modes) the physics compensator's modes,
 s4d_re / s4d_im (L, B, H, NS) the S4D states (all zero at the start of an episode). Outputs: u (B) the infusion (mg/min, in [0, 100]) and
-the new phys_re, phys_im, s4d_re, s4d_im. The matrices are the float64 discretization of export_cpp.py, rounded to float32. Nodes are named
+the new phys_re, phys_im, s4d_re, s4d_im. The matrices are the float64 discretization of deploy/cpp.py, rounded to float32. Nodes are named
 by region: in/ (the features), net/ (encoder, S4D readout, mixing, layer norms, head), rec/ (the S4D and physics recurrences, the infusion).
 
 Precision. The infusion is a high-gain function of the measurement (du/dBIS 3.6 mg/min per point at the median, up to 40), and a rounding
@@ -30,7 +30,7 @@ int16 activations and states), even with its state magnitudes equalized, drifts 
 import argparse, os, pickle, shutil, subprocess, tempfile, time
 import numpy as np
 
-import export_cpp
+from lethe.deploy import cpp as export_cpp
 
 UMAX, E0, EMAX, GAMMA, C50N = 100.0, 100.0, 100.0, 2.0, 4.5
 INPUTS = ("y", "tgt", "tgt_prev", "u_prev", "phys_re", "phys_im", "s4d_re", "s4d_im")
@@ -168,7 +168,7 @@ def build(params, quant=None, taps=None, half=False):
     outs = [vec("u"), oh.make_tensor_value_info("phys_re_out", F, ["B", P]), oh.make_tensor_value_info("phys_im_out", F, ["B", P]),
             oh.make_tensor_value_info("s4d_re_out", F, [L, "B", H, NS]), oh.make_tensor_value_info("s4d_im_out", F, [L, "B", H, NS])]
     graph = oh.make_graph(nodes, "lethe_step", ins, outs, inits)
-    m = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 18)], producer_name="lethe export_onnx.py")
+    m = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 18)], producer_name="lethe deploy/onnx_export.py")
     m.ir_version = 8
     onnx.checker.check_model(m)
     return m, d
@@ -182,7 +182,7 @@ def _slice(feed, i, j):
 def loop(run, pts, d, maxb=None, y_int=False, keep=None):
     """closed loop on the numpy plant of an engine with the ONNX interface (run(feed) -> outputs in OUTPUTS order), maxb patients per call;
     y_int: BIS read as an integer; keep(k, feed): sees every step's inputs -> BIS, infusion (B, N)"""
-    import model as M
+    from lethe.core import model as M
     B = pts["mu"].shape[0]
     plant = M.Plant(pts)
     z = lambda *s: np.zeros(s, np.float32)
@@ -206,13 +206,13 @@ def loop(run, pts, d, maxb=None, y_int=False, keep=None):
 def scenarios(n, seed):
     """n patients of every validation scenario, scenario i from key seed + i"""
     import jax
-    import model as M
+    from lethe.core import model as M
     return {name: M.to_numpy(M.sample_patients(jax.random.PRNGKey(seed + i), n, sp)) for i, (name, (sp, _)) in enumerate(M.VAL.items())}
 
 
 def clinical(runs, sc):
     """the selection score of closed loops {scenario: (BIS, u)}"""
-    import model as M
+    from lethe.core import model as M
     return M.score({n: {k: float(np.mean(v)) for k, v in M.metrics(b, u, sc[n]["tgt"]).items()} for n, (b, u) in runs.items()})
 
 
@@ -226,7 +226,8 @@ def compare(runs, ref, sc):
 def against_jax(run, params, d, pts):
     """the step vs the JAX policy (policy.act, float32), each in its own closed loop: max |du|"""
     import jax
-    import model as M, policy as P
+    from lethe.core import model as M
+    from lethe.core import policy as P
     jax.config.update("jax_default_matmul_precision", "highest")
     ref, plant = P.PolicyController(params), M.Plant(pts)
     ref.reset(pts, plant)
@@ -247,7 +248,7 @@ def calibrate(params, d, n, seed=1000):
     """closed loops of the float32 step (onnxruntime) on n patients of every scenario, keys seed + i: the int8 matmuls' smoothing and
     activation scales, group -> (s, a)"""
     from onnx import TensorProto, helper as oh
-    import model as M
+    from lethe.core import model as M
     taps = {}
     m, _ = build(params, taps=taps)
     m.graph.output.extend(oh.make_tensor_value_info(t, TensorProto.FLOAT, None) for t in taps.values())
@@ -398,7 +399,7 @@ def main():
     ap.add_argument("--no-int8", dest="int8", action="store_false", help="do not write policy_int8.onnx")
     a = ap.parse_args()
     import onnx
-    import policy as Pol
+    from lethe.core import policy as Pol
     os.makedirs(a.out, exist_ok=True)
     params = Pol.load_model(a.model)["params"]
     m, d = build(params)

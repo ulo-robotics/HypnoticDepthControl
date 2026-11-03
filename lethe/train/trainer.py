@@ -2,7 +2,7 @@
 Training core shared by train.py (one configuration) and search.py (meta-optimization): configuration space, optimizers and learning-rate
 rules, per-patient gradient clipping, and the Population: n configurations trained as ONE jitted program (train.py is a population of one).
 
-Population: the members' parameters, EMAs and optimizer states are stacked along a leading axis, zero-padded to a common shape (policy.py's
+Population: the members' parameters, EMAs and optimizer states are stacked along a leading axis, zero-padded to a common shape (core/policy.py's
 training layout; masks keep every member exactly its own network). Every hyperparameter is an array with one value per member, the optimizer
 is a switch over the members' update rules, K iterations run inside one lax.scan (learning-rate rule, delay curriculum and patient sampling on
 the device), and all members train on the same patients each iteration (common random numbers). So one compilation serves every population of
@@ -19,9 +19,9 @@ import jax
 import jax.numpy as jnp
 import optax
 
-import model as M
-import policy as P
-import engine as E
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe import engine as E
 
 jax.config.update("jax_default_matmul_precision", "highest")    # every engine computes the same float32 function (no TF32 in raw JAX)
 try:

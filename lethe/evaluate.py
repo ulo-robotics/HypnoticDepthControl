@@ -17,9 +17,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-import model as M
-import policy as P
-import baselines as BL
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.baselines import classic as BL
 
 jax.config.update("jax_default_matmul_precision", "highest")    # float32 matmuls (not TF32): the policy computes what it was trained on
 EVAL_KEY = jax.random.PRNGKey(8_000_000)

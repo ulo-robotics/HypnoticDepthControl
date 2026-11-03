@@ -3,7 +3,7 @@
 Train the policy (one configuration) with pathwise gradients through the differentiable closed loop.
 
 Every iteration draws a fresh batch of patients from model.TRAIN (a share of them exactly nominal; the monitor-delay range ramps up over the
-first iterations), computes one gradient per patient (engine.py: the fastest verified engine, raw JAX as the fallback), clips every patient's
+first iterations), computes one gradient per patient (lethe/engine: the fastest verified engine, raw JAX as the fallback), clips every patient's
 gradient to k x the median patient norm, averages, and takes an optimizer step (per-group learning rates for the physics layer, the SSM time
 scales and the rest). An EMA of the weights is validated every --eval-every iterations on fresh patients from all validation scenarios; the
 best EMA snapshot is written to <out>/best_model.pkl (compact layout). The run is a trainer.Population of one: the same program as a trial
@@ -12,14 +12,14 @@ of search.py.
   python train.py --out runs/train                       # defaults = the selected configuration (trainer.SELECTED)
   python train.py --out runs/train --resume              # continue after an interruption
   python train.py --out runs/smoke --iters 30 --batch 64 --val-batch 128 --eval-every 10 --H 16 --L 1 --head 0   # quick check
-  PKPD_ENGINE=raw python train.py ...                 # force raw JAX autodiff (see engine.py)
+  PKPD_ENGINE=raw python train.py ...                 # force raw JAX autodiff (see lethe/engine)
 """
 import argparse, json, os, pickle, signal, time
 import jax
 
-import model as M
-import policy as P
-import trainer as T
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.train import trainer as T
 
 CONFIG = dict(T.SELECTED, iters=6000, seed=0)
 aggregate = T.aggregate                                    # (used by selftest.py)

@@ -15,9 +15,9 @@ Adjoint gradient (per patient, exact):
   assembly (XLA)   with both tapes, every step is independent: one batched VJP of the replayed step over all (step, patient) pairs gives every
                    per-patient parameter gradient except the S4D kernels (dt, A, C), which follow from an FFT cross-correlation of the S4D input
                    with the S4D output cotangent (the S4D layer is a convolution with K_m = 2 Re sum C dA^m dB).
-The sweeps are implemented twice (XLA scans here = the reference, and the blocked CUDA kernels of cbwd.py); `assemble` is the reference assembly.
+The sweeps are implemented twice (XLA scans here = the reference, and the blocked CUDA kernels of engine/cuda.py); `assemble` is the reference assembly.
 
-Parameters come in the training layout of policy.py with the network's sizes sz. A padded network (sizes smaller than the arrays) gets a "masked"
+Parameters come in the training layout of core/policy.py with the network's sizes sz. A padded network (sizes smaller than the arrays) gets a "masked"
 kernel layout: the S4D input mask is folded into dB, and the layer-norm mask (kp["mH"], count sc[4]), the head switch (sc[5]) and the layer gates
 (sc[6 + l]) are applied in the step. An unpadded network can use the "plain" layout (no masks).
 """
@@ -28,8 +28,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-import model as M
-import policy as P
+from lethe.core import model as M
+from lethe.core import policy as P
 
 DP = M.DMAX_ALL + 1              # delay line length (16)
 f32 = jnp.float32

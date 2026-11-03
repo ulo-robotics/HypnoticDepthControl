@@ -7,14 +7,14 @@ Float64 (a minute on a CPU):
      (delays, target steps, noise steps, PD / PK shifts) with a non-trivial residual branch
   3. the pathwise gradient matches a finite difference
   4. per-patient aggregation without clipping == the gradient of the batch-mean loss
-  5. the adjoint gradient (kstep.py, XLA sweeps) == raw autodiff, per patient, for several shapes (head / no head, extra physics modes, H < 16),
+  5. the adjoint gradient (engine/xla.py, XLA sweeps) == raw autodiff, per patient, for several shapes (head / no head, extra physics modes, H < 16),
      in the plain and in the masked kernel layout
   6. padding is exact: a network zero-padded into a larger shape (more channels, states, layers, head units, physics modes) computes the same
      closed loop, its per-patient gradients equal the unpadded ones on the active entries and are exactly zero on the padding (raw and adjoint)
   7. a population of different configurations (sizes, optimizers, learning-rate rules, loss weights) trained together == each trained alone
   8. the UKF-MM baseline with one observer of delay 0 and fixed noise == UKF+LQR, and the full bank runs (finite, in range)
 Float32, GPU only (a fresh process, `python selftest.py --engines`; run automatically when a GPU is present):
-  9. every Pallas and CUDA sweep candidate of engine.py (cuda, cblk) == the XLA reference sweeps on every tape, for a single network (three
+  9. every Pallas and CUDA sweep candidate of lethe/engine (cuda, cblk) == the XLA reference sweeps on every tape, for a single network (three
      shapes including the selected one) and a padded population, and every GPU gradient assembly (XLA with the CUDA S4D-kernel gradients, the
      CUDA assembly, the joint cbwd backward + tape assembly) == the XLA reference assembly, per patient and per parameter. A candidate that does not fit a shape (e.g. shared memory) is reported as
      skipped: the engine would not use it either.
@@ -24,10 +24,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-import model as M
-import policy as P
-import train as T
-import kstep as K
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.train import train as T
+from lethe.engine import xla as K
 
 ENGINE_MODE = "--engines" in sys.argv
 if not ENGINE_MODE:
@@ -110,8 +110,8 @@ def main():
     ok.append(check("mean of per-patient gradients == batch gradient (relative)", num / den, 1e-10))
 
     # 5. adjoint gradient (XLA sweeps) == raw autodiff, per patient
-    import engine as E
-    import trainer as TR
+    from lethe import engine as E
+    from lethe.train import trainer as TR
     rel = lambda ga, gb: max(float(jnp.max(jnp.abs(x - y)) / (jnp.max(jnp.abs(y)) + 1e-30)) for x, y in zip(jax.tree_util.tree_leaves(ga), jax.tree_util.tree_leaves(gb)))
     noisy = lambda cfg, key=k: jax.tree_util.tree_map(lambda x: x + 0.05 * jax.random.normal(key, x.shape, x.dtype), f64(P.init_params(jax.random.PRNGKey(0), cfg)))
     for cfg in (dict(CFG, head=8, n_extra=3), dict(CFG, H=16, NS=8, L=1, head=0)):
@@ -175,7 +175,7 @@ def main():
                         rel(together[i]["params"], alone.member_states()[0]["params"]), 1e-9))
 
     # 8. UKF-MM reduces to UKF+LQR
-    import baselines as BL
+    from lethe.baselines import classic as BL
     _, u0 = M.run_numpy(BL.UKFLQR(q_theta=5e-4, rho=2e-4), pn)
     _, u1 = M.run_numpy(BL.UKFMM(dset=(0,), adapt=False), pn)
     ok.append(check("UKF-MM, one observer of delay 0, fixed noise == UKF+LQR (max |du|, mg/min)", float(np.max(np.abs(u0 - u1))), 1e-9))
@@ -193,8 +193,8 @@ def main():
 
 def engines():
     """9. every GPU sweep and assembly candidate vs the XLA references (float32)"""
-    import engine as E
-    import trainer as TR
+    from lethe import engine as E
+    from lethe.train import trainer as TR
     ok, n_run, n_asm = [], 0, 0
     noisy = lambda cfg: jax.tree_util.tree_map(lambda x: x + 0.05 * jax.random.normal(jax.random.PRNGKey(1), x.shape, x.dtype),
                                                P.init_params(jax.random.PRNGKey(0), cfg))

@@ -1,14 +1,14 @@
 """
 Training engine selection: per-patient gradients of a POPULATION of networks (leading member axis on the parameters, sizes and loss weights;
 the patients are shared), either by raw JAX autodiff (vmap of grad through policy.rollout; always available, the fallback and the reference)
-or by the adjoint method of kstep.py, whose forward and backward sweeps each run on the fastest VERIFIED implementation:
-  xla      lax.scan sweeps (kstep.xla_forward / xla_backward)           always available; per step (the reference) or with the S4D
+or by the adjoint method of engine/xla.py, whose forward and backward sweeps each run on the fastest VERIFIED implementation:
+  xla      lax.scan sweeps (xla.xla_forward / xla_backward)           always available; per step (the reference) or with the S4D
                                                                          blocked over T steps (state traffic once per block)
-  cblk     CUDA kernels in the blocked layout (cbwd.py: cuda/cfwd.cu,    GPU + nvcc; populations, masked and plain layouts
-           cuda/cbwd.cu): PB patients per thread block, GLU / head on tensor cores, S4D state touched once per T-step block
+  cblk     CUDA kernels in the blocked layout (engine/cuda.py: kernels/cfwd.cu,    GPU + nvcc; populations, masked and plain layouts
+           kernels/cbwd.cu): PB patients per thread block, GLU / head on tensor cores, S4D state touched once per T-step block
 and the gradient assembly on one of
-  xla      kstep.assemble (replayed steps' VJP; S4D kernels by FFT cross-correlation)      always available, the reference
-  tapes    joint backward + assembly (cbwd.grads): the cuda/cbwd.cu backward also writes the per-step cotangents, and cuda/casm.cu assembles
+  xla      xla.assemble (replayed steps' VJP; S4D kernels by FFT cross-correlation)      always available, the reference
+  tapes    joint backward + assembly (cuda.grads): the kernels/cbwd.cu backward also writes the per-step cotangents, and kernels/casm.cu assembles
            the gradients in one pass over them without replaying the steps; replaces the backward sweep
            (chosen when forward + joint < forward + backward + assembly)
 Selection per shape (padded sizes, members, batch, device): every candidate is compiled, checked against the XLA reference on stable (nominal)
@@ -27,9 +27,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-import model as M
-import policy as P
-import kstep as K
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.engine import xla as K
 
 CACHE = os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1")
 TUNE_FILE = os.path.join(CACHE, "engine.json")
@@ -50,8 +50,8 @@ TAPES_CANDS = [dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, p
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("kstep.py", "kcuda.py", "cbwd.py", "cuda/cbwd.cu", "cuda/cfwd.cu", "cuda/casm.cu",
-              "policy.py", "model.py", "engine.py"):
+    for f in ("xla.py", "cuda.py", "kernels/cbwd.cu", "kernels/cfwd.cu", "kernels/casm.cu", "../core/policy.py", "../core/model.py",
+              "__init__.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):
             h.update(open(p, "rb").read())
@@ -96,8 +96,8 @@ def sweep_fns(kind, opt):
     if kind == "xla":
         return partial(K.xla_forward, **opt), partial(K.xla_backward, **opt)
     if kind == "cblk":
-        import cbwd
-        return partial(cbwd.forward, **opt), partial(cbwd.backward, **opt)
+        from lethe.engine import cuda as C
+        return partial(C.forward, **opt), partial(C.backward, **opt)
     raise ValueError(kind)
 
 
@@ -112,8 +112,8 @@ def candidates(B, n=1, plain=None, only=None):
     out = [("xla", {})] + [("xla", o) for o in XLA_CANDS]
     if _gpu():
         try:
-            import kcuda
-            if kcuda.available():
+            from lethe.engine import cuda as C
+            if C.available():
                 out += [("cblk", o) for o in CBLK_CANDS if B % o["pb"] == 0]
         except Exception:
             pass
@@ -124,8 +124,8 @@ def asm_candidates():
     out = [("xla", {})]
     if _gpu():
         try:
-            import kcuda
-            if kcuda.available():
+            from lethe.engine import cuda as C
+            if C.available():
                 out += [("tapes", o) for o in TAPES_CANDS]
         except Exception:
             pass
@@ -137,8 +137,8 @@ def asm_fn(kind, opt):
     if kind == "xla":
         return K.assemble
     if kind == "tapes":                                  # joint: ignores bt (runs its own backward)
-        import cbwd
-        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: cbwd.grads(tp, sz, w, r, plain, q, st, ft, chunk=chunk, **opt)
+        from lethe.engine import cuda as C
+        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: C.grads(tp, sz, w, r, plain, q, st, ft, chunk=chunk, **opt)
     raise ValueError(kind)
 
 

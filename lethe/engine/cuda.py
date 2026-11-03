@@ -1,25 +1,26 @@
 """
-The backward sweep as one CUDA kernel (cuda/cbwd.cu), ported from the old meta_opt engine (cengine.py). Same contract as
-kstep.xla_backward(kp, q, st, ftape, T) (blocked S4D adjoint, T steps per block). With grads=True the kernel also returns the per-patient gradients
+The backward sweep as one CUDA kernel (kernels/cbwd.cu), ported from the old meta_opt engine (cengine.py). Same contract as
+xla.xla_backward(kp, q, st, ftape, T) (blocked S4D adjoint, T steps per block). With grads=True the kernel also returns the per-patient gradients
 that are sums over steps and the tapes of the large matrices' gradients, and assemble_tapes turns them into every per-patient gradient without
-replaying the steps (kstep.assemble replays every step and takes its VJP again).
+replaying the steps (xla.assemble replays every step and takes its VJP again).
 
 Layout of the kernel: one thread block = PB patients of one network, LANES threads per patient, the GLU / head matmuls on tensor cores across the
-block's patients. One shared library per shape and launch option, built with nvcc on first use and cached by content hash next to kcuda's.
+block's patients. One shared library per shape and launch option, built with nvcc on first use and cached by content hash (CACHE).
 """
 import ctypes, hashlib, math, os, subprocess
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-import model as M
-import policy as P
-import kstep as K
-import kcuda as KC
+from lethe.core import model as M
+from lethe.core import policy as P
+from lethe.engine import xla as K
+import shutil, threading
+from jax import lax
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "cbwd.cu")
-SRC_FWD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "cfwd.cu")
-SRC_ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda", "casm.cu")
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "cbwd.cu")
+SRC_FWD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "cfwd.cu")
+SRC_ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "casm.cu")
 SMEM_MAX = 101376                     # dynamic shared memory per block (sm_89)
 NQ = 48
 ASM_PREC = K.HI                       # precision of the assembly GEMMs
@@ -48,6 +49,93 @@ def default_lanes(H):
 
 def nsm(d):
     return 5 * d["H"] + max(d["HD"], 8) + 8 * d["PP"] + 2 + 2 * d["L"] * d["H"]
+
+
+# ---------------------------------------------------------------- build registry, tape packing, S4D gradients from moments
+CACHE = os.path.join(os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1"), "cuda")
+_LOADED = {}
+_BUILD_LOCK = threading.Lock()                # the registry (_LOADED, _INFLIGHT, FFI registration): lethe/engine builds candidates in parallel threads
+_INFLIGHT = {}
+
+
+def once(key, build):
+    """build() for key once per process: concurrent callers of the same key wait for the first one, different keys build in parallel (nvcc is
+    a process of its own; only the registry is locked)"""
+    with _BUILD_LOCK:
+        if key in _LOADED:
+            return _LOADED[key]
+        ev = _INFLIGHT.get(key)
+        first = ev is None
+        if first:
+            ev = _INFLIGHT[key] = threading.Event()
+    if not first:
+        ev.wait()
+        with _BUILD_LOCK:
+            if key in _LOADED:
+                return _LOADED[key]
+        raise RuntimeError(f"build of {key[:2]} failed in another thread")
+    try:
+        val = build()
+        with _BUILD_LOCK:
+            _LOADED[key] = val
+        return val
+    finally:
+        with _BUILD_LOCK:
+            _INFLIGHT.pop(key, None)
+        ev.set()
+
+
+def register(name, capsule):
+    with _BUILD_LOCK:
+        jax.ffi.register_ffi_target(name, capsule, platform="CUDA")
+
+
+def nvcc():
+    p = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    return p if os.path.exists(p) else None
+
+
+def available():
+    try:
+        return nvcc() is not None and jax.default_backend() == "gpu" and hasattr(jax, "ffi")
+    except Exception:
+        return False
+
+
+def _arch():
+    cc = getattr(jax.devices()[0], "compute_capability", None)
+    if cc is None:
+        cc = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], capture_output=True, text=True).stdout.split()[0]
+    return "sm_" + str(cc).replace(".", "")
+
+
+def pack_tape(c):
+    return jnp.concatenate([c[k][..., None] for k in ("x0", "x1", "x2", "x3", "ou", "up")] + [c["hpr"], c["hpi"], c["buf"]], -1)
+
+
+def unpack_tape(t, PP):
+    out = {k: t[..., i] for i, k in enumerate(("x0", "x1", "x2", "x3", "ou", "up"))}
+    out.update(hpr=t[..., 6:6 + PP], hpi=t[..., 6 + PP:6 + 2 * PP], buf=t[..., 6 + 2 * PP:])
+    return out
+
+
+def s4d_from_moments(tp, mS, pq):
+    """per-patient gradients of log_dt, log_A_re, A_im, C from the moments (B, L, H, NS, 4): Re P, Im P, Re P', Im P'.
+    The S4D kernel's contribution is 2 Re sum_n C dB P(dA) with P(dA) known to first order from the moments (P, P'): its gradient is the
+    gradient of the surrogate 2 Re sum_n C dB (P + P' (dA - dA_0)) at the current parameters, taken by JAX through the same discretization as
+    the reference (model.s4d_A: time constants bounded), so the chain rule through the bound cannot drift from it"""
+    ly = tp["extra"]["layers"]
+    p0 = {k: ly[k] for k in ("log_dt", "log_A_re", "A_im", "C")}
+
+    def surrogate(p, Pz, Pd):
+        dt, A = M.s4d_A(p["log_dt"], p["log_A_re"], p["A_im"])
+        dA = jnp.exp(dt * A)
+        dB = (dA - 1) / A * mS
+        C = p["C"][..., 0] + 1j * p["C"][..., 1]
+        return jnp.sum(2 * jnp.real(C * dB * (Pz + Pd * (dA - lax.stop_gradient(dA)))))
+
+    Pz, Pd = pq[..., 0] + 1j * pq[..., 1], pq[..., 2] + 1j * pq[..., 3]
+    return jax.vmap(jax.grad(surrogate), in_axes=(None, 0, 0))(p0, Pz, Pd)
 
 
 # ---------------------------------------------------------------- inputs (one network; under vmap every input gets the member axis)
@@ -107,7 +195,7 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
         for k in [k for k in MM_WEIGHTS if k in ins]:
             ins[k] = tf32_pack(jnp.asarray(ins[k], jnp.float32))
     if tapes:                                                            # the forward kernel's native tapes when there (no repacking)
-        ins["c_tape"] = ftape["packed"] if "packed" in ftape else KC.pack_tape(ftape["c"])
+        ins["c_tape"] = ftape["packed"] if "packed" in ftape else pack_tape(ftape["c"])
         ins["t_ys"] = ftape["ys_all"] if "ys_all" in ftape else jnp.stack(ftape["ys"])
     return {k: jnp.asarray(v, jnp.float32) for k, v in ins.items()}
 
@@ -139,20 +227,20 @@ def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam, B, N):
 
 
 def _build(header, src_path=SRC, symbol="CbwdHandler", prefix="cbwd"):
-    return KC.once((prefix, header), lambda: _compile(header, src_path, symbol, prefix))
+    return once((prefix, header), lambda: _compile(header, src_path, symbol, prefix))
 
 
 def _compile(header, src_path, symbol, prefix):
     """nvcc into the content-addressed cache (or load from it) and register the FFI target"""
     src = open(src_path).read()
-    arch = KC._arch()
+    arch = _arch()
     tag = hashlib.sha1((header + src + arch).encode()).hexdigest()[:16]
-    so = os.path.join(KC.CACHE, f"{prefix}_{tag}.so")
+    so = os.path.join(CACHE, f"{prefix}_{tag}.so")
     if not os.path.exists(so):
-        os.makedirs(KC.CACHE, exist_ok=True)
-        hf = os.path.join(KC.CACHE, f"{prefix}_{tag}.h")
+        os.makedirs(CACHE, exist_ok=True)
+        hf = os.path.join(CACHE, f"{prefix}_{tag}.h")
         open(hf, "w").write(header)
-        cmd = [KC.nvcc(), "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-arch={arch}", "-Xlinker", "--exclude-libs,ALL",
+        cmd = [nvcc(), "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-arch={arch}", "-Xlinker", "--exclude-libs,ALL",
                "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-diag-suppress", "177,550",
                "-I" + jax.ffi.include_dir(), "-include", hf, src_path, "-o", f"{so}.{os.getpid()}.tmp"]
         if os.environ.get("CBWD_VERBOSE"):
@@ -167,13 +255,13 @@ def _compile(header, src_path, symbol, prefix):
         os.replace(f"{so}.{os.getpid()}.tmp", so)
     lib = ctypes.cdll.LoadLibrary(so)
     name = f"pkpd_{prefix}_{tag}"
-    KC.register(name, jax.ffi.pycapsule(getattr(lib, symbol)))
+    register(name, jax.ffi.pycapsule(getattr(lib, symbol)))
     return name
 
 
 # ---------------------------------------------------------------- the sweep
 def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, lam=True):
-    """kstep.xla_backward(kp, q, st, ftape, T) on the CUDA kernel; grads=True: plus the per-patient gradient sums and tapes (for assemble_tapes);
+    """xla.xla_backward(kp, q, st, ftape, T) on the CUDA kernel; grads=True: plus the per-patient gradient sums and tapes (for assemble_tapes);
     lam=False: without lam / e (assemble_tapes does not need them)"""
     d = dims(kp)
     B = q["mu"].shape[0]
@@ -186,20 +274,20 @@ def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, la
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s, jnp.float32) for s in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B))
     r = dict(zip(outs, res))
-    bt = dict(lam=KC.unpack_tape(r["lam"], d["PP"]), e=[r["e"][l] for l in range(d["L"])]) if lam else {}
+    bt = dict(lam=unpack_tape(r["lam"], d["PP"]), e=[r["e"][l] for l in range(d["L"])]) if lam else {}
     if grads:
         bt.update({k: r[k] for k in ("g_sm", "t_x", "t_a", "t_dzv", "t_dzg", "t_xe", "t_dpre") if k in r})
     return bt
 
 
-# ---------------------------------------------------------------- the forward sweep (cuda/cfwd.cu, blocked S4D)
+# ---------------------------------------------------------------- the forward sweep (kernels/cfwd.cu, blocked S4D)
 def smem_fwd(d, pb, T):
     H, L, HDP, PP = d["H"], d["L"], max(d["HD"], 8), d["PP"]
     return 4 * (2 * pb * (max(2 * H, HDP) + 4) + (7 + 6 * L) * H + 2 * HDP + 8 * PP + L * T * H + pb * NQ)
 
 
 def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
-    """kstep.xla_forward(kp, q, st, tape, T) on the CUDA kernel: (tape dict or None, per-patient sums)"""
+    """xla.xla_forward(kp, q, st, tape, T) on the CUDA kernel: (tape dict or None, per-patient sums)"""
     d = dims(kp)
     B = q["mu"].shape[0]
     lanes, N = lanes or default_lanes(d["H"]), K.nsteps(st)
@@ -219,7 +307,7 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
     sums = dict(cost=r["sums"][0], se=r["sums"][1], viol=r["sums"][2])
     if not tape:
         return None, sums
-    return dict(c=KC.unpack_tape(r["tape"], d["PP"]), ys=[r["ys"][l] for l in range(L)], packed=r["tape"], ys_all=r["ys"]), sums
+    return dict(c=unpack_tape(r["tape"], d["PP"]), ys=[r["ys"][l] for l in range(L)], packed=r["tape"], ys_all=r["ys"]), sums
 
 
 # ---------------------------------------------------------------- replay-free assembly
@@ -227,7 +315,7 @@ CASM_CK = (30, 24, 20, 12, 10, 8)            # steps per chunk, largest first (m
 
 
 def casm(tp, btape, ck=None, nt=256):
-    """cuda/casm.cu on backward(..., grads=True)'s tapes: dict(pq (B, L, H, NS, 4) S4D moments, g_w (B, L, 2, H, H) GLU matrices,
+    """kernels/casm.cu on backward(..., grads=True)'s tapes: dict(pq (B, L, H, NS, 4) S4D moments, g_w (B, L, 2, H, H) GLU matrices,
     g_b (B, L, 3, H) bv / bg / D, and with a head g_hw (B, H, HD), g_hb (B, HD)). ck: steps per chunk (None: the largest that fits)"""
     ly = tp["extra"]["layers"]
     L, H, NS = ly["log_A_re"].shape
@@ -257,8 +345,8 @@ def casm(tp, btape, ck=None, nt=256):
 
 
 def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, ck=None):
-    """per-patient gradients (as kstep.assemble) from backward(..., grads=True): the matrices, sums and S4D moments in one pass over the tapes
-    (cuda/casm.cu, ck steps per chunk), the S4D-parameter gradients from the moments, then the VJP of the kernel layout. The whole batch at
+    """per-patient gradients (as xla.assemble) from backward(..., grads=True): the matrices, sums and S4D moments in one pass over the tapes
+    (kernels/casm.cu, ck steps per chunk), the S4D-parameter gradients from the moments, then the VJP of the kernel layout. The whole batch at
     once: nothing here grows with the batch beyond the tapes themselves. chunk: unused (the engine's signature)."""
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: K.to_kp(t, sz, w_low, rho_u, plain), tp)
@@ -301,7 +389,7 @@ def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None,
         g["hW"], g["hb"] = r["g_hw"], r["g_hb"]
     gt = jax.vmap(lambda gk: kp_vjp(gk)[0])(g)
     glt = gt["extra"]["layers"]
-    s4 = KC.s4d_from_moments(tp, mS, r["pq"])
+    s4 = s4d_from_moments(tp, mS, r["pq"])
     for k, v in s4.items():
         glt[k] = glt[k] + v
     return gt

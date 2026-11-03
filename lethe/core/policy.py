@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from jax import lax
 from scipy.linalg import block_diag, solve_discrete_are
 
-import model as M
+from lethe.core import model as M
 
 # hyperparameters of the architecture and of the prior design (the design defines the initial policy)
 ARCH_DEFAULTS = dict(H=64, NS=8, L=3, head=64, n_extra=0, q_theta=2.5e-3, sy_scale=0.78, rho_lqr=8.6e-4, q_x=1.2e-4)
