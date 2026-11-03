@@ -1,4 +1,5 @@
-"""The adjoint engine (XLA reference): per-patient gradients equal raw autodiff, blocked sweeps equal per-step ones, padding is exact"""
+"""The XLA adjoint engine: per-patient gradients equal raw autodiff, blocked sweeps equal per-step ones, padding is exact, and the engine's
+interface (the CUDA kernels' tape format) gives the same gradients"""
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -6,42 +7,44 @@ import pytest
 
 from lethe import engine as E
 from lethe.core import policy as P
-from lethe.engine import xla as K
+from lethe.engine import xla as X
 from lethe.train import trainer as TR
 from conftest import noisy, rel
 
 SHAPES = [dict(H=8, NS=4, L=2, head=8, n_extra=3), dict(H=16, NS=8, L=1, head=0)]
+ids = lambda s: f"H{s['H']}L{s['L']}head{s['head']}"
 
 
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"H{s['H']}L{s['L']}head{s['head']}")
-@pytest.mark.parametrize("layout", ["plain", "masked"])
-def test_adjoint_equals_raw(cfg, pts, shape, layout):
-    c = dict(cfg, **shape)
-    tp, sz = P.expand(noisy(c))
-    g_ref = E.raw_grads(tp, sz, pts, 0.87, 0.21)[0]
-    g_adj = K.adjoint_grads(tp, sz, pts, 0.87, 0.21, plain=(c["head"] > 0) if layout == "plain" else None)[0]
-    assert rel(g_adj, g_ref) <= 1e-8                                    # float64 rounding through 360 steps
+@pytest.mark.parametrize("shape", SHAPES, ids=ids)
+@pytest.mark.parametrize("T", [0, 10])
+def test_adjoint_equals_raw(cfg, pts, shape, T):
+    tp, sz = P.expand(noisy(dict(cfg, **shape)))
+    g_ref, l_ref, J_ref = E.raw_grads(tp, sz, pts, 0.87, 0.21)
+    g, l, J = X.adjoint_grads(tp, sz, pts, 0.87, 0.21, T=T)
+    assert rel(g, g_ref) <= 1e-8                                        # float64 rounding through 360 steps
+    assert rel(l, l_ref) <= 1e-12 and rel(J, J_ref) <= 1e-12
 
 
 @pytest.mark.parametrize("T", [10, 20])
 def test_blocked_sweeps(cfg, pts, T):
     tp, sz = P.expand(noisy(dict(cfg, **SHAPES[0])))
-    kp, (q, st) = K.to_kp(tp, sz, 0.87, 0.21, None), K.to_kq(pts)
-    ft, s0 = K.xla_forward(kp, q, st)
-    bt = K.xla_backward(kp, q, st, ft)
-    ft2, s2 = K.xla_forward(kp, q, st, T=T)
-    bt2 = K.xla_backward(kp, q, st, ft, T=T)
+    net, pat, steps = X.net_of(tp, sz, 0.87, 0.21), X.patients_of(pts), X.steps_of(pts)
+    ft, s0 = X.forward(net, pat, steps, True, 0)
+    bt = X.backward(net, pat, steps, ft, 0)
+    ft2, s2 = X.forward(net, pat, steps, True, T)
+    bt2 = X.backward(net, pat, steps, ft, T)
     assert max(rel(ft2, ft), rel(s2, s0), rel(bt2, bt)) <= 1e-10
 
 
-def test_adjoint_with_blocked_sweeps(cfg, pts):
+def test_engine_interface(cfg, pts):
+    """the sweeps and the assembly through the kernels' tape format == the XLA engine's own gradient"""
     tp, sz = P.expand(noisy(dict(cfg, **SHAPES[0])))
-    g = K.adjoint_grads(tp, sz, pts, 0.87, 0.21, forward=lambda *a, **k_: K.xla_forward(*a, **k_, T=20),
-                        backward=lambda *a: K.xla_backward(*a, T=20))[0]
-    assert rel(g, E.raw_grads(tp, sz, pts, 0.87, 0.21)[0]) <= 1e-8
+    g, l, J = E.adjoint_grads(tp, sz, pts, 0.87, 0.21)
+    g2, l2, J2 = X.adjoint_grads(tp, sz, pts, 0.87, 0.21)
+    assert max(rel(g, g2), rel(l, l2), rel(J, J2)) <= 1e-12
 
 
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"H{s['H']}L{s['L']}head{s['head']}")
+@pytest.mark.parametrize("shape", SHAPES, ids=ids)
 def test_padding_is_exact(cfg, pts, shape):
     c = dict(cfg, **shape)
     cp = noisy(c)
@@ -53,7 +56,7 @@ def test_padding_is_exact(cfg, pts, shape):
     _, b1, _ = P.rollout(tpb, pts, sz=sz)
     assert float(jnp.max(jnp.abs(b1 - b0))) <= 1e-10
     g0 = E.raw_grads(tp, sz, pts, 0.87, 0.21)[0]
-    for gf in (E.raw_grads, lambda *a: K.adjoint_grads(*a, plain=None)):
+    for gf in (E.raw_grads, X.adjoint_grads):
         g1 = gf(tpb, sz, pts, 0.87, 0.21)[0]
         per = [jax.tree_util.tree_map(lambda x: np.asarray(x[i]), g1) for i in range(pts["mu"].shape[0])]
         g1c = jax.tree_util.tree_map(lambda *x: np.stack(x), *[P.resize(g, own) for g in per])          # the active entries

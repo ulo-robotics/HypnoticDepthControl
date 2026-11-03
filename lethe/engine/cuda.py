@@ -1,8 +1,14 @@
 """
-The backward sweep as one CUDA kernel (kernels/cbwd.cu), ported from the old meta_opt engine (cengine.py). Same contract as
-xla.xla_backward(kp, q, st, ftape, T) (blocked S4D adjoint, T steps per block). With grads=True the kernel also returns the per-patient gradients
+The blocked CUDA engine: the forward sweep (kernels/cfwd.cu), the backward sweep (kernels/cbwd.cu, blocked S4D adjoint, T steps per block)
+and the gradient assembly from the backward's tapes (kernels/casm.cu). With grads=True the backward also returns the per-patient gradients
 that are sums over steps and the tapes of the large matrices' gradients, and assemble_tapes turns them into every per-patient gradient without
-replaying the steps (xla.assemble replays every step and takes its VJP again).
+replaying the steps.
+
+The kernels take the network in the "kernel layout" (to_kp: real / imaginary planes, no slicing or gathers, the 4x4 plant as 16 scalars,
+power-of-two physics modes, scalars in one vector sc; a padded network in the masked layout, an unpadded one in the plain layout) and the
+patients as per-patient constants and per-step inputs (to_kq). Their tapes (the small carry per step as x0..x3, ou, up, hpr, hpi, buf) are
+the engine's exchange format: lethe/engine/xla converts its own to and from it. The engine calls forward_p, backward_p and grads_p
+(network parameters and a patient batch, the backends' common interface).
 
 Layout of the kernel: one thread block = PB patients of one network, LANES threads per patient, the GLU / head matmuls on tensor cores across the
 block's patients. One shared library per shape and launch option, built with nvcc on first use and cached by content hash (CACHE).
@@ -14,7 +20,6 @@ import jax.numpy as jnp
 
 from lethe.core import model as M
 from lethe.core import policy as P
-from lethe.engine import xla as K
 import shutil, threading
 from jax import lax
 
@@ -23,7 +28,100 @@ SRC_FWD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "c
 SRC_ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "casm.cu")
 SMEM_MAX = 101376                     # dynamic shared memory per block (sm_89)
 NQ = 48
-ASM_PREC = K.HI                       # precision of the assembly GEMMs
+DP = M.DMAX_ALL + 1                   # delay line length
+HI = lax.Precision.HIGHEST
+ASM_PREC = HI                         # precision of the assembly GEMMs
+
+
+# ---------------------------------------------------------------- the kernel layout
+def p2(n):
+    return 1 << max(0, int(n) - 1).bit_length()
+
+
+def kp_dims(tp):
+    s = P.shape_of(tp)
+    return dict(H=s["H"], NS=s["NS"], L=s["L"], HD=s["HD"], P=s["P"], Pp=max(8, p2(s["P"])))
+
+
+def s4d_mats(lp, mS=None):
+    """discretized S4D (dA, dB, C) as planes, and the zero-lag tap K0 = 2 Re sum C dB; mS masks the inputs of padded states"""
+    dt, A = M.s4d_A(lp["log_dt"], lp["log_A_re"], lp["A_im"])
+    dA = jnp.exp(dt * A)
+    dB = (dA - 1) / A if mS is None else (dA - 1) / A * mS
+    C = lp["C"][..., 0] + 1j * lp["C"][..., 1]
+    return dict(Ar=jnp.real(dA), Ai=jnp.imag(dA), Br=jnp.real(dB), Bi=jnp.imag(dB), Cr=jnp.real(C), Ci=jnp.imag(C),
+                K0=2 * jnp.sum(jnp.real(C * dB), -1))
+
+
+def to_kp(tp, sz, w_low, rho_u, plain=None):
+    """training-layout params of a network of sizes sz -> kernel layout (differentiable).
+    plain = None: masked layout; True / False: plain layout with / without the head (only for an unpadded network)"""
+    d = kp_dims(tp)
+    ph, ex, ly = tp["phys"], tp["extra"], tp["extra"]["layers"]
+    dt = ph["u0"].dtype
+    mk = P.masks(sz, P.shape_of(tp), dt)
+    pad = lambda v: jnp.pad(v, (0, d["Pp"] - d["P"]))
+    mag = jnp.exp(-jnp.exp(ph["a"]))
+    sc = [ph["u0"][0], ex["dec_b"][0], jnp.asarray(w_low, dt), jnp.asarray(rho_u, dt)]
+    kp = dict(lamr=pad(mag * jnp.cos(ph["b"])), lami=pad(mag * jnp.sin(ph["b"])),
+              Bur=pad(ph["Bu"][:, 0]), Bui=pad(ph["Bu"][:, 1]), Bwr=pad(ph["Bw"][:, 0]), Bwi=pad(ph["Bw"][:, 1]),
+              Cor=pad(ph["Cout"][:, 0]), Coi=pad(ph["Cout"][:, 1]),
+              enc0=ex["enc_W"][0], enc1=ex["enc_W"][1], enc2=ex["enc_W"][2], enc_b=ex["enc_b"], layers=[])
+    if plain is None:
+        kp.update(hW=ex["hW"], hb=ex["hb"], dec=ex["hdec"][:, 0], decl=ex["dec_lin"][:, 0], mH=mk["mH"])
+        sc += [mk["nH"], mk["head"].astype(dt)] + [mk["gate"][l].astype(dt) for l in range(d["L"])]
+    elif plain:
+        kp.update(hW=ex["hW"], hb=ex["hb"], dec=ex["hdec"][:, 0])
+    else:
+        kp["dec"] = ex["dec_lin"][:, 0]
+    kp["sc"] = jnp.stack(sc)
+    for l in range(d["L"]):
+        lp = {k: v[l] for k, v in ly.items()}
+        kp["layers"].append(dict(**s4d_mats(lp, mk["mS"] if plain is None else None), D=lp["D"], Wv=lp["Wv"], Wg=lp["Wg"], bv=lp["bv"],
+                                 bg=lp["bg"], g=lp["ln_g"], beta=lp["ln_b"]))
+    return kp
+
+
+def nsteps(st):
+    """steps of the episode of per-step inputs st (N, B)"""
+    return st["tg"].shape[0]
+
+
+def to_kq(pts):
+    """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
+    B = pts["mu"].shape[0]
+    a = jnp.exp(-M.DT / pts["tau"])
+    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+             **{k: pts[k] for k in ("stim", "stim_t", "stim2", "stim_t2", "stim3", "stim_t3")},
+             dmask=jax.nn.one_hot(pts["delay"], DP, dtype=pts["mu"].dtype))
+    Ad = pts["Ad"].reshape(B, 16)
+    for i in range(16):
+        q[f"A{i}"] = Ad[:, i]
+    for i in range(4):
+        q[f"B{i}"] = pts["Bd"][:, i]
+    wr = lambda t: M.cref(M.C50N, M.GAMMA, M.E0, M.EMAX, t)
+    tg = pts["tgt"].T
+    tgp = jnp.concatenate([tg[:1], tg[:-1]], 0)
+    if "len" in pts:                                                    # variable-length episodes: each patient's own steps, its mean cost
+        N = tg.shape[0]
+        on = jnp.arange(N)[:, None] < pts["len"][None, :]
+        w = jnp.where(on, N / pts["len"][None, :].astype(tg.dtype), 0.0).astype(tg.dtype)
+    else:
+        w = jnp.ones_like(tg)
+    st = dict(z0=pts["z"][:, 0], z1=pts["z"][:, 1], tg=tg, sy=pts["sy"].T, r=wr(tg) / M.C50N, rho=wr(tgp) / wr(tg), w=w)
+    return q, st
+
+
+def block_mats(lp, T):
+    """blocked S4D of one layer over T steps (complex): Wb[..., i] = C dA^(i+1), Wu[..., j] = dB dA^(T-1-j) (H, NS, T), dA^T (H, NS), and the
+    impulse response K[:, m] = 2 Re sum C dB dA^m (H, T)"""
+    dA, dB, C = lp["Ar"] + 1j * lp["Ai"], lp["Br"] + 1j * lp["Bi"], lp["Cr"] + 1j * lp["Ci"]
+    pw = [jnp.ones_like(dA)]
+    for _ in range(T):
+        pw.append(pw[-1] * dA)
+    Pw = jnp.stack(pw, -1)
+    return dict(Wb=C[..., None] * Pw[..., 1:], Wu=dB[..., None] * Pw[..., T - 1::-1], AT=Pw[..., T],
+                K=2 * jnp.real(jnp.sum((C * dB)[..., None] * Pw[..., :T], 1)))
 
 
 def dims(kp):
@@ -190,9 +288,9 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
     ins["L_WgT"] = jnp.swapaxes(ins["L_Wg"], 1, 2)
     ins["q_c"] = pack_q(q)
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "w")])
-    ins["b_K"] = jnp.stack([K.block_mats(lp, T)["K"].T for lp in ly])
+    ins["b_K"] = jnp.stack([block_mats(lp, T)["K"].T for lp in ly])
     ins["b_S4"] = jnp.stack([jnp.stack([lp[k].T for k in ("Ar", "Ai", "Br", "Bi", "Cr", "Ci")]) for lp in ly])    # (L, 6, NS, H): channels fastest
-    at = [K.block_mats(lp, T)["AT"] for lp in ly]
+    at = [block_mats(lp, T)["AT"] for lp in ly]
     ins["b_AT"] = jnp.stack([jnp.stack([jnp.real(a).T, jnp.imag(a).T]) for a in at])                    # dA^T (L, 2, NS, H) for cfwd.cu
     if packed:                                                           # the tensor-core path (the plain weights otherwise)
         for k in [k for k in MM_WEIGHTS if k in ins]:
@@ -205,7 +303,7 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
 
 def outputs(d, B, T, grads, lam, N):
     L, H, NS, HD = d["L"], d["H"], d["NS"], d["HD"]
-    o = dict(lam=(N, B, 6 + 2 * d["PP"] + K.DP), e=(L, N, B, H)) if lam else {}
+    o = dict(lam=(N, B, 6 + 2 * d["PP"] + DP), e=(L, N, B, H)) if lam else {}
     o.update(t_x=(B, N, 2 * L * H), s_l=(L, 2, B, NS, H), s_F=(L, T, B, H))
     if grads:
         o.update(g_sm=(B, nsm(d)), t_a=(L, B, N, H), t_dzv=(L, B, N, H), t_dzg=(L, B, N, H), t_xe=(B, N, H))
@@ -219,7 +317,7 @@ def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam, B, N):
     f = lambda v: f"{float(v)!r}f"
     lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}",
              f"#define HEAD {int(d['HD'] > 0)}",
-             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
+             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {N}", f"#define PB {pb}", f"#define DPAD {DP}", f"#define BN {B}",
              f"#define LANES {lanes}", f"#define TC {int(tc)}", f"#define GRADS {int(grads)}", f"#define LAMOUT {int(lam)}"]
     for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX)):
         lines.append(f"#define {n} {f(v)}")
@@ -265,11 +363,11 @@ def _compile(header, src_path, symbol, prefix):
 
 # ---------------------------------------------------------------- the sweep
 def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, lam=True):
-    """xla.xla_backward(kp, q, st, ftape, T) on the CUDA kernel; grads=True: plus the per-patient gradient sums and tapes (for assemble_tapes);
+    """the backward sweep (blocked S4D adjoint) on the CUDA kernel; grads=True: plus the per-patient gradient sums and tapes (for assemble_tapes);
     lam=False: without lam / e (assemble_tapes does not need them)"""
     d = dims(kp)
     B = q["mu"].shape[0]
-    lanes, N = lanes or default_lanes(d["H"]), K.nsteps(st)
+    lanes, N = lanes or default_lanes(d["H"]), nsteps(st)
     if not valid(d, B, pb, lanes, T, N):
         raise ValueError(f"cbwd: pb={pb} lanes={lanes} T={T} not valid for {d} (shared memory {smem_bytes(d, pb)} B)")
     ins = inputs(kp, q, st, ftape, T, packed=tc and pb % 8 == 0)
@@ -291,10 +389,10 @@ def smem_fwd(d, pb, T):
 
 
 def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
-    """xla.xla_forward(kp, q, st, tape, T) on the CUDA kernel: (tape dict or None, per-patient sums)"""
+    """the forward sweep on the CUDA kernel: (tape dict or None, per-patient sums)"""
     d = dims(kp)
     B = q["mu"].shape[0]
-    lanes, N = lanes or default_lanes(d["H"]), K.nsteps(st)
+    lanes, N = lanes or default_lanes(d["H"]), nsteps(st)
     if not (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and pb % 8 == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024
             and N % T == 0 and smem_fwd(d, pb, T) <= SMEM_MAX):
         raise ValueError(f"cfwd: pb={pb} lanes={lanes} T={T} not valid for {d}")
@@ -303,7 +401,7 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
                                 "q_c", "b_K", "b_S4", "b_AT") if k in full}
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1", "w")]).astype(jnp.float32)
     L, H, NS = d["L"], d["H"], d["NS"]
-    outs = dict(tape=(N, B, 6 + 2 * d["PP"] + K.DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))
+    outs = dict(tape=(N, B, 6 + 2 * d["PP"] + DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))
     name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True, B, N), SRC_FWD, "CfwdHandler", "cfwd")
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s_, jnp.float32) for s_ in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B), wtape=np.int32(1 if tape else 0))
@@ -349,11 +447,11 @@ def casm(tp, btape, ck=None, nt=256):
 
 
 def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, ck=None):
-    """per-patient gradients (as xla.assemble) from backward(..., grads=True): the matrices, sums and S4D moments in one pass over the tapes
+    """per-patient gradients from backward(..., grads=True): the matrices, sums and S4D moments in one pass over the tapes
     (kernels/casm.cu, ck steps per chunk), the S4D-parameter gradients from the moments, then the VJP of the kernel layout. The whole batch at
     once: nothing here grows with the batch beyond the tapes themselves. chunk: unused (the engine's signature)."""
     B = q["mu"].shape[0]
-    kp, kp_vjp = jax.vjp(lambda t: K.to_kp(t, sz, w_low, rho_u, plain), tp)
+    kp, kp_vjp = jax.vjp(lambda t: to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
     d = dims(kp)
     H, L, HD, PP = d["H"], d["L"], d["HD"], d["PP"]
@@ -401,6 +499,24 @@ def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None,
 
 def grads(tp, sz, w_low, rho_u, plain, q, st, ftape, T=10, pb=16, lanes=None, chunk=None):
     """backward with tapes + replay-free assembly in one: the engine's joint candidate (the assembly signature with the kernel's own backward)"""
-    kp = K.to_kp(tp, sz, w_low, rho_u, plain)
+    kp = to_kp(tp, sz, w_low, rho_u, plain)
     bt = backward(kp, q, st, ftape, T, pb=pb, lanes=lanes, grads=True, lam=False)
     return assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, bt, chunk)
+
+
+# ---------------------------------------------------------------- the engine's interface (network parameters and a patient batch)
+def forward_p(tp, sz, w_low, rho_u, plain, pts, tape=True, **opt):
+    q, st = to_kq(pts)
+    return forward(to_kp(tp, sz, w_low, rho_u, plain), q, st, tape=tape, **opt)
+
+
+def backward_p(tp, sz, w_low, rho_u, plain, pts, ftape, **opt):
+    q, st = to_kq(pts)
+    return backward(to_kp(tp, sz, w_low, rho_u, plain), q, st, ftape, **opt)
+
+
+def grads_p(tp, sz, w_low, rho_u, plain, pts, ftape, btape=None, chunk=None, **opt):
+    """the joint backward with tapes and their assembly (btape: unused, the engine's assembly signature)"""
+    q, st = to_kq(pts)
+    return grads(tp, sz, w_low, rho_u, plain, q, st, ftape, chunk=chunk, **opt)
+

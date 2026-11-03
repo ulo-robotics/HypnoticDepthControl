@@ -1,8 +1,8 @@
 """
 Training engine selection: per-patient gradients of a POPULATION of networks (leading member axis on the parameters, sizes and loss weights;
 the patients are shared), either by raw JAX autodiff (vmap of grad through policy.rollout; always available, the fallback and the reference)
-or by the adjoint method of engine/xla.py, whose forward and backward sweeps each run on the fastest VERIFIED implementation:
-  xla      lax.scan sweeps (xla.xla_forward / xla_backward)           always available; per step (the reference) or with the S4D
+or by the adjoint method (lethe/engine/xla), whose forward and backward sweeps each run on the fastest VERIFIED implementation:
+  xla      lax.scan sweeps (xla.forward / xla.backward)                always available; per step (the reference) or with the S4D
                                                                          blocked over T steps (state traffic once per block)
   cblk     CUDA kernels in the blocked layout (engine/cuda.py: kernels/cfwd.cu,    GPU + nvcc; populations, masked and plain layouts
            kernels/cbwd.cu): PB patients per thread block, GLU / head on tensor cores, S4D state touched once per T-step block
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 
 from lethe.core import model as M
 from lethe.core import policy as P
-from lethe.engine import xla as K
+from lethe.engine import xla as X
 
 import lethe
 CACHE = lethe.CACHE
@@ -54,8 +54,8 @@ TAPES_CANDS = [dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, p
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("xla.py", "cuda.py", "kernels/cbwd.cu", "kernels/cfwd.cu", "kernels/casm.cu", "../core/policy.py", "../core/model.py",
-              "__init__.py"):
+    for f in ("xla/__init__.py", "xla/layout.py", "xla/step.py", "xla/sweeps.py", "xla/assemble.py", "cuda.py", "kernels/cbwd.cu",
+              "kernels/cfwd.cu", "kernels/casm.cu", "../core/policy.py", "../core/model.py", "__init__.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):
             h.update(open(p, "rb").read())
@@ -98,10 +98,10 @@ def pop_map(f, n, in_axes):
 # ---------------------------------------------------------------- the sweep implementations
 def sweep_fns(kind, opt):
     if kind == "xla":
-        return partial(K.xla_forward, **opt), partial(K.xla_backward, **opt)
+        return partial(X.forward_k, **opt), partial(X.backward_k, **opt)
     if kind == "cblk":
         from lethe.engine import cuda as C
-        return partial(C.forward, **opt), partial(C.backward, **opt)
+        return partial(C.forward_p, **opt), partial(C.backward_p, **opt)
     raise ValueError(kind)
 
 
@@ -137,16 +137,16 @@ def asm_candidates():
 
 
 def asm_fn(kind, opt):
-    """the gradient assembly: (tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk) -> per-patient gradients"""
+    """the gradient assembly: (tp, sz, w_low, rho_u, plain, pts, ftape, btape, chunk) -> per-patient gradients"""
     if kind == "xla":
-        return K.assemble
+        return X.assemble_k
     if kind == "tapes":                                  # joint: ignores bt (runs its own backward)
         from lethe.engine import cuda as C
-        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: C.grads(tp, sz, w, r, plain, q, st, ft, chunk=chunk, **opt)
+        return partial(C.grads_p, **opt)
     raise ValueError(kind)
 
 
-def _no_backward(kp, q, st, ftape):
+def _no_backward(tp, sz, w_low, rho_u, plain, pts, ftape):
     return {}
 
 
@@ -166,8 +166,43 @@ def population(fn, n):
     return pop_map(fn, n, (0, 0, None, 0, 0))
 
 
+def adjoint_grads(tp, sz, pts, w_low, rho_u, plain=None, forward=X.forward_k, backward=X.backward_k, chunk=None, assembly=X.assemble_k):
+    """per-patient gradients, loss and J of one network with the given sweeps and assembly (the backends' common interface)"""
+    ftape, sums = forward(tp, sz, w_low, rho_u, plain, pts)
+    btape = backward(tp, sz, w_low, rho_u, plain, pts, ftape)
+    N = pts["z"].shape[0]
+    return assembly(tp, sz, w_low, rho_u, plain, pts, ftape, btape, chunk), sums["cost"] / N, sums["se"] / N
+
+
 def adjoint_fn(fwd, bwd, plain, chunk, asm=None):
-    return partial(K.adjoint_grads, plain=plain, forward=fwd, backward=bwd, chunk=chunk, assembly=asm)
+    return partial(adjoint_grads, plain=plain, forward=fwd, backward=bwd, chunk=chunk, assembly=asm or X.assemble_k)
+
+
+def _fwd_call(f, plain, pts, tp, sz, w_low, rho_u):
+    return f(tp, sz, w_low, rho_u, plain, pts)
+
+
+def _bwd_call(f, plain, pts, tp, sz, w_low, rho_u, ft):
+    return f(tp, sz, w_low, rho_u, plain, pts, ft)
+
+
+def _asm_call(f, plain, pts, chunk, tp, sz, w_low, rho_u, ft, bt):
+    return f(tp, sz, w_low, rho_u, plain, pts, ft, bt, chunk)
+
+
+def fwd_pop(f, plain, pts, n):
+    """a forward sweep f over a population: (tp, sz, w_low, rho_u) with the member axis -> (tapes, sums) with the member axis"""
+    return pop_map(partial(_fwd_call, f, plain, pts), n, (0, 0, 0, 0))
+
+
+def bwd_pop(f, plain, pts, n):
+    """a backward sweep over a population: (tp, sz, w_low, rho_u, forward tape)"""
+    return pop_map(partial(_bwd_call, f, plain, pts), n, (0, 0, 0, 0, 0))
+
+
+def asm_pop(f, plain, pts, chunk, n):
+    """an assembly over a population: (tp, sz, w_low, rho_u, forward tape, backward tape)"""
+    return pop_map(partial(_asm_call, f, plain, pts, chunk), n, (0,) * 6)
 
 
 def _chunk(tp, n):
@@ -283,21 +318,18 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
     executable (run time does not depend on the patients). Returns the decision record (engine raw when no adjoint path works)"""
     t0 = time.perf_counter()
     chk = M.sample_patients(jax.random.PRNGKey(4242), B, dict(M.VAL["nominal"][0], T=minutes))
-    kp = pop_map(lambda t, s, w, r: K.to_kp(t, s, w, r, plain), n, (0, 0, 0, 0))(tp, sz, w_low, rho_u)
-    q, st = K.to_kq(chk)
-    sweeps = lambda f, tape: pop_map(lambda k_, t_=None: f(k_, q, st) if t_ is None else f(k_, q, st, t_), n, (0,) if tape is None else (0, 0))
-    ft_shape = jax.eval_shape(sweeps(K.xla_forward, None), kp)[0]
-    bt_shape = jax.eval_shape(sweeps(K.xla_backward, 1), kp, ft_shape)
+    net = (tp, sz, w_low, rho_u)                                         # the members' arguments of every sweep
+    ft_shape = jax.eval_shape(fwd_pop(X.forward_k, plain, chk, n), *net)[0]
+    bt_shape = jax.eval_shape(bwd_pop(X.backward_k, plain, chk, n), *net, ft_shape)
     jobs, later = {}, {}
     for kind, opt in cands:
         fwd, bwd = sweep_fns(kind, opt)
-        jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
+        jobs[(kind, repr(opt), "fwd")] = (fwd_pop(fwd, plain, chk, n), net)
         # a CUDA backward alone is needed only when no joint backward + assembly works: built then (each is an nvcc build)
-        (later if kind == "cblk" else jobs)[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
+        (later if kind == "cblk" else jobs)[(kind, repr(opt), "bwd")] = (bwd_pop(bwd, plain, chk, n), net + (ft_shape,))
     for kind, opt in acands:
         af = asm_fn(kind, opt)
-        jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
-                                          (tp, sz, w_low, rho_u, ft_shape, bt_shape))
+        jobs[("asm", kind, repr(opt))] = (asm_pop(af, plain, chk, chunk, n), net + (ft_shape, bt_shape))
     exe = _compile_jobs(jobs)
     t_compile = time.perf_counter() - t0
 
@@ -321,8 +353,8 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
 
     ft = bt = None
     try:
-        _, (ft, s) = timed(("xla", "{}", "fwd"), kp)
-        _, bt = timed(("xla", "{}", "bwd"), kp, ft)
+        _, (ft, s) = timed(("xla", "{}", "fwd"), *net)
+        _, bt = timed(("xla", "{}", "bwd"), *net, ft)
     except Exception as e:
         log(f"[engine] XLA reference sweeps unavailable ({type(e).__name__}): raw JAX")
         ft = None
@@ -330,13 +362,13 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
     if ft is not None:
         for kind, opt in cands:                        # one candidate's outputs at a time (checked, then released)
             try:
-                tf, (ft2, s2) = timed((kind, repr(opt), "fwd"), kp)
+                tf, (ft2, s2) = timed((kind, repr(opt), "fwd"), *net)
                 err_f = max([_rel(ft2["c"][k], ft["c"][k]) for k in ft["c"]] + [_rel(a, b) for a, b in zip(ft2["ys"], ft["ys"])] +
                             [_rel(s2["cost"], s["cost"])])
                 del ft2, s2
                 tb, err_b = float("inf"), 0.0                          # (deferred: see later)
                 if (kind, repr(opt), "bwd") in exe:
-                    tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+                    tb, bt2 = timed((kind, repr(opt), "bwd"), *net, ft)
                     err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
                     del bt2
             except Exception as e:
@@ -378,7 +410,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
                 if (kind, repr(opt), "bwd") not in exe:
                     continue
                 try:
-                    tb, bt2 = timed((kind, repr(opt), "bwd"), kp, ft)
+                    tb, bt2 = timed((kind, repr(opt), "bwd"), *net, ft)
                     err_b = max([_rel(bt2["lam"][k], bt["lam"][k]) for k in bt["lam"]] + [_rel(a, b) for a, b in zip(bt2["e"], bt["e"])])
                     del bt2
                 except Exception as e:
@@ -432,7 +464,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
             log("[engine] gradient assembly unavailable: raw JAX")
     rec["tune_s"] = time.perf_counter() - t0
     rec["compile_s"] = t_compile
-    del exe, later, kp, ft, bt, res, timed, chk
+    del exe, later, net, ft, bt, res, timed, chk
     gc.collect()                                                    # every candidate's executable and outputs released before the next stage
     return rec
 
@@ -498,7 +530,6 @@ def forward_stats_fn(rec, plain=None):
     fwd = sweep_fns(*rec["fwd"])[0]
 
     def f(tp, sz, pts):
-        q, st = K.to_kq(pts)
-        _, s = fwd(K.to_kp(tp, sz, 0.0, 0.0, plain), q, st, tape=False)
-        return s["se"] / K.nsteps(st), s["viol"] / K.nsteps(st)
+        _, s = fwd(tp, sz, 0.0, 0.0, plain, pts, tape=False)
+        return s["se"] / pts["z"].shape[0], s["viol"] / pts["z"].shape[0]
     return f

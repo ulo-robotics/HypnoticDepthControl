@@ -47,7 +47,7 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
 | `lethe/core/policy.py` | prior design, parameter init, the policy step, the differentiable closed loop (`rollout`), `load_model` |
 | `lethe/train/trainer.py` | configuration space, optimizers / learning-rate rules, per-patient clipping, the population trainer (many configurations as one program), validation |
 | `lethe/train/train.py`, `search.py`, `finetune.py` | train one configuration; the meta-optimization; the fine-tuning of its winner |
-| `lethe/engine/` | the gradient engines: selection (`__init__.py`), the XLA reference (`xla.py`), the blocked CUDA engine (`cuda.py`, `kernels/*.cu`) |
+| `lethe/engine/` | the gradient engines: selection (`__init__.py`), the XLA reference (`xla/`), the blocked CUDA engine (`cuda.py`, `kernels/*.cu`) |
 | `lethe/baselines/classic.py` | PID, UKF+LQR (with Hill-slope estimation), UKF-MM (delay-aware multiple-model UKF+LQR with adaptive noise) and its tuning, oracle certainty equivalence |
 | `lethe/baselines/mpc.py`, `parallel.py` | MPC-MM and MHE+NMPC (CasADi + IPOPT, optional); closed loops in parallel processes |
 | `lethe/evaluate.py` | trained policies vs the baselines on the same fresh patients, paired differences, per-patient metrics, figure |
@@ -83,8 +83,10 @@ population of networks (one network in `train.py`) in one of two ways:
 - **Raw JAX:** `vmap(grad)` through `policy.rollout`. Always available; the reference, and the fallback.
 - **Adjoint:** exact up to float32 rounding.
   - A forward sweep writes a tape (the small carry and the S4D outputs per step); a backward sweep propagates only the carry and S4D adjoints.
-  - The XLA reference (`xla.py`) runs both sweeps as scans (per step, or with the S4D blocked over T steps) and turns the tapes into every
-    per-patient parameter gradient at once: one batched VJP over all (step, patient) pairs, plus an FFT cross-correlation for the S4D kernels.
+  - The XLA reference (`xla/`, plain JAX on pytrees: complex states, every function at module level and jitted) runs both sweeps as scans
+    (per step, or with the S4D blocked over T steps: an inner scan per block, a Toeplitz contraction for the inputs within the block) and
+    turns the tapes into every per-patient parameter gradient: per patient one VJP of the replayed step over all its steps, plus an FFT
+    cross-correlation for the S4D kernels. The backends exchange tapes in the CUDA kernels' format, so their sweeps combine freely.
   - The blocked CUDA engine (`cuda.py`) keeps a thread block of 8–32 patients: the GLU and head matmuls run on tensor cores across them
     (3xTF32: float32 accuracy up to rounding), and the S4D state stays in global memory, touched once per T-step block. Its backward also
     writes the per-step cotangents, and `kernels/casm.cu` assembles the whole gradient from them in one pass, without replaying the steps.
@@ -196,8 +198,8 @@ CasADi's thread map serializes IPOPT, so `evaluate.py` runs them in spawned proc
 - **Float64, CPU:** the untrained policy equals an independent numpy implementation of the prior compensator; the training closed loop equals
   the numpy reference plant step by step; the pathwise gradient matches finite differences; the mean of per-patient gradients equals the
   batch gradient; episode lengths are data (a patient's own length only weights its cost); a saved model with the earlier 4-input encoder
-  converts to the same policy; the adjoint gradients (per-step and blocked XLA sweeps) equal raw autodiff per patient, in the plain and the
-  masked layout; padding is exact (zero gradients on the padding); a population equals its members trained alone; UKF-MM with one observer
+  converts to the same policy; the adjoint gradients (per-step and blocked XLA sweeps) equal raw autodiff per patient, also through the
+  engine interface (the CUDA kernels' tape format); padding is exact (zero gradients on the padding); a population equals its members trained alone; UKF-MM with one observer
   of delay 0 equals UKF+LQR; the MPC baselines run; the C++ engine and the ONNX graph agree with the JAX policy in closed loop.
 - **Float32, GPU** (`pytest -m gpu`, a process of its own): every CUDA sweep and assembly candidate equals the XLA references, per tape and
   per patient and parameter, for three single networks and a padded population.
