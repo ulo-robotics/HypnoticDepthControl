@@ -5,12 +5,16 @@ Meta-optimization of the policy's training configuration (the procedure of the p
   1. prior screen    score --prior-screen prior designs (q_theta, sy_scale, rho_lqr, q_x) at iteration 0 (forward only: the untrained policy
                      IS the prior compensator) and keep the best --prior-keep share as the pool the trials draw their prior design from
   2. trials          --trials configurations: trial 0 = trainer.SEARCH_BASE, the rest a scrambled Sobol sequence over trainer.SPACE
-  3. rungs           successive halving: train every trial to the rung budget (--rungs, cumulative iterations), score its EMA on new patients
-                     (a fresh validation key per rung), keep the best 1/--eta (at least --final-top)
+  3. rungs           successive halving: train every trial to the rung budget (--rungs, cumulative iterations), keep the best 1/--eta (at
+                     least --final-top). A trial's score is that of its best snapshot so far: every --eval-every iterations its EMA is
+                     validated on new patients (a new key at every evaluation point, the same patients for every trial), and at the end of a
+                     rung on the rung's own validation key; the best EMA is kept (<out>/store/b<id>.pkl). --eval-every 0: the EMA at the end
+                     of the rung only
   4. final stage     the --final-top survivors continue for --final-iters with --final-seeds training-data seeds each (seed copies share the
                      trial's state at the start of the stage)
-  5. re-rank / test  all final models on a fresh key with --rerank-batch patients per scenario, the configuration with the best mean over seeds
-                     wins (its best seed is the model); the winner is scored ONCE on the test key against the untrained base prior
+  5. re-rank / test  the best snapshots of all final models on a fresh key with --rerank-batch patients per scenario, the configuration with
+                     the best mean over seeds wins (its best seed is the model); the winner is scored ONCE on the test key against the
+                     untrained base prior
 All trials see the same training patients (common random numbers). Score = weighted mean over model.VAL of J + 2 viol (lower is better).
 Training and scoring use the fixed stimulus (--stimulus, model.STIM_FIXED); finetune.py then moves the winner to the random one.
 
@@ -38,7 +42,7 @@ AHEAD = 2                                     # populations prepared ahead of th
 def _keys():
     import jax
     from lethe.train import trainer as T
-    return dict(val=T.VAL_KEY, rerank=jax.random.PRNGKey(424242), test=jax.random.PRNGKey(99999))
+    return dict(val=T.VAL_KEY, rerank=jax.random.PRNGKey(424242), test=jax.random.PRNGKey(99999), snap=jax.random.fold_in(T.VAL_KEY, 777))
 
 
 def screen(designs, n, stimulus):
@@ -151,6 +155,21 @@ class Search:
 
     def spath(self, t):
         return os.path.join(self.store, f"t{t['id']}.pkl")
+
+    def bpath(self, t):
+        """the trial's best snapshot (its EMA, training layout)"""
+        return os.path.join(self.store, f"b{t['id']}.pkl")
+
+    def keep_best(self, g, pop, res, it, tag):
+        """record each trial's validation (per, score) of iteration it; a new best saves the trial's EMA"""
+        from lethe.train import trainer as T
+        states = None
+        for i, (t, (per, sc)) in enumerate(zip(g, res)):
+            sc = float(sc)
+            if np.isfinite(sc) and sc < t.get("best_score", float("inf")):
+                states = states or pop.member_states()
+                T.save(dict(ema=states[i]["ema"], it=it), self.bpath(t))
+                t.update(best_score=sc, best_it=it, best_per=per)
 
     # ---- phases
     def prior_screen(self, SPACE, BASE, PRIOR_KEYS):
@@ -279,18 +298,29 @@ class Search:
         from lethe.train import trainer as T
         t1, it0 = time.time(), pop.it
 
-        def ckpt(it, m, dt):
+        every = self.a.eval_every
+
+        def on_block(it, m, dt):
+            if every and it % every == 0 and it < budget:                               # a snapshot candidate (fresh patients)
+                res = pop.validate(jax.random.fold_in(_keys()["snap"], it))
+                self.keep_best(g, pop, res, it, tag)
+                for t, (_, sc) in zip(g, res):
+                    self.log(dict(trial=t["id"], stage=tag, it=it, snap_score=float(sc)))
             if it % 500 == 0 and it < budget:                                           # a crash loses at most 500 iterations
                 for t, st in zip(g, pop.member_states()):
                     T.save(st, self.spath(t))
-        pop.train_to(budget, on_block=ckpt)
+        pop.train_to(budget, on_block=on_block)
         t2 = time.time()
         res = pop.validate(jax.random.fold_in(_keys()["val"], val_idx))
+        if every:
+            self.keep_best(g, pop, res, budget, tag)                                     # the end of the rung is a candidate too
         for t, st, (per, sc) in zip(g, pop.member_states(), res):
             T.save(st, self.spath(t))
             failed = not np.isfinite(sc)
-            t.update(it=st["it"], score=float(sc) if not failed else float("inf"), per=per, failed=failed, done=tag)
-            self.log(dict(trial=t["id"], stage=tag, it=t["it"], score=t["score"], cfg=t["cfg"], per=per, engine=pop.engine.get("engine")))
+            score = t.get("best_score", float("inf")) if every else (float(sc) if not failed else float("inf"))
+            t.update(it=st["it"], end_score=float(sc), score=score, per=t.get("best_per", per) if every else per, failed=failed, done=tag)
+            self.log(dict(trial=t["id"], stage=tag, it=t["it"], score=t["score"], end_score=t["end_score"], best_it=t.get("best_it"),
+                          cfg=t["cfg"], per=t["per"], engine=pop.engine.get("engine")))
         self.save()
         e = pop.engine
         eng = f"{e['fwd'][0]}/{e['bwd'][0]}" if e.get("engine") == "adjoint" else e.get("engine")
@@ -333,8 +363,10 @@ class Search:
                 keep = a.final_top if r == len(rungs) - 1 else max(a.final_top, int(math.ceil(len(trials) / a.eta)))
                 survivors = [t for t in trials[:keep] if not t.get("failed")]
                 for t in trials:
-                    if t not in survivors and os.path.exists(self.spath(t)):
-                        os.remove(self.spath(t))
+                    if t not in survivors:
+                        for f in (self.spath(t), self.bpath(t)):
+                            if os.path.exists(f):
+                                os.remove(f)
                 for t in survivors[:5]:
                     c = t["cfg"]
                     print(f"  top: trial {t['id']:5d} score {t['score']:8.3f}  {c['opt']} {c['sched']} lr {c['lr']:.1e} "
@@ -347,6 +379,8 @@ class Search:
                 for t in list(trials):
                     cid = t["id"] + s * SEED_STRIDE
                     shutil.copyfile(self.spath(t), os.path.join(self.store, f"t{cid}.pkl"))
+                    if os.path.exists(self.bpath(t)):                                    # the same history so far: the same best snapshot
+                        shutil.copyfile(self.bpath(t), os.path.join(self.store, f"b{cid}.pkl"))
                     copies.append(dict(t, id=cid, seed=s, parent=t["parent"], done=None))
             trials += copies
             self.save(phase="final", final_start=rungs[-1])
@@ -366,7 +400,8 @@ class Search:
         from lethe.train import trainer as T
         a = self.a
         live = [t for t in trials if not t.get("failed")]
-        models = [P.shrink(pickle.load(open(self.spath(t), "rb"))["ema"], t["cfg"]) for t in live]
+        snap = lambda t: self.bpath(t) if a.eval_every and os.path.exists(self.bpath(t)) else self.spath(t)
+        models = [P.shrink(pickle.load(open(snap(t), "rb"))["ema"], t["cfg"]) for t in live]
         w = np.array([M.VAL[s][1] for s in M.VAL])
         comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
         sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True,
@@ -386,7 +421,7 @@ class Search:
         test = np.stack([comb(st) for st in T.evaluate([models[bi], P.init_params(jax.random.PRNGKey(0), dict(BASE, **fix))], a.test_batch,
                                                         _keys()["test"], per_patient=True, stimulus=M.score_stimulus(a.stimulus))])
         d = test[1] - test[0]
-        res = dict(best_model=best["id"], best_parent=best["parent"], cfg=best["cfg"], iters=best["it"],
+        res = dict(best_model=best["id"], best_parent=best["parent"], cfg=best["cfg"], iters=best["it"], snapshot_it=best.get("best_it"),
                    rerank=[dict(id=t["id"], parent=t["parent"], seed=t["seed"], mean=float(mean[i]), se=float(se[i]),
                                 diff_vs_best=float((sc[i] - sc[bi]).mean())) for i, t in enumerate(live)], configs=rows,
                    test_score=float(test[0].mean()), base_prior_score=float(test[1].mean()),
@@ -438,6 +473,8 @@ def main():
     ap.add_argument("--prior-keep", type=float, default=0.25)
     ap.add_argument("--pop", type=int, default=8, help="trials per population (at most; a population that does not fit is split)")
     ap.add_argument("--block", type=int, default=100, help="training iterations per jitted call")
+    ap.add_argument("--eval-every", type=int, default=100, help="snapshot validation every N iterations (a multiple of --block; 0: score the "
+                    "EMA at the end of each rung only)")
     ap.add_argument("--no-pad-pop", dest="pad_pop", action="store_false", help="pad a population only to the next power of two (fewer discarded "
                     "copies in a rung's last population, but one more program and engine choice per population size)")
     ap.add_argument("--seed", type=int, default=0, help="Sobol scrambling seed")
@@ -452,6 +489,9 @@ def main():
         args.trials, args.rungs, args.final_iters, args.final_seeds, args.batch, args.block = 6, "20,40", 20, 2, 32, 10
         args.val_batch, args.rerank_batch, args.test_batch, args.prior_screen = 64, 64, 64, 16
         args.fix = (args.fix or []) + ["H=16", "NS=8", "L=1"]
+        args.eval_every = 10 if args.eval_every else 0
+    if args.eval_every % args.block:
+        args.eval_every = -(-args.eval_every // args.block) * args.block               # on block boundaries
     os.makedirs(args.out, exist_ok=True)
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))     # docker stop / kill: same as Ctrl-C
     try:

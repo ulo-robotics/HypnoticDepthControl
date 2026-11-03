@@ -154,9 +154,10 @@ change nothing clinically (p99 |du| 7e-5 / 1.3e-4 mg/min).
 `search.py` follows the procedure used for the paper:
 1. **Prior screen.** Score 4096 prior designs at iteration 0 and keep the best 25 % as the pool for the trials' prior design.
 2. **Trials.** 1025 trials: trial 0 is the base configuration, the rest a scrambled Sobol sequence over `trainer.SPACE`.
-3. **Successive halving.** Rungs at 300 / 900 / 2700 iterations, η = 3, each rung scored on its own fresh validation key.
+3. **Successive halving.** Rungs at 300 / 900 / 2700 iterations, η = 3. A trial is ranked by its best snapshot: its EMA is validated every
+   100 iterations on new patients (and at the end of each rung on the rung's own key), and the best EMA is kept.
 4. **Final stage.** The top 3 configurations continue for 3000 iterations with 3 training-data seeds each.
-5. **Re-rank and test.** All final models are re-ranked on a fresh key with 4096 patients per scenario; the configuration with the best mean
+5. **Re-rank and test.** The best snapshots of all final models are re-ranked on a fresh key with 4096 patients per scenario; the configuration with the best mean
    over seeds wins. The winner is scored once on the test key against the untrained base prior.
 6. **Fine-tuning** (`finetune.py`). The winner continues for 3000 iterations from its EMA weights with a fresh optimizer state, as one
    population of learning-rate × schedule variants. Each variant's best validated snapshot and the unchanged winner are re-ranked on a fresh
