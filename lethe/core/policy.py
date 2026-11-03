@@ -53,6 +53,11 @@ def design_prior(q_theta, sy_scale, rho_lqr, q_x):
     return dict(lam=lam, Bu=(Vinv @ B5)[:, 0], Bw=(Vinv @ Lg)[:, 0], Cout=-(Kfull @ V)[0], u0=float((M.NOM["Cl1"] + K.sum()) * M.C50N))
 
 
+# S4D step sizes at init, log-uniform: with A_re = -0.5 a mode decays in DT / (0.5 dt), so 10 s (dt = 1, fast enough for the monitor delays of
+# up to 60 s) to the 30-min bound (model.TAU_MAX)
+DT_MIN, DT_MAX = 1e-3, 1.0
+
+
 def init_params(key, cfg):
     """untrained policy for the config (architecture sizes + prior design), compact layout; its output equals the prior compensator.
     n_extra > 0 adds physics modes with time constants 2..400 min, random input gains and zero output (so the output is unchanged)."""
@@ -77,7 +82,7 @@ def init_params(key, cfg):
     for i in range(L):
         k1, k2, k3, k4 = ks[2 + 4 * i: 6 + 4 * i]
         layers.append(dict(
-            log_dt=jax.random.uniform(k1, (H,)) * (math.log(1e-1) - math.log(1e-3)) + math.log(1e-3),
+            log_dt=jax.random.uniform(k1, (H,)) * (math.log(DT_MAX) - math.log(DT_MIN)) + math.log(DT_MIN),
             log_A_re=jnp.full((H, NS), math.log(0.5)), A_im=math.pi * jnp.tile(jnp.arange(NS, dtype=jnp.float32), (H, 1)),
             C=nrm(k3, (H, NS, 2), NS ** -0.5), D=nrm(k4, (H,), 1.0),
             W_mix=nrm(k2, (H, 2 * H), H ** -0.5), b_mix=jnp.zeros(2 * H), ln_g=jnp.ones(H), ln_b=jnp.zeros(H)))

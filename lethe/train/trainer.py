@@ -262,6 +262,7 @@ class Population:
     def __init__(self, cfgs, states, train_key, shape=None, opt_names=None, val_batch=1024, iters_hint=None, block=100, log=print,
                  engine=None, full_tune=False):
         """engine, full_tune: see engine.select (mode, full_tune)"""
+        cfgs = [{**SETUP, **c} for c in cfgs]                           # a configuration saved before a setup key existed: its default
         self.cfgs, self.n, self.log, self.block, self.key = cfgs, len(cfgs), log, block, train_key
         self.setup = {k: cfgs[0][k] for k in SETUP}
         assert all({k: c[k] for k in SETUP} == self.setup for c in cfgs), "members must share the training setup"
