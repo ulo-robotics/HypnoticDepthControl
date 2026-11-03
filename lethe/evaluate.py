@@ -19,7 +19,8 @@ import jax.numpy as jnp
 
 from lethe.core import model as M
 from lethe.core import policy as P
-from lethe.baselines import classic as BL
+import lethe.baselines as BL
+from lethe.baselines import classic
 
 jax.config.update("jax_default_matmul_precision", "highest")    # float32 matmuls (not TF32): the policy computes what it was trained on
 EVAL_KEY = jax.random.PRNGKey(8_000_000)
@@ -46,7 +47,9 @@ def main():
     ap.add_argument("--prior", action="store_true", help="also the untrained policy (prior compensator) of the model's config")
     ap.add_argument("--extra", action="append", default=[], help="name=path: another model on the same patients")
     ap.add_argument("--stim-times", default="", help="comma separated times (min): a scenario with a stimulus of 0.3 at each")
-    ap.add_argument("--baselines", default=",".join(BL.BASELINES), help="comma separated, from: " + ", ".join(BL.BASELINES))
+    ap.add_argument("--baselines", default=",".join(classic.BASELINES), help="comma separated, from: " + ", ".join(BL.BASELINES) +
+                    " (the MPC ones in parallel processes; CasADi)")
+    ap.add_argument("--workers", type=int, default=None, help="processes for the MPC baselines (default: CPUs - 2)")
     ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.model)), "eval")
@@ -79,7 +82,7 @@ def main():
             per[cname] = M.metrics(b, u, pn["tgt"])
             curves[sname][cname] = (b, u)
         for cname in names:
-            b, u = M.run_numpy(BL.BASELINES[cname](), pn)
+            b, u = BL.run(cname, pn, args.workers)
             per[cname] = M.metrics(b, u, pn["tgt"])
             curves[sname][cname] = (b, u)
         np.savez(os.path.join(out, f"{sname}.npz"), **{f"{c}__{k}": v for c, d in per.items() for k, v in d.items()})

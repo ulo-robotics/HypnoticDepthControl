@@ -148,8 +148,10 @@ class UKFMM(UKFLQR):
         self.d = np.tile(self.dset, B)
         self.row = np.arange(B * Mo) // Mo                        # the patient of each observer (row of uh)
 
-    def act(self, k, y):
-        B, Mo, n = self.B, len(self.dset), self.z.shape[1]
+    def estimate(self, k, y):
+        """the observers' update with reading y at step k: (present PK states by the Smith predictor (B * Mo, 4), log C50 (B * Mo), gamma
+        (the nominal one, or (B * Mo,) when estimated), the observers' probabilities (B, Mo)). Rows are patient-major."""
+        B, Mo = self.B, len(self.dset)
         j = np.maximum(0, k - self.d)                             # the step each observer's state refers to
         adv = k - self.d >= 1                                     # j advanced at this step (by one, once k > d)
         up = self.uh[self.row, np.maximum(j - 1, 0)]
@@ -179,7 +181,6 @@ class UKFMM(UKFLQR):
         if self.est_gamma:
             self.z[:, 5] = np.clip(self.z[:, 5], np.log(0.7), np.log(10.0))
             g = np.exp(self.z[:, 5])
-        cr = M.cref(np.exp(self.z[:, 4]), g, M.E0, M.EMAX, np.repeat(self.tgt[:, k], Mo))
         # Smith predictor: the PK part forward over u_j .. u_(k-1), m = min(k, d) steps: Ad^m x + sum_s Ad^(m-1-s) Bd u_(j+s), per m
         m = np.minimum(k, self.d)
         xf = self.z[:, :4].copy()
@@ -187,10 +188,16 @@ class UKFMM(UKFLQR):
             i = np.flatnonzero(m == mv)
             U = self.uh[self.row[i, None], j[i, None] + np.arange(mv)]
             xf[i] = self.z[i, :4] @ self.Apow[mv].T + U @ self.Gpow[mv]
-        um = (M.NOM["Cl1"] * cr - np.sum(self.K * (xf - cr[:, None]), 1)).reshape(B, Mo)
         p = np.exp(self.ll - self.ll.max(1, keepdims=True))
         p = np.maximum(p / p.sum(1, keepdims=True), self.pfloor)
-        p = p / p.sum(1, keepdims=True)
+        return xf, self.z[:, 4], g, p / p.sum(1, keepdims=True)
+
+    def act(self, k, y):
+        """the probability-weighted mixture of the observers' LQR laws"""
+        B, Mo = self.B, len(self.dset)
+        xf, lc, g, p = self.estimate(k, y)
+        cr = M.cref(np.exp(lc), g, M.E0, M.EMAX, np.repeat(self.tgt[:, k], Mo))
+        um = (M.NOM["Cl1"] * cr - np.sum(self.K * (xf - cr[:, None]), 1)).reshape(B, Mo)
         u = np.clip(np.sum(p * um, 1), 0, M.UMAX)
         self.uh[:, k] = u
         return u
