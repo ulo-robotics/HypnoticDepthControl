@@ -29,7 +29,7 @@ namespace ffi = xla::ffi;
 #define S_TAPE (6 + 2 * P5P + DPAD)
 #define DPL ((DPAD + LANES - 1) / LANES)                      // delay-line entries per lane: entry lane + LANES j
 
-#define NSM (6 * HP + HDP + 8 * P5P + 2 + 2 * LP * HP)          // packed per-patient small gradients (GRADS)
+#define NSM (5 * HP + HDP + 8 * P5P + 2 + 2 * LP * HP)          // packed per-patient small gradients (GRADS)
 #define WX (2 * LP * HP)                                       // row of t_x
 
 static_assert(NSP % PD == 0, "cbwd: the S4D modes come in groups of PD");
@@ -187,7 +187,7 @@ __device__ __forceinline__ void mmx(const float* X, const float* W, const float*
 }
 
 // member vectors in shared memory (HP each)
-enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_encW3, V_dec_lin, NV_TOP };
+enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_dec_lin, NV_TOP };
 #define VL(l, k) (NV_TOP + (l) * 5 + (k))                 // per layer: D, bv, bg, ln_g, ln_b
 #define NV (NV_TOP + 5 * LP)
 // per-patient constants (cbwd.py pack_q)
@@ -218,7 +218,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
     float x;
     if (v == V_mH) x = LD(mH, g * HP + h);
     else if (v == V_enc_b) x = LD(enc_b, g * HP + h);
-    else if (v <= V_encW3) x = LD(encW, ((size_t)g * 4 + (v - V_encW0)) * HP + h);
+    else if (v <= V_encW2) x = LD(encW, ((size_t)g * 3 + (v - V_encW0)) * HP + h);
     else if (v == V_dec_lin) x = LD(dec_lin, g * HP + h);
     else {
       const int l = (v - NV_TOP) / 5, kk = (v - NV_TOP) % 5;
@@ -244,13 +244,13 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
 #define STX(i, v) (SX[i] = (v))                        // fp32: split into TF32 hi / lo where the tensor cores read it
 
 #if GRADS
-  float a_encW[4][CH], a_encb[CH], a_decl[CH], a_lng[LP][CH], a_lnb[LP][CH], a_hdec[CHD], a_p5[8][CP5];
+  float a_encW[3][CH], a_encb[CH], a_decl[CH], a_lng[LP][CH], a_lnb[LP][CH], a_hdec[CHD], a_p5[8][CP5];
   float a_decb = 0.f, a_u0 = 0.f;
 #pragma unroll
   for (int j = 0; j < CH; j++) {
     a_encb[j] = 0.f; a_decl[j] = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; i++) a_encW[i][j] = 0.f;
+    for (int i = 0; i < 3; i++) a_encW[i][j] = 0.f;
 #pragma unroll
     for (int l = 0; l < LP; l++) { a_lng[l][j] = 0.f; a_lnb[l][j] = 0.f; }
   }
@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
       const float wpow = C50N_ * powf(ratio, 1.f / GAMMA_);
       const float w = fminf(wpow, 3.f * C50N_);
       const float ri = __frcp_rn(r);
-      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = 0.f, f3 = w * ri * (1.f / C50N_) - 1.f;
+      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = w * ri * (1.f / C50N_) - 1.f;
       float ul = 0.f;
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -356,7 +356,7 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
       float xx[CH];
 #pragma unroll
       for (int j = 0; j < CH; j++)
-        xx[j] = f0 * SVv(V_encW0, j) + f1 * SVv(V_encW1, j) + f2 * SVv(V_encW2, j) + f3 * SVv(V_encW3, j) + SVv(V_enc_b, j);
+        xx[j] = f0 * SVv(V_encW0, j) + f1 * SVv(V_encW1, j) + f2 * SVv(V_encW2, j) + SVv(V_enc_b, j);
       // ======== forward recompute: residual layers (S4D outputs from the tape) ========
 #pragma unroll
       for (int l = 0; l < LP; l++) {
@@ -598,14 +598,14 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
         }
       }
       // encoder
-      float pf[4] = {0.f, 0.f, 0.f, 0.f};
+      float pf[3] = {0.f, 0.f, 0.f};
 #if GRADS
-      const float fv[4] = {f0, f1, f2, f3};
+      const float fv[3] = {f0, f1, f2};
 #endif
 #pragma unroll
       for (int j = 0; j < CH; j++) {
 #pragma unroll
-        for (int ii = 0; ii < 4; ii++) {
+        for (int ii = 0; ii < 3; ii++) {
 #if GRADS
           a_encW[ii][j] += d_xx[j] * fv[ii];
 #endif
@@ -615,10 +615,10 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
         a_encb[j] += d_xx[j];
 #endif
       }
-      const float d_f0 = AR(pf[0]), d_f1 = AR(pf[1]), d_f3 = AR(pf[3]);
+      const float d_f0 = AR(pf[0]), d_f1 = AR(pf[1]), d_f2 = AR(pf[2]);
       float d_y = d_f0 * 0.02f;
       const float d_up = d_f1 * ri * (1.f / UMAX_);
-      d_w += d_f3 * ri * (1.f / C50N_);
+      d_w += d_f2 * ri * (1.f / C50N_);
       // monitor
       const float d_wpow = d_w * d_min(wpow, 3.f * C50N_);
       const float d_ratio = d_wpow * wpow * (1.f / GAMMA_) / ratio;     // C50 ratio^(1/gamma - 1) = wpow / ratio
@@ -714,28 +714,28 @@ __global__ void __launch_bounds__(NT, 1) cbwd_kernel(Args A) {
   for (int j = 0; j < CH; j++) {
     const int h = lane + LANES * j;
 #pragma unroll
-    for (int ii = 0; ii < 4; ii++) gs[ii * HP + h] = a_encW[ii][j];
-    gs[4 * HP + h] = a_encb[j];
-    gs[5 * HP + h] = a_decl[j];
+    for (int ii = 0; ii < 3; ii++) gs[ii * HP + h] = a_encW[ii][j];
+    gs[3 * HP + h] = a_encb[j];
+    gs[4 * HP + h] = a_decl[j];
 #pragma unroll
     for (int l = 0; l < LP; l++) {
-      gs[6 * HP + HDP + 8 * P5P + 2 + l * HP + h] = a_lng[l][j];
-      gs[6 * HP + HDP + 8 * P5P + 2 + (LP + l) * HP + h] = a_lnb[l][j];
+      gs[5 * HP + HDP + 8 * P5P + 2 + l * HP + h] = a_lng[l][j];
+      gs[5 * HP + HDP + 8 * P5P + 2 + (LP + l) * HP + h] = a_lnb[l][j];
     }
   }
 #pragma unroll
   for (int j = 0; j < CHD; j++) {
     const int n = lane + LANES * j;
-    if (n < HDP) gs[6 * HP + n] = a_hdec[j];
+    if (n < HDP) gs[5 * HP + n] = a_hdec[j];
   }
 #pragma unroll
   for (int j = 0; j < CP5; j++) {
     const int n = lane + LANES * j;
     if (n < P5P)
 #pragma unroll
-      for (int v = 0; v < 8; v++) gs[6 * HP + HDP + v * P5P + n] = a_p5[v][j];
+      for (int v = 0; v < 8; v++) gs[5 * HP + HDP + v * P5P + n] = a_p5[v][j];
   }
-  if (lane == 0) { gs[6 * HP + HDP + 8 * P5P] = a_decb; gs[6 * HP + HDP + 8 * P5P + 1] = a_u0; }
+  if (lane == 0) { gs[5 * HP + HDP + 8 * P5P] = a_decb; gs[5 * HP + HDP + 8 * P5P + 1] = a_u0; }
 #endif
 }
 

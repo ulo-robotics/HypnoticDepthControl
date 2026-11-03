@@ -10,11 +10,9 @@ Evaluate a trained policy against the baselines on the SAME fresh patients (a ke
 
 The policy runs in the JAX closed loop, the baselines on the numpy plant (both checked equal by selftest.py). Prints, per scenario, the mean
 J of every controller and the paired difference policy - baseline (95% CI, share of patients where the policy is better). Writes
-<out>/results.json and per-patient metrics <out>/<scenario>.npz. Also accepts the best_model.pkl files of the old meta_opt runs.
-Every model runs with its own semantics (model.SEMANTICS: the time feature, the S4D time-constant bound), recorded in its .pkl or given:
---semantics legacy|current for the model, --extra name=path@legacy|@current for another one; a model that records none must be told.
+<out>/results.json and per-patient metrics <out>/<scenario>.npz.
 """
-import argparse, json, os, pickle, time
+import argparse, json, os, time
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -27,13 +25,11 @@ jax.config.update("jax_default_matmul_precision", "highest")    # float32 matmul
 EVAL_KEY = jax.random.PRNGKey(8_000_000)
 
 
-_ROLLOUTS = {}                       # one jitted rollout per semantics: the switches are read when it is traced, jit keys on shapes only
+_ROLLOUT = jax.jit(lambda p, pt: P.rollout(p, pt)[1:])
 
 
-def run_policy(params, pts, sem, chunk=1024):
-    key = (bool(sem["time_feature"]), float(sem["tau_max"]))
-    P.use_semantics(sem)                                                  # also for any retrace (a new chunk shape) of this semantics' function
-    f = _ROLLOUTS.setdefault(key, jax.jit(lambda p, pt: P.rollout(p, pt)[1:]))
+def run_policy(params, pts, chunk=1024):
+    f = _ROLLOUT
     B = pts["mu"].shape[0]
     out = [f(params, {k: (v[:, :, i:i + chunk] if k == "z" else v[i:i + chunk]) for k, v in pts.items()}) for i in range(0, B, chunk)]
     b, u = (np.concatenate([np.asarray(o[j], np.float64) for o in out], 1).T for j in (0, 1))
@@ -47,8 +43,7 @@ def main():
     ap.add_argument("--out", default="", help="default: <model folder>/eval")
     ap.add_argument("--stress", action="store_true")
     ap.add_argument("--prior", action="store_true", help="also the untrained policy (prior compensator) of the model's config")
-    ap.add_argument("--extra", action="append", default=[], help="name=path[@legacy|@current]: another model on the same patients")
-    ap.add_argument("--semantics", choices=list(M.SEMANTICS), default=None, help="the model's semantics, when its .pkl does not record them")
+    ap.add_argument("--extra", action="append", default=[], help="name=path: another model on the same patients")
     ap.add_argument("--stim-times", default="", help="comma separated times (min): a scenario with a stimulus of 0.3 at each")
     ap.add_argument("--baselines", default=",".join(BL.BASELINES), help="comma separated, from: " + ", ".join(BL.BASELINES))
     ap.add_argument("--plot", action="store_true")
@@ -56,19 +51,14 @@ def main():
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.model)), "eval")
     os.makedirs(out, exist_ok=True)
 
-    m = pickle.load(open(args.model, "rb"))
-    sem = M.semantics_of(m, args.semantics)
-    ctrls = {"policy": (jax.tree_util.tree_map(jnp.asarray, m["params"]), sem)}       # name -> (parameters, semantics)
+    m = P.load_model(args.model)
+    ctrls = {"policy": jax.tree_util.tree_map(jnp.asarray, m["params"])}               # name -> parameters
     if args.prior:
         cfg = {**P.ARCH_DEFAULTS, **(m.get("cfg") or {})}
-        ctrls["prior"] = (P.init_params(jax.random.PRNGKey(0), cfg), sem)
+        ctrls["prior"] = P.init_params(jax.random.PRNGKey(0), cfg)
     for e in args.extra:
         n, path = e.split("=", 1)
-        path, _, sname = path.partition("@")
-        mx = pickle.load(open(path, "rb"))
-        ctrls[n] = (jax.tree_util.tree_map(jnp.asarray, mx["params"]), M.semantics_of(mx, sname or None))
-    print("semantics: " + ", ".join(f"{c} {'time feature' if s['time_feature'] else 'no time feature'}, tau_max {s['tau_max']:g}"
-                                   for c, (_, s) in ctrls.items()), flush=True)
+        ctrls[n] = jax.tree_util.tree_map(jnp.asarray, P.load_model(path)["params"])
     names = [b for b in args.baselines.split(",") if b]
     scen = {n: sp for n, (sp, _w) in M.VAL.items()}
     if args.stress:
@@ -82,8 +72,8 @@ def main():
         pts = M.sample_patients(jax.random.fold_in(EVAL_KEY, si), args.n, sp)
         pn = M.to_numpy(pts)
         per, curves[sname] = {}, {}
-        for cname, (prm, csem) in ctrls.items():
-            b, u = run_policy(prm, pts, csem)
+        for cname, prm in ctrls.items():
+            b, u = run_policy(prm, pts)
             per[cname] = M.metrics(b, u, pn["tgt"])
             curves[sname][cname] = (b, u)
         for cname in names:

@@ -11,7 +11,7 @@ r         w_ref(target) / C50N: the physics branch runs in target-normalized uni
 Two parameter layouts:
   compact   (files, deployment, C++ export) a plain dict of arrays, the layout of the old best_model.pkl files:
               phys  = dict(a, b, Bu, Bw, Cout, u0)          (P,) (P,) (P,2) (P,2) (P,2) (1,)   complex values stored as [..., (re, im)], P = 5 + n_extra
-              extra = dict(enc_W (4,H), enc_b (H,), layers=[...], dec_W (H or head,1), dec_b (1,), [head_W1 (H,head), head_b1 (head,)])
+              extra = dict(enc_W (3,H), enc_b (H,), layers=[...], dec_W (H or head,1), dec_b (1,), [head_W1 (H,head), head_b1 (head,)])
               layer = dict(log_dt (H,), log_A_re (H,NS), A_im (H,NS), C (H,NS,2), D (H,), W_mix (H,2H), b_mix (2H,), ln_g (H,), ln_b (H,))
   training  the same values with one tree structure for every size: the layers stacked along a leading axis, the gated-mixing halves as
             separate matrices (Wv, Wg, bv, bg), and the head always present (hW, hb, hdec; dec_lin is the decoder of a head-less network).
@@ -81,7 +81,7 @@ def init_params(key, cfg):
             log_A_re=jnp.full((H, NS), math.log(0.5)), A_im=math.pi * jnp.tile(jnp.arange(NS, dtype=jnp.float32), (H, 1)),
             C=nrm(k3, (H, NS, 2), NS ** -0.5), D=nrm(k4, (H,), 1.0),
             W_mix=nrm(k2, (H, 2 * H), H ** -0.5), b_mix=jnp.zeros(2 * H), ln_g=jnp.ones(H), ln_b=jnp.zeros(H)))
-    extra = dict(enc_W=nrm(ks[0], (4, H), 0.5), enc_b=jnp.zeros(H), layers=layers, dec_b=jnp.zeros(1))
+    extra = dict(enc_W=nrm(ks[0], (3, H), 0.5), enc_b=jnp.zeros(H), layers=layers, dec_b=jnp.zeros(1))
     if hd > 0:
         extra.update(head_W1=nrm(ks[1], (H, hd), H ** -0.5), head_b1=jnp.zeros(hd), dec_W=jnp.zeros((hd, 1)))
     else:
@@ -99,7 +99,7 @@ def sizes(params):
 # ---------------------------------------------------------------- training layout
 _DIMS = {                       # leaf name -> its dims in the training layout (a size name or a fixed length)
     "a": ("P",), "b": ("P",), "Bu": ("P", 2), "Bw": ("P", 2), "Cout": ("P", 2), "u0": (1,),
-    "enc_W": (4, "H"), "enc_b": ("H",), "dec_b": (1,), "dec_lin": ("H", 1), "hW": ("H", "HD"), "hb": ("HD",), "hdec": ("HD", 1),
+    "enc_W": (3, "H"), "enc_b": ("H",), "dec_b": (1,), "dec_lin": ("H", 1), "hW": ("H", "HD"), "hb": ("HD",), "hdec": ("HD", 1),
     "log_dt": ("L", "H"), "log_A_re": ("L", "H", "NS"), "A_im": ("L", "H", "NS"), "C": ("L", "H", "NS", 2), "D": ("L", "H"),
     "Wv": ("L", "H", "H"), "Wg": ("L", "H", "H"), "bv": ("L", "H"), "bg": ("L", "H"), "ln_g": ("L", "H"), "ln_b": ("L", "H")}
 
@@ -213,16 +213,6 @@ def s4d_layer(lp, pre, x, h, mk):
     return dv / jnp.sqrt(jnp.sum(dv * dv, -1, keepdims=True) / mk["nH"] + 1e-5) * lp["ln_g"] + lp["ln_b"], h
 
 
-TIME_FEATURE = False                  # the time input t / T_END (legacy models only; see model.SEMANTICS and use_semantics)
-
-
-def use_semantics(sem):
-    """run (trace) the policy with a model's semantics, dict(time_feature, tau_max) from model.SEMANTICS; read when functions are traced"""
-    global TIME_FEATURE
-    TIME_FEATURE = bool(sem["time_feature"])
-    M.TAU_MAX = float(sem["tau_max"])
-
-
 def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
     """one control step for a batch: measured BIS y, previous infusion u_prev, time t (min), reference now / at the previous step.
     Returns (infusion in [0, UMAX], new state)."""
@@ -232,8 +222,7 @@ def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
     hp = hp * (w_ref(tgt_prev) / w_ref(tgt))[:, None]               # re-express the physics state when the reference moves
     w = w_from_y(y)
     ex = tp["extra"]
-    tf = jnp.full_like(y, t / M.T_END) if TIME_FEATURE else jnp.zeros_like(y)
-    feat = jnp.stack([(y - tgt) / 50, u_prev / (r * M.UMAX), tf, w / (r * M.C50N) - 1.0], -1)
+    feat = jnp.stack([(y - tgt) / 50, u_prev / (r * M.UMAX), w / (r * M.C50N) - 1.0], -1)
     x = feat @ ex["enc_W"] + ex["enc_b"]
     new = []
     for l, h in enumerate(hs):
@@ -325,3 +314,18 @@ class PolicyController:
                                   self.tgt[:, k], self.tgt[:, max(k - 1, 0)])
         self.u_prev = u
         return np.asarray(u, np.float64)
+
+
+def load_model(path):
+    """a saved model (the best_model.pkl dict: params in the compact layout, cfg, ...). A model saved with the earlier 4-input encoder, whose
+    third input (the time t / T_END) was held at zero, has that row dropped: the same policy. One that used the time input is refused."""
+    import pickle
+    m = pickle.load(open(path, "rb"))
+    ex = m["params"]["extra"]
+    if ex["enc_W"].shape[0] == 4:
+        if (m.get("semantics") or {}).get("time_feature", False):
+            raise SystemExit(f"{path}: trained with the time input, which this code no longer has")
+        ex["enc_W"] = ex["enc_W"][[0, 1, 3]]
+        m.pop("semantics", None)
+    return m
+

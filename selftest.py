@@ -186,7 +186,7 @@ def main():
         print("engine checks (float32, GPU) in a fresh process:", flush=True)
         ok.append(subprocess.run([sys.executable, os.path.abspath(__file__), "--engines"]).returncode == 0)
     else:
-        print("no GPU: Pallas / CUDA engine checks skipped")
+        print("no GPU: CUDA engine checks skipped")
     print("ALL OK" if all(ok) else f"{len(ok) - sum(ok)} CHECK(S) FAILED")
     raise SystemExit(0 if all(ok) else 1)
 

@@ -95,7 +95,7 @@ __device__ __forceinline__ void mmx(const float* X, const float* __restrict__ W,
   }
 }
 
-enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_encW3, V_dec_lin, NV_TOP };
+enum { V_mH, V_enc_b, V_encW0, V_encW1, V_encW2, V_dec_lin, NV_TOP };
 #define VL(l, k) (NV_TOP + (l) * 6 + (k))                 // per layer: D, bv, bg, ln_g, ln_b, K0
 #define NV (NV_TOP + 6 * LP)
 enum { Q_Ad = 0, Q_Bd = 16, Q_mu = 20, Q_stim, Q_stimt, Q_aou, Q_gam, Q_e0, Q_em, Q_osc, Q_stim2, Q_stimt2, Q_stim3, Q_stimt3, Q_dmask = 32, NQ = 48 };
@@ -119,7 +119,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
     float x;
     if (v == V_mH) x = LD(mH, g * HP + h);
     else if (v == V_enc_b) x = LD(enc_b, g * HP + h);
-    else if (v <= V_encW3) x = LD(encW, ((size_t)g * 4 + (v - V_encW0)) * HP + h);
+    else if (v <= V_encW2) x = LD(encW, ((size_t)g * 3 + (v - V_encW0)) * HP + h);
     else if (v == V_dec_lin) x = LD(dec_lin, g * HP + h);
     else {
       const int l = (v - NV_TOP) / 6, kk = (v - NV_TOP) % 6;
@@ -216,7 +216,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
       const float s = fminf(1.f - 1e-3f, fmaxf(1e-3f, (E0_ - y) * (1.f / EMAX_)));
       const float w = fminf(C50N_ * powf(s / (1.f - s), 1.f / GAMMA_), 3.f * C50N_);
       const float ri = __frcp_rn(r);
-      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = 0.f, f3 = w * ri * (1.f / C50N_) - 1.f;
+      const float f0 = (y - tg) * 0.02f, f1 = up * ri * (1.f / UMAX_), f2 = w * ri * (1.f / C50N_) - 1.f;
       float hqr[CP5], hqi[CP5], ul = 0.f;
 #pragma unroll
       for (int j = 0; j < CP5; j++) {
@@ -228,7 +228,7 @@ __global__ void __launch_bounds__(NT, 1) cfwd_kernel(Args A, int wtape) {
       float xx[CH];
 #pragma unroll
       for (int j = 0; j < CH; j++)
-        xx[j] = f0 * SVv(V_encW0, j) + f1 * SVv(V_encW1, j) + f2 * SVv(V_encW2, j) + f3 * SVv(V_encW3, j) + SVv(V_enc_b, j);
+        xx[j] = f0 * SVv(V_encW0, j) + f1 * SVv(V_encW1, j) + f2 * SVv(V_encW2, j) + SVv(V_enc_b, j);
       // layers
 #pragma unroll
       for (int l = 0; l < LP; l++) {

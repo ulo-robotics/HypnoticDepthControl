@@ -8,7 +8,7 @@ reference plant over every validation scenario, against the float32 model.
   python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx --tensorrt fp32,fp16,int8      # + policy_<p>.plan
   python export_onnx.py runs/lethe/best_model.pkl --out runs/lethe/onnx --litert fp32,dynamic          # + policy_<p>.tflite
 
-policy.onnx (opset 18, float32, batch B dynamic). Inputs: step (B) the step index k (t = 5 k s), y (B) measured BIS, tgt / tgt_prev (B) the
+policy.onnx (opset 18, float32, batch B dynamic). Inputs: y (B) measured BIS, tgt / tgt_prev (B) the
 reference now / at the previous step, u_prev (B) the previous infusion, phys_re / phys_im (B, modes) the physics compensator's modes,
 s4d_re / s4d_im (L, B, H, NS) the S4D states (all zero at the start of an episode). Outputs: u (B) the infusion (mg/min, in [0, 100]) and
 the new phys_re, phys_im, s4d_re, s4d_im. The matrices are the float64 discretization of export_cpp.py, rounded to float32. Nodes are named
@@ -32,9 +32,8 @@ import numpy as np
 
 import export_cpp
 
-DT, T_END, UMAX, E0, EMAX, GAMMA, C50N = 5.0 / 60.0, 30.0, 100.0, 100.0, 100.0, 2.0, 4.5
-SEM = None                            # the model's semantics (model.SEMANTICS), set in main
-INPUTS = ("step", "y", "tgt", "tgt_prev", "u_prev", "phys_re", "phys_im", "s4d_re", "s4d_im")
+UMAX, E0, EMAX, GAMMA, C50N = 100.0, 100.0, 100.0, 2.0, 4.5
+INPUTS = ("y", "tgt", "tgt_prev", "u_prev", "phys_re", "phys_im", "s4d_re", "s4d_im")
 OUTPUTS = ("u", "phys_re_out", "phys_im_out", "s4d_re_out", "s4d_im_out")
 QUANT = ("mix0", "mix1", "mix2", "head")                           # the int8 matmuls
 ALPHA = 0.75                                                       # smoothing exponent (int8)
@@ -46,7 +45,7 @@ def build(params, quant=None, taps=None, half=False):
     activation operand (for calibration)"""
     import onnx
     from onnx import TensorProto, helper as oh, numpy_helper as onh
-    d, a = export_cpp.discretized(params, SEM)
+    d, a = export_cpp.discretized(params)
     H, NS, L, HD, P = d["H"], d["NS"], d["L"], d["head"], d["modes"]
     nodes, inits, n, reg = [], [], [0], ["in"]
     kind_of = {x: np.float32 for x in INPUTS}                      # tensor -> np.float32 / np.float16 / None (not floating point)
@@ -116,7 +115,7 @@ def build(params, quant=None, taps=None, half=False):
     s = op("Clip", op("Div", op("Sub", const(E0), "y"), const(EMAX)), const(1e-3), const(1.0 - 1e-3))
     w = op("Min", op("Mul", const(C50N), op("Pow", op("Div", s, op("Sub", const(1.0), s)), const(1.0 / GAMMA))), const(3.0 * C50N))
     f = [op("Div", op("Sub", "y", "tgt"), const(50.0)), op("Div", "u_prev", op("Mul", r, const(UMAX))),
-         op("Mul", "step", const(DT / T_END if SEM["time_feature"] else 0.0)), op("Sub", op("Div", w, op("Mul", r, const(C50N))), const(1.0))]
+         op("Sub", op("Div", w, op("Mul", r, const(C50N))), const(1.0))]
     f = op("Concat", *[unsq(v, (1,)) for v in f], axis=1)
     reg[0] = "rec"
     pr, pi = op("Mul", "phys_re", rho), op("Mul", "phys_im", rho)
@@ -163,7 +162,7 @@ def build(params, quant=None, taps=None, half=False):
               oh.make_node("Concat", new_im, ["s4d_im_out"], axis=0, name="rec/s4d_im")]
     F = TensorProto.FLOAT
     vec = lambda name: oh.make_tensor_value_info(name, F, ["B"])
-    ins = [vec("step"), vec("y"), vec("tgt"), vec("tgt_prev"), vec("u_prev"), oh.make_tensor_value_info("phys_re", F, ["B", P]),
+    ins = [vec("y"), vec("tgt"), vec("tgt_prev"), vec("u_prev"), oh.make_tensor_value_info("phys_re", F, ["B", P]),
            oh.make_tensor_value_info("phys_im", F, ["B", P]), oh.make_tensor_value_info("s4d_re", F, [L, "B", H, NS]),
            oh.make_tensor_value_info("s4d_im", F, [L, "B", H, NS])]
     outs = [vec("u"), oh.make_tensor_value_info("phys_re_out", F, ["B", P]), oh.make_tensor_value_info("phys_im_out", F, ["B", P]),
@@ -190,8 +189,8 @@ def loop(run, pts, d, maxb=None, y_int=False, keep=None):
     st, up = [z(B, d["modes"]), z(B, d["modes"]), z(d["L"], B, d["H"], d["NS"]), z(d["L"], B, d["H"], d["NS"])], z(B)
     for k in range(M.N):
         y = plant.measure()
-        feed = dict(step=np.full(B, k, np.float32), y=(np.round(y) if y_int else y).astype(np.float32), tgt=pts["tgt"][:, k].astype(np.float32),
-                    tgt_prev=pts["tgt"][:, max(k - 1, 0)].astype(np.float32), u_prev=up, **dict(zip(INPUTS[5:], st)))
+        feed = dict(y=(np.round(y) if y_int else y).astype(np.float32), tgt=pts["tgt"][:, k].astype(np.float32),
+                    tgt_prev=pts["tgt"][:, max(k - 1, 0)].astype(np.float32), u_prev=up, **dict(zip(INPUTS[4:], st)))
         if keep:
             keep(k, feed)
         if maxb is None or maxb >= B:
@@ -262,7 +261,7 @@ def calibrate(params, d, n, seed=1000):
         return out[:5]
     for pts in scenarios(n, seed).values():
         loop(run, pts, d)
-    _, a = export_cpp.discretized(params, SEM)
+    _, a = export_cpp.discretized(params)
     W = {f"mix{l}": a[f"l{l}_W_mix"] for l in range(d["L"])}
     if d["head"]:
         W["head"] = a["head_W1"]
@@ -397,16 +396,11 @@ def main():
     ap.add_argument("--tensorrt", default="", help="comma-separated: fp32, fp16, int8 (TensorRT Python API and cuda-python)")
     ap.add_argument("--litert", default="", help="comma-separated: fp32, dynamic (onnx2tf, TensorFlow, ai-edge-litert)")
     ap.add_argument("--no-int8", dest="int8", action="store_false", help="do not write policy_int8.onnx")
-    ap.add_argument("--semantics", choices=["legacy", "current"], default=None, help="see export_cpp.py")
     a = ap.parse_args()
-    global SEM
     import onnx
-    os.makedirs(a.out, exist_ok=True)
-    mdl = pickle.load(open(a.model, "rb"))
-    SEM = export_cpp.semantics(mdl, a.semantics)
     import policy as Pol
-    Pol.use_semantics(SEM)                                                  # the JAX reference of the checks, with the same semantics
-    params = mdl["params"]
+    os.makedirs(a.out, exist_ok=True)
+    params = Pol.load_model(a.model)["params"]
     m, d = build(params)
     path = os.path.join(a.out, "policy.onnx")
     onnx.save(m, path)
@@ -446,7 +440,7 @@ def main():
 
 def _feed0(d, B):
     z = lambda *s: np.zeros(s, np.float32)
-    return dict(step=z(B), y=np.full(B, 50, np.float32), tgt=np.full(B, 50, np.float32), tgt_prev=np.full(B, 50, np.float32), u_prev=z(B),
+    return dict(y=np.full(B, 50, np.float32), tgt=np.full(B, 50, np.float32), tgt_prev=np.full(B, 50, np.float32), u_prev=z(B),
                 phys_re=z(B, d["modes"]), phys_im=z(B, d["modes"]), s4d_re=z(d["L"], B, d["H"], d["NS"]), s4d_im=z(d["L"], B, d["H"], d["NS"]))
 
 

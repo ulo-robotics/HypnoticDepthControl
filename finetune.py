@@ -51,7 +51,7 @@ def main():
         raise SystemExit(f"{a.out} already holds a finished fine-tune")
     os.makedirs(a.out, exist_ok=True)
 
-    win = pickle.load(open(os.path.join(a.search, "best_model.pkl"), "rb"))
+    win = P.load_model(os.path.join(a.search, "best_model.pkl"))
     sargs = json.load(open(os.path.join(a.search, "manifest.json")))["args"]
     cfgs = variants(win["cfg"], a.iters, [float(x) for x in a.lr_mults.split(",")], [float(x) for x in a.decay_at.split(",")])
     if a.smoke:
@@ -107,7 +107,7 @@ def main():
                test_improvement=float((test[2] - test[0]).mean()), test_improvement_ci=ci(test[2] - test[0]),
                gain_over_winner=float((test[1] - test[0]).mean()), gain_over_winner_ci=ci(test[1] - test[0]))
     json.dump(res, open(os.path.join(a.out, "results.json"), "w"), indent=1, default=float)
-    T.save(dict(params=models[bi], cfg=cfg, semantics=M.SEMANTICS["current"]), os.path.join(a.out, "best_model.pkl"))
+    T.save(dict(params=models[bi], cfg=cfg), os.path.join(a.out, "best_model.pkl"))
     print(f"\nmodel: {names[bi]}; test score (random stimulus) {res['test_score']:.3f}, search winner {res['winner_score']:.3f} "
           f"(gain {res['gain_over_winner']:.3f} +- {res['gain_over_winner_ci']:.3f}), untrained base prior {res['base_prior_score']:.3f} "
           f"(improvement {res['test_improvement']:.3f} +- {res['test_improvement_ci']:.3f})\n-> {os.path.join(a.out, 'best_model.pkl')}", flush=True)

@@ -18,21 +18,7 @@ from scipy.linalg import expm
 DT = 5.0 / 60.0                      # min
 T_END = 30.0
 N = int(os.environ.get("PKPD_N", round(T_END / DT)))    # steps simulated (360 = the 30 min scenarios; PKPD_N: longer episodes)
-TAU_MAX = 30.0                       # min: the slowest S4D mode's time constant (the scale of the shortest training episode); 0: unbounded
-# what a trained model computes beyond its parameters: legacy = models trained before these changes (time feature, unbounded time constants)
-SEMANTICS = dict(legacy=dict(time_feature=True, tau_max=0.0), current=dict(time_feature=False, tau_max=30.0))
-
-
-def semantics_of(saved, name=None):
-    """the semantics of a saved model (a best_model.pkl dict): the one it records, or SEMANTICS[name]; never guessed. Raises SystemExit when
-    neither is given or they disagree"""
-    rec = saved.get("semantics") if isinstance(saved, dict) else None
-    if name is None and rec is None:
-        raise SystemExit("the model does not record its semantics: pass --semantics legacy (trained before the time feature was dropped) "
-                         "or --semantics current")
-    if rec is not None and name is not None and dict(rec) != dict(SEMANTICS[name]):
-        raise SystemExit(f"--semantics {name} contradicts the semantics recorded in the model: {rec}")
-    return dict(SEMANTICS[name] if name is not None else rec)
+TAU_MAX = 30.0                       # min: the slowest S4D mode's time constant (the scale of the shortest training episode)
 UMAX, TARGET, GAMMA, E0, EMAX = 100.0, 50.0, 2.0, 100.0, 100.0
 PK_KEYS = ("V1", "V2", "V3", "Cl1", "Cl2", "Cl3", "ke0")
 NOM = dict(V1=4.27, V2=18.9, V3=238.0, Cl1=1.89, Cl2=1.29, Cl3=0.836, ke0=0.456)     # Schnider, 40 y, 70 kg, 170 cm
@@ -158,8 +144,6 @@ def pk_disc(p):
 def s4d_A(log_dt, log_A_re, A_im):
     """continuous S4D eigenvalues with the decay per step floored at DT / TAU_MAX (no mode slower than TAU_MAX): (dt (..., 1), A)"""
     dt = jnp.exp(log_dt)[..., None]
-    if TAU_MAX <= 0:                                                      # unbounded (legacy models): the original expression, bit for bit
-        return dt, -jnp.exp(log_A_re) + 1j * A_im
     rate = jnp.maximum(dt * jnp.exp(log_A_re), DT / TAU_MAX)
     return dt, -rate / dt + 1j * A_im
 

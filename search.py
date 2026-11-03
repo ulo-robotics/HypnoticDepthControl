@@ -385,7 +385,7 @@ class Search:
                    test_score=float(test[0].mean()), base_prior_score=float(test[1].mean()),
                    test_improvement=float(d.mean()), test_improvement_ci=float(1.96 * d.std(ddof=1) / math.sqrt(len(d))))
         json.dump(res, open(os.path.join(self.out, "results.json"), "w"), indent=1, default=float)
-        T.save(dict(params=models[bi], cfg=best["cfg"], semantics=M.SEMANTICS["current"]), os.path.join(self.out, "best_model.pkl"))
+        T.save(dict(params=models[bi], cfg=best["cfg"]), os.path.join(self.out, "best_model.pkl"))
         self.save(phase="done")
         print(f"\nwinner: trial {best['id']} (config {best['parent']}), test score {res['test_score']:.3f}, untrained base prior "
               f"{res['base_prior_score']:.3f} (improvement {res['test_improvement']:.3f} +- {res['test_improvement_ci']:.3f})\n"

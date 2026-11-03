@@ -47,7 +47,7 @@ def default_lanes(H):
 
 
 def nsm(d):
-    return 6 * d["H"] + max(d["HD"], 8) + 8 * d["PP"] + 2 + 2 * d["L"] * d["H"]
+    return 5 * d["H"] + max(d["HD"], 8) + 8 * d["PP"] + 2 + 2 * d["L"] * d["H"]
 
 
 # ---------------------------------------------------------------- inputs (one network; under vmap every input gets the member axis)
@@ -87,7 +87,7 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
         mH, nH, ho, gl, dec_lin, head_dec = jnp.ones(H, dt), jnp.asarray(H, dt), jnp.asarray(0.0, dt), jnp.ones(L, dt), kp["dec"], None
     z = jnp.zeros((), dt)
     ins = dict(sc=jnp.stack([nH, ho, kp["sc"][0], kp["sc"][1], kp["sc"][2], kp["sc"][3], z, z]), gl=gl, mH=mH, enc_b=kp["enc_b"],
-               encW=jnp.stack([kp[f"enc{i}"] for i in range(4)]), dec_lin=dec_lin)
+               encW=jnp.stack([kp[f"enc{i}"] for i in range(3)]), dec_lin=dec_lin)
     if d["HD"]:
         ins.update(head_W1=kp["hW"], W1T=kp["hW"].T, head_b1=kp["hb"], head_dec=head_dec)
     ins["p5"] = jnp.stack([kp[k] for k in ("lamr", "lami", "Bur", "Bui", "Bwr", "Bwi", "Cor", "Coi")])
@@ -129,7 +129,7 @@ def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam=True, B=0):
     lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}", f"#define HEAD {int(d['HD'] > 0)}",
              f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {M.N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
              f"#define LANES {lanes}", f"#define TC {int(tc)}", f"#define GRADS {int(grads)}", f"#define LAMOUT {int(lam)}"]
-    for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX), ("T_END_", M.T_END)):
+    for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX)):
         lines.append(f"#define {n} {f(v)}")
     lines.append(f"#define NIN {len(names_in)}")
     lines += [f"#define I_{n} {i}" for i, n in enumerate(names_in)]
@@ -275,7 +275,7 @@ def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None,
         v = gsm[:, o:o + n]
         o += n
         return v
-    for i in range(4):
+    for i in range(3):
         g[f"enc{i}"] = take(H)
     g["enc_b"] = take(H)
     decl = take(H)

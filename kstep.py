@@ -82,7 +82,7 @@ def to_kp(tp, sz, w_low, rho_u, plain=None):
     kp = dict(lamr=pad(mag * jnp.cos(ph["b"])), lami=pad(mag * jnp.sin(ph["b"])),
               Bur=pad(ph["Bu"][:, 0]), Bui=pad(ph["Bu"][:, 1]), Bwr=pad(ph["Bw"][:, 0]), Bwi=pad(ph["Bw"][:, 1]),
               Cor=pad(ph["Cout"][:, 0]), Coi=pad(ph["Cout"][:, 1]),
-              enc0=ex["enc_W"][0], enc1=ex["enc_W"][1], enc2=ex["enc_W"][2], enc3=ex["enc_W"][3], enc_b=ex["enc_b"], layers=[])
+              enc0=ex["enc_W"][0], enc1=ex["enc_W"][1], enc2=ex["enc_W"][2], enc_b=ex["enc_b"], layers=[])
     if plain is None:
         kp.update(hW=ex["hW"], hb=ex["hb"], dec=ex["hdec"][:, 0], decl=ex["dec_lin"][:, 0], mH=mk["mH"])
         sc += [mk["nH"], mk["head"].astype(dt)] + [mk["gate"][l].astype(dt) for l in range(d["L"])]
@@ -168,8 +168,8 @@ def step_pre(kp, q, c, k, st):
     s = jnp.clip((M.E0 - y) / M.EMAX, 1e-3, 1 - 1e-3)
     w = jnp.minimum(M.C50N * jnp.power(s / (1 - s), 1.0 / M.GAMMA), 3 * M.C50N)
     r, rho, tg = st["r"], st["rho"], st["tg"]
-    f0, f1, f3 = (y - tg) / 50, c["up"] / (r * M.UMAX), w / (r * M.C50N) - 1.0
-    x = f0[:, None] * kp["enc0"] + f1[:, None] * kp["enc1"] + (0.0 * t)[..., None] * kp["enc2"] + f3[:, None] * kp["enc3"] + kp["enc_b"]
+    f0, f1, f2 = (y - tg) / 50, c["up"] / (r * M.UMAX), w / (r * M.C50N) - 1.0
+    x = f0[:, None] * kp["enc0"] + f1[:, None] * kp["enc1"] + f2[:, None] * kp["enc2"] + kp["enc_b"]
     return x, dict(b=b, buf=buf, w=w, hpr=c["hpr"] * rho[:, None], hpi=c["hpi"] * rho[:, None])
 
 

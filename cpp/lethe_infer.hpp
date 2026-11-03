@@ -1,6 +1,6 @@
 // lethe_infer.hpp -- dependency-free C++17 inference engine of the Lethe policy (one patient, one control step at a time).
 //
-//   lethe::Model m = lethe::Model::load("model.bin");     // written by export_cpp.py (LETHE02; LETHE01 files of older models load too)
+//   lethe::Model m = lethe::Model::load("model.bin");     // written by export_cpp.py (LETHE03)
 //   lethe::Policy<float> pol(m);                           // or Policy<double>
 //   pol.reset();
 //   for each 5 s step k:  u = pol.step(k, bis_measured, target_now, target_previous);    // infusion, mg/min, in [0, 100]
@@ -20,7 +20,7 @@
 
 namespace lethe {
 
-constexpr double DT = 5.0 / 60.0, T_END = 30.0, UMAX = 100.0, E0 = 100.0, EMAX = 100.0, GAMMA = 2.0, C50N = 4.5;
+constexpr double UMAX = 100.0, E0 = 100.0, EMAX = 100.0, GAMMA = 2.0, C50N = 4.5;
 
 struct Layer {
   std::vector<double> dAr, dAi, dBr, dBi, Cr, Ci;    // (H, NS)
@@ -29,7 +29,6 @@ struct Layer {
 
 struct Model {
   int H = 0, NS = 0, L = 0, HD = 0, P = 0;
-  bool time_feature = true;                                   // the input t / T_END: models trained before it was dropped (every LETHE01 file)
   double u0 = 0, dec_b = 0;
   std::vector<double> lr, li, Bur, Bui, Bwr, Bwi, Cor, Coi;   // physics modes (P)
   std::vector<double> enc, enc_b;                             // enc (4, H) row major
@@ -41,13 +40,11 @@ struct Model {
     if (!f) throw std::runtime_error("cannot open " + path);
     char magic[8];
     f.read(magic, 8);
-    const bool v1 = std::memcmp(magic, "LETHE01\0", 8) == 0, v2 = std::memcmp(magic, "LETHE02\0", 8) == 0;
-    if (!v1 && !v2) throw std::runtime_error(path + ": not a Lethe model file");
-    int32_t d[7] = {0, 0, 0, 0, 0, 1, 0};
-    f.read(reinterpret_cast<char*>(d), (v2 ? 7 : 5) * sizeof(int32_t));
+    if (std::memcmp(magic, "LETHE03\0", 8) != 0) throw std::runtime_error(path + ": not a Lethe model file (LETHE03)");
+    int32_t d[5] = {0, 0, 0, 0, 0};
+    f.read(reinterpret_cast<char*>(d), 5 * sizeof(int32_t));
     Model m;
     m.H = d[0]; m.NS = d[1]; m.L = d[2]; m.HD = d[3]; m.P = d[4];
-    m.time_feature = (d[5] & 1) != 0;
     auto rd = [&](size_t n) {
       std::vector<double> v(n);
       f.read(reinterpret_cast<char*>(v.data()), n * sizeof(double));
@@ -57,7 +54,7 @@ struct Model {
     const size_t H = m.H, NS = m.NS, P = m.P, HD = m.HD;
     auto s = rd(2); m.u0 = s[0]; m.dec_b = s[1];
     m.lr = rd(P); m.li = rd(P); m.Bur = rd(P); m.Bui = rd(P); m.Bwr = rd(P); m.Bwi = rd(P); m.Cor = rd(P); m.Coi = rd(P);
-    m.enc = rd(4 * H); m.enc_b = rd(H);
+    m.enc = rd(3 * H); m.enc_b = rd(H);
     for (int l = 0; l < m.L; l++) {
       Layer y;
       y.dAr = rd(H * NS); y.dAi = rd(H * NS); y.dBr = rd(H * NS); y.dBi = rd(H * NS); y.Cr = rd(H * NS); y.Ci = rd(H * NS);
@@ -100,8 +97,8 @@ class Policy {
     for (int p = 0; p < P; p++) { pr_[p] *= rho; pi_[p] *= rho; }
     T s = std::clamp((T(E0) - y) / T(EMAX), T(1e-3), T(1) - T(1e-3));
     const T w = std::min(T(C50N) * std::pow(s / (T(1) - s), T(1) / T(GAMMA)), T(3 * C50N));
-    const T f[4] = {(y - tgt) / T(50), u_prev_ / (r * T(UMAX)), m_.time_feature ? T(k * DT / T_END) : T(0), w / (r * T(C50N)) - T(1)};
-    for (int h = 0; h < H; h++) x_[h] = f[0] * enc_[h] + f[1] * enc_[H + h] + f[2] * enc_[2 * H + h] + f[3] * enc_[3 * H + h] + enc_b_[h];
+    const T f[3] = {(y - tgt) / T(50), u_prev_ / (r * T(UMAX)), w / (r * T(C50N)) - T(1)};
+    for (int h = 0; h < H; h++) x_[h] = f[0] * enc_[h] + f[1] * enc_[H + h] + f[2] * enc_[2 * H + h] + enc_b_[h];
     for (int l = 0; l < m_.L; l++) layer(l);
     T o = T(m_.dec_b);
     if (HD > 0) {
