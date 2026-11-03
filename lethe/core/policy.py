@@ -213,8 +213,8 @@ def s4d_layer(lp, pre, x, h, mk):
     return dv / jnp.sqrt(jnp.sum(dv * dv, -1, keepdims=True) / mk["nH"] + 1e-5) * lp["ln_g"] + lp["ln_b"], h
 
 
-def act(tp, mk, pre, state, y, u_prev, t, tgt, tgt_prev):
-    """one control step for a batch: measured BIS y, previous infusion u_prev, time t (min), reference now / at the previous step.
+def act(tp, mk, pre, state, y, u_prev, tgt, tgt_prev):
+    """one control step for a batch: measured BIS y, previous infusion u_prev, reference now / at the previous step.
     Returns (infusion in [0, UMAX], new state)."""
     (lam, Bu, Bw, Cout), (dA, dB, C) = pre
     hp, hs = state
@@ -264,7 +264,7 @@ def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
         buf = jnp.where(k == 0, b[:, None], jnp.concatenate([b[:, None], buf[:, :-1]], 1))   # buf[:, j] = BIS j steps ago (first reading before that)
         y = jnp.sum(buf * dmask, -1) + pts["sy"][:, k] * z[0]
         tg, tgp = pts["tgt"][:, k], pts["tgt"][:, jnp.maximum(k - 1, 0)]
-        u, state = act(tp, mk, pre, state, y, u_prev, t, tg, tgp)
+        u, state = act(tp, mk, pre, state, y, u_prev, tg, tgp)
         cost = ((b - tg) / 10) ** 2 + w_low * (jax.nn.relu(40 - b) / 10) ** 2 + rho_u * (u / M.UMAX) ** 2
         a = jnp.exp(-M.DT / pts["tau"])
         x = jnp.einsum("bij,bj->bi", pts["Ad"], x) + pts["Bd"] * u[:, None]
@@ -311,8 +311,8 @@ class PolicyController:
         self.u_prev = jnp.zeros(B, self.dt)
 
     def act(self, k, y):
-        u, self.state = self._act(self.tp, self.mk, self.pre, self.state, jnp.asarray(y, self.dt), self.u_prev, jnp.asarray(k * M.DT, self.dt),
-                                  self.tgt[:, k], self.tgt[:, max(k - 1, 0)])
+        u, self.state = self._act(self.tp, self.mk, self.pre, self.state, jnp.asarray(y, self.dt), self.u_prev, self.tgt[:, k],
+                                  self.tgt[:, max(k - 1, 0)])
         self.u_prev = u
         return np.asarray(u, np.float64)
 

@@ -1,3 +1,7 @@
 runs/
 __pycache__/
 *.pyc
+embedded/esp32/main/model.bin
+embedded/esp32/main/trace.bin
+embedded/esp32/build_*/
+embedded/esp32/sdkconfig
