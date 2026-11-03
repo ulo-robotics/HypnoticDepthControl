@@ -47,7 +47,7 @@ SPACE = [
     ("q_theta", "log", 2e-4, 2e-2), ("sy_scale", "log", 0.5, 2.0), ("rho_lqr", "log", 1e-5, 1e-2), ("q_x", "log", 1e-5, 1e-3),
 ]
 PRIOR_KEYS = ("q_theta", "sy_scale", "rho_lqr", "q_x")
-SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="signed", len_lo=0.0)
+SETUP = dict(patient_clip=4.0, nominal_frac=0.25, max_delay=12, delay_ramp=400, batch=512, stimulus="signed", len_lo=0.0, minutes=30.0)
 
 # the selected configuration (winner of the paper's search, runs/search_full: config 171): train.py's default
 SELECTED = dict(opt="nadamw", lr=7.38e-3, phys_mult=0.024, ssm_mult=0.954, clip=2.0, omb1=0.0538, omb2=8.17e-4, wd=1.55e-2, sched="wsd",
@@ -173,9 +173,10 @@ def new_state(c, init_key):
 
 def train_spec(setup, it):
     dmax = jnp.minimum(setup["max_delay"], jnp.floor(setup["max_delay"] * it / max(setup["delay_ramp"], 1)))
-    sp = dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax)
-    if setup.get("len_lo", 0.0) > 0:                                       # episodes of len_lo .. the simulated length, stimuli across them
-        sp.update(len_lo=setup["len_lo"], len_hi=M.N * M.DT, stim_thi=M.N * M.DT - 2.0)
+    T = setup.get("minutes", 30.0)
+    sp = dict(M.with_stimulus(M.TRAIN, setup["stimulus"]), dmax=dmax, T=T)
+    if setup.get("len_lo", 0.0) > 0:                                       # episodes of len_lo .. T minutes, stimuli across them
+        sp.update(len_lo=setup["len_lo"], len_hi=T, stim_thi=T - 2.0)
     return sp
 
 
@@ -206,9 +207,10 @@ def make_validate(n, stats_fn, scenarios=None, per_patient=False):
     return validate
 
 
-def evaluate(models, n, key, per_patient=False, stimulus="random"):
-    """compact parameter trees (one network each, any sizes) on the validation scenarios, raw JAX forward; list of per-model stats"""
-    val = make_validate(n, E.forward_stats_fn({}), M.val_specs(stimulus), per_patient=per_patient)
+def evaluate(models, n, key, per_patient=False, stimulus="random", minutes=None):
+    """compact parameter trees (one network each, any sizes) on the validation scenarios (episodes of `minutes`, default 30), raw JAX
+    forward; list of per-model stats"""
+    val = make_validate(n, E.forward_stats_fn({}), M.val_specs(stimulus, minutes), per_patient=per_patient)
     out = []
     for p in models:
         tp, sz = P.expand(jax.tree_util.tree_map(jnp.asarray, p))
@@ -268,7 +270,7 @@ class Population:
             hp = hyper(cfgs)
         self.state, self.sz, self.hp, self.key = jax.device_put((state, sz, hp, train_key), jax.devices()[0])
         self.grad_fn, self.engine = E.select(self.state["params"], self.sz, self.setup["batch"], self.hp["w_low"], self.hp["rho_u"], self.plain,
-                                             iters=iters_hint, log=log)
+                                             iters=iters_hint, log=log, minutes=self.setup["minutes"])
         self.stats_fn = E.forward_stats_fn(self.engine, self.plain)
         self.val_batch = val_batch
         self._validate = None
@@ -284,7 +286,7 @@ class Population:
 
     def _validator(self):
         def build():
-            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(M.score_stimulus(self.setup["stimulus"])))
+            v = make_validate(self.val_batch, self.stats_fn, M.val_specs(M.score_stimulus(self.setup["stimulus"]), self.setup["minutes"]))
             v.compile(self.state["ema"], self.sz, VAL_KEY)
             return v
         return _program(("val", self._sig(self.val_batch)), build)

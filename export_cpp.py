@@ -61,14 +61,15 @@ def write_trace(params, path, n=8, seed=0):
     ctrl = P.PolicyController(params)
     plant = M.Plant(pts)
     ctrl.reset(pts, plant)
-    ys, us = np.zeros((n, M.N)), np.zeros((n, M.N))
-    for k in range(M.N):
+    N = plant.N
+    ys, us = np.zeros((n, N)), np.zeros((n, N))
+    for k in range(N):
         y = plant.measure()
         u = np.clip(ctrl.act(k, y), 0.0, M.UMAX)
         ys[:, k], us[:, k] = y, u
         plant.step(u)
     with open(path, "wb") as f:
-        f.write(struct.pack("<2i", n, M.N))
+        f.write(struct.pack("<2i", n, N))
         for i in range(n):
             for a in (ys[i], pts["tgt"][i], us[i]):
                 f.write(np.ascontiguousarray(a, "<f8").tobytes())

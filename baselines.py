@@ -144,7 +144,7 @@ class UKFMM(UKFLQR):
         self.P = np.tile(self.P0, (B * Mo, 1, 1))
         self.Rm = np.full(B * Mo, self.R)
         self.ll = np.zeros((B, Mo))
-        self.uh = np.zeros((B, M.N))
+        self.uh = np.zeros((B, pts["z"].shape[0]))
         self.d = np.tile(self.dset, B)
         self.row = np.arange(B * Mo) // Mo                        # the patient of each observer (row of uh)
 

@@ -27,8 +27,8 @@ LR_MULTS = (1.0, 1 / 3, 1 / 10, 1 / 30)
 DECAY_AT = (1 / 3, 2 / 3)                     # wsd: constant learning rate until this share of --iters, then down to the floor in half that time
 
 
-def variants(cfg, iters, lr_mults=LR_MULTS, decay_at=DECAY_AT):
-    return [dict(cfg, stimulus="signed", len_lo=30.0, delay_ramp=0, lr=cfg["lr"] * m, sched="wsd", tc=d * iters, warm=100)
+def variants(cfg, iters, lr_mults=LR_MULTS, decay_at=DECAY_AT, minutes=120.0):
+    return [dict(cfg, stimulus="signed", len_lo=30.0, minutes=minutes, delay_ramp=0, lr=cfg["lr"] * m, sched="wsd", tc=d * iters, warm=100)
             for m in lr_mults for d in decay_at]
 
 
@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--test-batch", type=int, default=4096)
     ap.add_argument("--lr-mults", default=",".join(map(str, LR_MULTS)), help="learning-rate multipliers of the variants (fewer: less GPU memory)")
     ap.add_argument("--decay-at", default=",".join(map(str, DECAY_AT)))
+    ap.add_argument("--minutes", type=float, default=120.0, help="episode length (min) of training (episodes of 30 min .. this), validation and test")
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run")
     a = ap.parse_args()
     if a.smoke:
@@ -53,7 +54,7 @@ def main():
 
     win = P.load_model(os.path.join(a.search, "best_model.pkl"))
     sargs = json.load(open(os.path.join(a.search, "manifest.json")))["args"]
-    cfgs = variants(win["cfg"], a.iters, [float(x) for x in a.lr_mults.split(",")], [float(x) for x in a.decay_at.split(",")])
+    cfgs = variants(win["cfg"], a.iters, [float(x) for x in a.lr_mults.split(",")], [float(x) for x in a.decay_at.split(",")], a.minutes)
     if a.smoke:
         cfgs = [dict(c, batch=32) for c in cfgs]
     with jax.default_device(T.HOST):
@@ -86,7 +87,7 @@ def main():
     models = [b["params"] for b in best] + [win["params"]]
     w = np.array([M.VAL[s][1] for s in M.VAL])
     comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
-    sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, jax.random.fold_in(S._keys()["rerank"], 1), per_patient=True)])
+    sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, jax.random.fold_in(S._keys()["rerank"], 1), per_patient=True, minutes=a.minutes)])
     mean = sc.mean(1)
     bi = int(np.argmin(mean))
     print("\n=== re-rank (fresh key, random stimulus, %d patients per scenario) ===" % a.rerank_batch)
@@ -97,7 +98,7 @@ def main():
     _, BASE, _ = S.space()
     fix = {k: json.loads(v) for k, v in (x.split("=", 1) for x in sargs.get("fix") or [])}
     base = P.init_params(jax.random.PRNGKey(0), dict(BASE, **fix))
-    test = np.stack([comb(st) for st in T.evaluate([models[bi], win["params"], base], a.test_batch, S._keys()["test"], per_patient=True)])
+    test = np.stack([comb(st) for st in T.evaluate([models[bi], win["params"], base], a.test_batch, S._keys()["test"], per_patient=True, minutes=a.minutes)])
     ci = lambda d: float(1.96 * d.std(ddof=1) / math.sqrt(len(d)))
     cfg = cfgs[bi] if bi < len(cfgs) else dict(win["cfg"])
     res = dict(model=names[bi], cfg=cfg, iters=best[bi]["it"] if bi < len(best) else 0,

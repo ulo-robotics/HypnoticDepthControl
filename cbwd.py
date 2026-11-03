@@ -37,8 +37,8 @@ def smem_bytes(d, pb):
     return 4 * (4 * L * pb * H + L * pb * 2 + 3 * pb * lds + nv * H + 2 * HDP + 8 * PP + pb * NQ)
 
 
-def valid(d, B, pb, lanes, T):
-    return (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024 and M.N % T == 0
+def valid(d, B, pb, lanes, T, N):
+    return (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024 and N % T == 0
             and smem_bytes(d, pb) <= SMEM_MAX)
 
 
@@ -112,8 +112,8 @@ def inputs(kp, q, st, ftape, T, tapes=True, packed=True):
     return {k: jnp.asarray(v, jnp.float32) for k, v in ins.items()}
 
 
-def outputs(d, B, T, grads, lam):
-    N, L, H, NS, HD = M.N, d["L"], d["H"], d["NS"], d["HD"]
+def outputs(d, B, T, grads, lam, N):
+    L, H, NS, HD = d["L"], d["H"], d["NS"], d["HD"]
     o = dict(lam=(N, B, 6 + 2 * d["PP"] + K.DP), e=(L, N, B, H)) if lam else {}
     o.update(t_x=(B, N, 2 * L * H), s_l=(L, 2, B, NS, H), s_F=(L, T, B, H))
     if grads:
@@ -124,10 +124,10 @@ def outputs(d, B, T, grads, lam):
 
 
 # ---------------------------------------------------------------- build
-def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam=True, B=0):
+def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam, B, N):
     f = lambda v: f"{float(v)!r}f"
     lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}", f"#define HEAD {int(d['HD'] > 0)}",
-             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {M.N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
+             f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
              f"#define LANES {lanes}", f"#define TC {int(tc)}", f"#define GRADS {int(grads)}", f"#define LAMOUT {int(lam)}"]
     for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX)):
         lines.append(f"#define {n} {f(v)}")
@@ -177,12 +177,12 @@ def backward(kp, q, st, ftape, T=20, pb=16, lanes=None, grads=False, tc=True, la
     lam=False: without lam / e (assemble_tapes does not need them)"""
     d = dims(kp)
     B = q["mu"].shape[0]
-    lanes = lanes or default_lanes(d["H"])
-    if not valid(d, B, pb, lanes, T):
+    lanes, N = lanes or default_lanes(d["H"]), K.nsteps(st)
+    if not valid(d, B, pb, lanes, T, N):
         raise ValueError(f"cbwd: pb={pb} lanes={lanes} T={T} not valid for {d} (shared memory {smem_bytes(d, pb)} B)")
     ins = inputs(kp, q, st, ftape, T, packed=tc and pb % 8 == 0)
-    outs = outputs(d, B, T, grads, lam)
-    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, grads, tc, lam, B))
+    outs = outputs(d, B, T, grads, lam, N)
+    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, grads, tc, lam, B, N))
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s, jnp.float32) for s in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B))
     r = dict(zip(outs, res))
@@ -202,17 +202,17 @@ def forward(kp, q, st, tape=True, T=8, pb=16, lanes=None, tc=True):
     """kstep.xla_forward(kp, q, st, tape, T) on the CUDA kernel: (tape dict or None, per-patient sums)"""
     d = dims(kp)
     B = q["mu"].shape[0]
-    lanes = lanes or default_lanes(d["H"])
+    lanes, N = lanes or default_lanes(d["H"]), K.nsteps(st)
     if not (lanes in (4, 8, 16, 32) and d["H"] % lanes == 0 and B % pb == 0 and pb % 8 == 0 and (pb * lanes) % 32 == 0 and pb * lanes <= 1024
-            and M.N % T == 0 and smem_fwd(d, pb, T) <= SMEM_MAX):
+            and N % T == 0 and smem_fwd(d, pb, T) <= SMEM_MAX):
         raise ValueError(f"cfwd: pb={pb} lanes={lanes} T={T} not valid for {d}")
     full = inputs(kp, q, st, dict(c=None, ys=None), T, tapes=False)
     ins = {k: full[k] for k in ("sc", "gl", "mH", "enc_b", "encW", "dec_lin", "head_W1", "head_b1", "head_dec", "p5", "L_vec", "L_Wv", "L_Wg",
                                 "q_c", "b_K", "b_S4", "b_AT") if k in full}
     ins["s_in"] = jnp.stack([st[k] for k in ("z0", "tg", "sy", "r", "rho", "z1", "w")]).astype(jnp.float32)
-    N, L, H, NS = M.N, d["L"], d["H"], d["NS"]
+    L, H, NS = d["L"], d["H"], d["NS"]
     outs = dict(tape=(N, B, 6 + 2 * d["PP"] + K.DP), ys=(L, N, B, H), sums=(3, B), s_h=(L, 2, B, NS, H))
-    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True, B), SRC_FWD, "CfwdHandler", "cfwd")
+    name = _build(_header(list(ins), list(outs), d, T, pb, lanes, False, tc, True, B, N), SRC_FWD, "CfwdHandler", "cfwd")
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s_, jnp.float32) for s_ in outs.values()], vmap_method="broadcast_all")(
         *ins.values(), B=np.int32(B), wtape=np.int32(1 if tape else 0))
     r = dict(zip(outs, res))
@@ -232,8 +232,8 @@ def casm(tp, btape, ck=None, nt=256):
     ly = tp["extra"]["layers"]
     L, H, NS = ly["log_A_re"].shape
     HD = btape["t_dpre"].shape[-1] if "t_dpre" in btape else 0
-    B = btape["g_sm"].shape[0]
-    fits = lambda c: M.N % c == 0 and 4 * c * (2 * L * H + 3 * L * H + H + max(HD, 8)) <= SMEM_MAX
+    B, N = btape["g_sm"].shape[0], btape["t_x"].shape[1]
+    fits = lambda c: N % c == 0 and 4 * c * (2 * L * H + 3 * L * H + H + max(HD, 8)) <= SMEM_MAX
     ck = ck or next((c for c in CASM_CK if fits(c)), None)
     if ck is None or not fits(ck):
         raise ValueError(f"casm: ck={ck} does not fit (H{H} L{L} HD{HD})")
@@ -248,7 +248,7 @@ def casm(tp, btape, ck=None, nt=256):
         ins.update(t_xe=btape["t_xe"], t_dpre=btape["t_dpre"])
         outs.update(g_hw=(B, H, HD), g_hb=(B, HD))
     lines = [f"#define HP {H}", f"#define NSP {NS}", f"#define LP {L}", f"#define HDP {max(HD, 8)}", f"#define HEAD {int(HD > 0)}",
-             f"#define NSTEP {M.N}", f"#define NT {nt}", f"#define CK {ck}", f"#define RM {rm}", f"#define MS {ms}", f"#define NIN {len(ins)}"]
+             f"#define NSTEP {N}", f"#define NT {nt}", f"#define CK {ck}", f"#define RM {rm}", f"#define MS {ms}", f"#define NIN {len(ins)}"]
     lines += [f"#define I_{k} {i}" for i, k in enumerate(ins)] + [f"#define NOUT {len(outs)}"] + [f"#define O_{k} {i}" for i, k in enumerate(outs)]
     name = _build("\n".join(lines) + "\n", SRC_ASM, "CasmHandler", "casm")
     res = jax.ffi.ffi_call(name, [jax.ShapeDtypeStruct(s_, jnp.float32) for s_ in outs.values()], vmap_method="broadcast_all")(

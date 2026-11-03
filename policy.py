@@ -276,12 +276,13 @@ def rollout(params, pts, w_low=0.0, rho_u=0.0, chunk=20, sz=None):
         return lax.scan(step, carry, inp)
 
     carry = (jnp.zeros((B, 4)), jnp.zeros(B), init_state(tp, B), jnp.zeros(B), jnp.full((B, M.DMAX_ALL + 1), M.E0))
-    ks = jnp.arange(M.N).reshape(-1, chunk)
-    zs = pts["z"].reshape(M.N // chunk, chunk, 2, B)
+    N = pts["z"].shape[0]
+    ks = jnp.arange(N).reshape(-1, chunk)
+    zs = pts["z"].reshape(N // chunk, chunk, 2, B)
     _, (cost, b, u) = lax.scan(chunk_fn, carry, (ks, zs))
-    cost, b, u = (a.reshape(M.N, B) for a in (cost, b, u))
+    cost, b, u = (a.reshape(N, B) for a in (cost, b, u))
     if "len" in pts:                                                       # variable-length episodes: each patient's own steps
-        on = jnp.arange(M.N)[:, None] < pts["len"][None, :]
+        on = jnp.arange(N)[:, None] < pts["len"][None, :]
         return jnp.sum(jnp.where(on, cost, 0.0), 0) / pts["len"], b, u
     return cost.mean(0), b, u
 

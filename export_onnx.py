@@ -187,7 +187,7 @@ def loop(run, pts, d, maxb=None, y_int=False, keep=None):
     plant = M.Plant(pts)
     z = lambda *s: np.zeros(s, np.float32)
     st, up = [z(B, d["modes"]), z(B, d["modes"]), z(d["L"], B, d["H"], d["NS"]), z(d["L"], B, d["H"], d["NS"])], z(B)
-    for k in range(M.N):
+    for k in range(plant.N):
         y = plant.measure()
         feed = dict(y=(np.round(y) if y_int else y).astype(np.float32), tgt=pts["tgt"][:, k].astype(np.float32),
                     tgt_prev=pts["tgt"][:, max(k - 1, 0)].astype(np.float32), u_prev=up, **dict(zip(INPUTS[4:], st)))
@@ -230,7 +230,7 @@ def against_jax(run, params, d, pts):
     jax.config.update("jax_default_matmul_precision", "highest")
     ref, plant = P.PolicyController(params), M.Plant(pts)
     ref.reset(pts, plant)
-    for k in range(M.N):
+    for k in range(plant.N):
         plant.step(np.clip(ref.act(k, plant.measure()), 0.0, M.UMAX))
     _, u = loop(run, pts, d)
     return float(np.max(np.abs(u - plant.us.T)))

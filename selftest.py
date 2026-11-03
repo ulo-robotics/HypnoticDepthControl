@@ -68,7 +68,7 @@ def f64(tree):
 
 
 def main():
-    pts = f64(M.sample_patients(jax.random.PRNGKey(3), 32, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=M.N * M.DT)))
+    pts = f64(M.sample_patients(jax.random.PRNGKey(3), 32, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=30.0)))
     pn = M.to_numpy(pts)
     ok = []
 
@@ -198,7 +198,7 @@ def engines():
     ok, n_run, n_asm = [], 0, 0
     noisy = lambda cfg: jax.tree_util.tree_map(lambda x: x + 0.05 * jax.random.normal(jax.random.PRNGKey(1), x.shape, x.dtype),
                                                P.init_params(jax.random.PRNGKey(0), cfg))
-    pts = M.sample_patients(jax.random.PRNGKey(3), 64, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=M.N * M.DT))
+    pts = M.sample_patients(jax.random.PRNGKey(3), 64, dict(M.with_stimulus(M.VAL["mixed_hard"][0], "signed"), len_lo=10.0, len_hi=30.0))
     q, st = K.to_kq(pts)
     cases = []
     for cfg in (dict(P.ARCH_DEFAULTS, H=16, NS=8, L=1, head=0), dict(P.ARCH_DEFAULTS, H=32, NS=4, L=2, head=32, n_extra=3), dict(P.ARCH_DEFAULTS)):

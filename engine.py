@@ -58,10 +58,10 @@ def _code_hash():
     return h.hexdigest()[:12]
 
 
-def _sig(tp, B, plain):
+def _sig(tp, B, plain, N):
     s, dev = P.shape_of(tp), jax.devices()[0]
     n = jax.tree_util.tree_leaves(tp)[0].shape[0]
-    return (f"H{s['H']}_NS{s['NS']}_L{s['L']}_hd{s['HD']}_P{s['P']}_x{n}_{'masked' if plain is None else 'plain' + str(int(plain))}_B{B}_"
+    return (f"H{s['H']}_NS{s['NS']}_L{s['L']}_hd{s['HD']}_P{s['P']}_x{n}_{'masked' if plain is None else 'plain' + str(int(plain))}_B{B}_N{N}_"
             f"{dev.platform}_{getattr(dev, 'device_kind', '')}_{_code_hash()}").replace(" ", "")
 
 
@@ -274,11 +274,11 @@ def _preferred(cands, acands):
     return (c, a) if len(c) > 1 and len(a) > 1 else None
 
 
-def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
+def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, minutes):
     """compile every candidate (in parallel threads), check it against the XLA reference on stable (nominal) patients, time it with that same
     executable (run time does not depend on the patients). Returns the decision record (engine raw when no adjoint path works)"""
     t0 = time.perf_counter()
-    chk = M.sample_patients(jax.random.PRNGKey(4242), B, M.VAL["nominal"][0])
+    chk = M.sample_patients(jax.random.PRNGKey(4242), B, dict(M.VAL["nominal"][0], T=minutes))
     kp = pop_map(lambda t, s, w, r: K.to_kp(t, s, w, r, plain), n, (0, 0, 0, 0))(tp, sz, w_low, rho_u)
     q, st = K.to_kq(chk)
     sweeps = lambda f, tape: pop_map(lambda k_, t_=None: f(k_, q, st) if t_ is None else f(k_, q, st, t_), n, (0,) if tape is None else (0, 0))
@@ -433,8 +433,9 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
     return rec
 
 
-def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print):
-    """choose the gradient implementation for a population (tp, sz, w_low, rho_u with a leading member axis) on batches of B patients.
+def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print, minutes=30.0):
+    """choose the gradient implementation for a population (tp, sz, w_low, rho_u with a leading member axis) on batches of B patients with
+    episodes of `minutes`.
     Returns (grad_fn(tp, sz, pts, w_low, rho_u) -> (per-patient grads (n, B, ...), loss (n, B), J (n, B)), description).
     A shape is tuned once: another population size of the same shape re-checks (and re-times) only the choice made there. A new shape first
     tries the candidates that won everywhere so far (_preferred) and tunes the full set only when none of them works (PKPD_TUNE=full: always)."""
@@ -443,7 +444,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
     raw = population(raw_grads, n)
     if mode == "raw":
         return raw, dict(engine="raw")
-    sig = _sig(tp, B, plain) + f"_{mode}"
+    sig = _sig(tp, B, plain, M.steps(dict(T=minutes))) + f"_{mode}"
     rec = _load().get(sig)
     chunk = _chunk(tp, n)
     if rec is None and mode == "auto" and iters is not None and iters < MIN_TUNE_ITERS:
@@ -456,7 +457,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         if any(x.dtype == np.float64 for x in jax.tree_util.tree_leaves(tp)):   # the CUDA kernels compute in float32
             cands = [c for c in cands if c[0] != "cblk"]
             acands = [a for a in acands if a == ("xla", {})]
-        tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log)
+        tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log, minutes)
         prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
         if prev is not None and not full:                                      # the same shape at another population size
             keep = lambda lst, ch: [x for x in lst if (x[0] == "xla" and not x[1]) or [x[0], x[1]] == ch]
@@ -493,6 +494,7 @@ def forward_stats_fn(rec, plain=None):
     fwd = sweep_fns(*rec["fwd"])[0]
 
     def f(tp, sz, pts):
-        _, s = fwd(K.to_kp(tp, sz, 0.0, 0.0, plain), *K.to_kq(pts), tape=False)
-        return s["se"] / M.N, s["viol"] / M.N
+        q, st = K.to_kq(pts)
+        _, s = fwd(K.to_kp(tp, sz, 0.0, 0.0, plain), q, st, tape=False)
+        return s["se"] / K.nsteps(st), s["viol"] / K.nsteps(st)
     return f

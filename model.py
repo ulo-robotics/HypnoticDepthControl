@@ -9,15 +9,13 @@ Cost       J = mean_k (BIS_k - target_k)^2 on the TRUE BIS; viol = mean relu(40 
 Every patient draws its own values from a scenario spec (ranges; lo == hi is a fixed value), so one scenario mixes many conditions.
 The patient population is sampled in JAX (`sample_patients`); the same batch, converted to numpy, drives the numpy plant used for the baselines.
 """
-import math, os
+import math
 import numpy as np
 import jax
 import jax.numpy as jnp
 from scipy.linalg import expm
 
 DT = 5.0 / 60.0                      # min
-T_END = 30.0
-N = int(os.environ.get("PKPD_N", round(T_END / DT)))    # steps simulated (360 = the 30 min scenarios; PKPD_N: longer episodes)
 TAU_MAX = 30.0                       # min: the slowest S4D mode's time constant (the scale of the shortest training episode)
 UMAX, TARGET, GAMMA, E0, EMAX = 100.0, 50.0, 2.0, 100.0, 100.0
 PK_KEYS = ("V1", "V2", "V3", "Cl1", "Cl2", "Cl3", "ke0")
@@ -26,14 +24,19 @@ C50N = 4.5
 PK_CV, C50_CV, SY = 0.2, 0.3, 2.5
 DMAX = 12                            # longest monitor delay (steps): 60 s
 KMAX = 8                             # most target / noise-level changes per episode
-IND = np.arange(N) * DT <= 10.0      # induction phase (first 10 min)
+T_IND = 10.0                         # min: the induction phase
 
 # ---------------------------------------------------------------- scenarios
-SPEC_NOMINAL = dict(tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0, stim_neg=0.0, stim_nmax=1,
+SPEC_NOMINAL = dict(T=30.0, tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0, stim_neg=0.0, stim_nmax=1,
                     dmin=0, dmax=0,
                     gamma_lo=GAMMA, gamma_hi=GAMMA, e0_lo=E0, e0_hi=E0, emax_lo=EMAX, emax_hi=EMAX,
                     tgt_lo=TARGET, tgt_hi=TARGET, pk_shift=0.0, sy_lo=SY, sy_hi=SY,
                     tgt_changes=0, tgt_dmax=10.0, sy_changes=0)
+
+
+def steps(sp):
+    """steps of a spec's episodes (T minutes); T is never traced"""
+    return int(round(float(sp["T"]) / DT))
 
 
 def spec(**kw):
@@ -97,9 +100,9 @@ def score_stimulus(stimulus):
     return "random" if stimulus == "signed" else stimulus
 
 
-def val_specs(stimulus="random"):
-    """the validation scenarios' specs, name -> spec"""
-    return {k: with_stimulus(v[0], stimulus) for k, v in VAL.items()}
+def val_specs(stimulus="random", T=None):
+    """the validation scenarios' specs, name -> spec; T: episodes of T minutes instead of the specs' 30"""
+    return {k: dict(with_stimulus(v[0], stimulus), **({"T": T} if T else {})) for k, v in VAL.items()}
 
 
 DMAX_ALL = max(int(s["dmax"]) for s in [TRAIN, *[v[0] for v in VAL.values()], *STRESS.values()])   # delay buffer length
@@ -163,7 +166,9 @@ def cref(c50, gamma, e0, emax, target):
 def sample_patients(key, B, sp, nom_frac=0.0):
     """B patients from spec `sp` (values may be traced scalars, e.g. the ramped dmax). A share `nom_frac` of them is exactly the nominal case
     (nominal drift, no stimulus / delay / PD or PK shift, target 50, noise SY); only their PK / C50 inter-individual variability remains.
-    Returns a dict of arrays, all batch-first, plus the noise of the whole episode (N, 2, B): [measurement, drift]."""
+    Returns a dict of arrays, all batch-first, plus the noise of the whole episode (N, 2, B): [measurement, drift], N = steps(sp).
+    A spec with len_lo / len_hi (min) also gives each patient its own episode length len (steps, at most N)."""
+    N = steps(sp)
     f = lambda v: jnp.asarray(v, jnp.float32)
     lens = "len_hi" in sp                                                # per-patient episode lengths: only training specs carry len_lo / len_hi (min)
     sp = {k: f(v) for k, v in sp.items()}
@@ -181,7 +186,7 @@ def sample_patients(key, B, sp, nom_frac=0.0):
     Ad, Bd = pk_disc(pk)
 
     pick = lambda v, v0: jnp.where(nom, v0, v)
-    steps = jnp.arange(N)
+    kn = jnp.arange(N)
 
     def traj(k, init, n_max, new_level):
         """(B, N) piecewise-constant trajectory: 0..n_max changes at random steps, each to a new random level"""
@@ -193,7 +198,7 @@ def sample_patients(key, B, sp, nom_frac=0.0):
             prev = new_level(prev, u(kj))
             lv.append(prev)
         active = jnp.arange(KMAX)[None, :] < n[:, None]
-        cnt = jnp.sum(active[:, :, None] & (times[:, :, None] <= steps[None, None, :]), 1)
+        cnt = jnp.sum(active[:, :, None] & (times[:, :, None] <= kn[None, None, :]), 1)
         return jnp.take_along_axis(jnp.stack(lv, 1), cnt, axis=1)
 
     tgt0 = pick(un(ks[4], sp["tgt_lo"], sp["tgt_hi"]), TARGET)
@@ -252,8 +257,9 @@ class Plant:
         self.x = np.zeros((self.B, 4))
         self.ou = np.zeros(self.B)
         self.k = 0
-        self.hist = np.zeros((N, self.B))
-        self.us = np.zeros((N, self.B))
+        self.N = pts["z"].shape[0]
+        self.hist = np.zeros((self.N, self.B))
+        self.us = np.zeros((self.N, self.B))
 
     def logc50(self, k=None):
         k = self.k if k is None else k
@@ -283,7 +289,7 @@ def run_numpy(controller, pts):
     """closed loop of a numpy controller (reset(pts, plant), act(k, y) -> u (B,)) on a numpy patient batch -> (BIS (B, N), u (B, N))"""
     plant = Plant(pts)
     controller.reset(pts, plant)
-    for k in range(N):
+    for k in range(plant.N):
         y = plant.measure()
         u = np.clip(np.asarray(controller.act(k, y), np.float64), 0.0, UMAX)
         plant.step(u)
@@ -293,6 +299,7 @@ def run_numpy(controller, pts):
 def metrics(b, u, tgt):
     """per-patient metrics of (B, N) traces"""
     se = (b - tgt) ** 2
+    IND = np.arange(b.shape[1]) * DT <= T_IND
     late = ~IND
     reach = b <= tgt + 5.0
     return dict(J=se.mean(1), J_ind=se[:, IND].mean(1), Jm=se[:, late].mean(1), low=100.0 * (b < 40).mean(1),

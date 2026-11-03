@@ -98,6 +98,11 @@ def to_kp(tp, sz, w_low, rho_u, plain=None):
     return kp
 
 
+def nsteps(st):
+    """steps of the episode of per-step inputs st (N, B)"""
+    return st["tg"].shape[0]
+
+
 def to_kq(pts):
     """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
     B = pts["mu"].shape[0]
@@ -113,8 +118,9 @@ def to_kq(pts):
     tg = pts["tgt"].T
     tgp = jnp.concatenate([tg[:1], tg[:-1]], 0)
     if "len" in pts:                                                    # variable-length episodes: each patient's own steps, its mean cost
-        on = jnp.arange(M.N)[:, None] < pts["len"][None, :]
-        w = jnp.where(on, M.N / pts["len"][None, :].astype(tg.dtype), 0.0).astype(tg.dtype)
+        N = tg.shape[0]
+        on = jnp.arange(N)[:, None] < pts["len"][None, :]
+        w = jnp.where(on, N / pts["len"][None, :].astype(tg.dtype), 0.0).astype(tg.dtype)
     else:
         w = jnp.ones_like(tg)
     st = dict(z0=pts["z"][:, 0], z1=pts["z"][:, 1], tg=tg, sy=pts["sy"].T, r=wr(tg) / M.C50N, rho=wr(tgp) / wr(tg), w=w)
@@ -324,7 +330,7 @@ def xla_forward(kp, q, st, tape=True, T=0):
             out = out + (c, [y for y, _ in ex])
         return (c2, [hh for _, hh in ex]), out
 
-    _, out = lax.scan(body, (carry0(B, Pp, q["mu"].dtype), h0), jnp.arange(M.N))
+    _, out = lax.scan(body, (carry0(B, Pp, q["mu"].dtype), h0), jnp.arange(nsteps(st)))
     sums = dict(cost=out[0].sum(0), se=out[1].sum(0), viol=out[2].sum(0))
     return (dict(c=out[3], ys=out[4]) if tape else None), sums
 
@@ -360,8 +366,9 @@ def _forward_blocked(kp, q, st, tape, T):
         return (c, h2), jax.tree_util.tree_map(lambda *x: jnp.stack(x), *outs)
 
     h0 = [(jnp.zeros((B, H, NS), dt),) * 2 for _ in range(L)]
-    _, out = lax.scan(body, (carry0(B, Pp, dt), h0), jnp.arange(M.N // T))
-    out = jax.tree_util.tree_map(lambda a: a.reshape((M.N,) + a.shape[2:]), out)
+    N = nsteps(st)
+    _, out = lax.scan(body, (carry0(B, Pp, dt), h0), jnp.arange(N // T))
+    out = jax.tree_util.tree_map(lambda a: a.reshape((N,) + a.shape[2:]), out)
     sums = dict(cost=out[0].sum(0), se=out[1].sum(0), viol=out[2].sum(0))
     return (dict(c=out[3], ys=out[4]) if tape else None), sums
 
@@ -370,7 +377,7 @@ def _backward_blocked(kp, q, st, tape, T):
     """the backward sweep with the blocked S4D adjoint. With lam = the cotangent of the state at the end of the block (from later blocks):
     e_i = <lam, dB dA^(T-1-i)> + sum_{m>i in the block} K_(m-i) cy_m, and the cotangent of the state at the block start is
     lam conj(dA^T) + 2 sum_m cy_m conj(C dA^(m+1))"""
-    B, dt = q["mu"].shape[0], q["mu"].dtype
+    B, dt, N = q["mu"].shape[0], q["mu"].dtype, nsteps(st)
     L = len(kp["layers"])
     bm = [block_mats(lp, T) for lp in kp["layers"]]
     lam_c = jax.tree_util.tree_map(jnp.zeros_like, carry0(B, kp["lamr"].shape[0], dt))
@@ -387,7 +394,7 @@ def _backward_blocked(kp, q, st, tape, T):
             c = {n: _row(v, k) for n, v in tape["c"].items()}
             ys = [_row(y, k) for y in tape["ys"]]
             e = [E[l][..., i] + sum(bm[l]["K"][:, m - i] * cys[l][m] for m in range(i + 1, T)) for l in range(L)]
-            c_bar, cy = bwd_core(kp, q, c, k, s, ys, e, lc, 1.0 / M.N)
+            c_bar, cy = bwd_core(kp, q, c, k, s, ys, e, lc, 1.0 / N)
             outs[i] = (lc, e)
             for l in range(L):
                 cys[l][i] = cy[l]
@@ -399,8 +406,8 @@ def _backward_blocked(kp, q, st, tape, T):
             lh2.append((lr * ATr + li * ATi + gr, li * ATr - lr * ATi - gi))
         return (lc, lh2), jax.tree_util.tree_map(lambda *x: jnp.stack(x), *outs)
 
-    _, (lam, e) = lax.scan(body, (lam_c, lam_h), jnp.arange(M.N // T), reverse=True)
-    rs = lambda a: a.reshape((M.N,) + a.shape[2:])
+    _, (lam, e) = lax.scan(body, (lam_c, lam_h), jnp.arange(N // T), reverse=True)
+    rs = lambda a: a.reshape((N,) + a.shape[2:])
     return dict(lam=jax.tree_util.tree_map(rs, lam), e=[rs(x) for x in e])
 
 
@@ -408,7 +415,7 @@ def xla_backward(kp, q, st, tape, T=0):
     """backward sweep. Returns dict(lam = cotangent of the carry AFTER each step (N, B, ...), e = [(N, B, H)] * L). T > 0: blocked S4D adjoint"""
     if T:
         return _backward_blocked(kp, q, st, tape, T)
-    B = q["mu"].shape[0]
+    B, N = q["mu"].shape[0], nsteps(st)
     lam_c = jax.tree_util.tree_map(jnp.zeros_like, carry0(B, kp["lamr"].shape[0], q["mu"].dtype))
     lam_h = [(jnp.zeros((B,) + lp["Ar"].shape, q["mu"].dtype),) * 2 for lp in kp["layers"]]
 
@@ -417,15 +424,15 @@ def xla_backward(kp, q, st, tape, T=0):
         s = {n: _row(v, k) for n, v in st.items()}
         c = {n: _row(v, k) for n, v in tape["c"].items()}
         ys = [_row(y, k) for y in tape["ys"]]
-        e, c_bar, lh2 = bwd_step(kp, q, c, k, s, ys, lc, lh, 1.0 / M.N)
+        e, c_bar, lh2 = bwd_step(kp, q, c, k, s, ys, lc, lh, 1.0 / N)
         return (c_bar, lh2), (lc, e)
 
-    _, (lam, e) = lax.scan(body, (lam_c, lam_h), jnp.arange(M.N), reverse=True)
+    _, (lam, e) = lax.scan(body, (lam_c, lam_h), jnp.arange(N), reverse=True)
     return dict(lam=lam, e=e)
 
 
 # ---------------------------------------------------------------- assembly of the per-patient gradients (XLA, parallel over steps)
-def s4d_kernel(lp, mS, n=M.N):
+def s4d_kernel(lp, mS, n):
     """K_m = 2 Re sum_n C dB dA^m, m = 0..n-1: (H, n)"""
     dt, A = M.s4d_A(lp["log_dt"], lp["log_A_re"], lp["A_im"])
     dtA = dt * A
@@ -448,14 +455,15 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
-    ks = jnp.arange(M.N)
+    N = nsteps(st)
+    ks = jnp.arange(N)
 
     def one(qb, stb, cb, ysb, lamb, eb):
         """one patient, all steps as the batch axis"""
-        qr = {n: jnp.broadcast_to(v, (M.N,) + v.shape) for n, v in qb.items()}
+        qr = {n: jnp.broadcast_to(v, (N,) + v.shape) for n, v in qb.items()}
         f = lambda kp_, ys_: replay(kp_, qr, cb, ks, stb, ys_, eb)
         (_, _), vjp, us = jax.vjp(f, kp, ysb, has_aux=True)
-        g_kp, cy = vjp((lamb, stb["w"] / M.N))
+        g_kp, cy = vjp((lamb, stb["w"] / N))
         return g_kp, cy, us
 
     def chunk_fn(i):
@@ -468,7 +476,7 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
         gl = g["extra"]["layers"]
         for l in range(len(us)):                                                 # S4D kernels: FFT cross-correlation, then the kernel's VJP
             gK = xcorr(jnp.swapaxes(cy[l], 1, 2), jnp.swapaxes(us[l], 1, 2))      # (chunk, H, N)
-            _, kvjp = jax.vjp(lambda p: s4d_kernel(p, mS), {k: tp["extra"]["layers"][k][l] for k in ("log_dt", "log_A_re", "A_im", "C")})
+            _, kvjp = jax.vjp(lambda p: s4d_kernel(p, mS, N), {k: tp["extra"]["layers"][k][l] for k in ("log_dt", "log_A_re", "A_im", "C")})
             gs = jax.vmap(lambda x: kvjp(x)[0])(gK)
             for k, v in gs.items():
                 gl[k] = gl[k].at[:, l].add(v)
@@ -489,4 +497,4 @@ def adjoint_grads(tp, sz, pts, w_low, rho_u, plain=None, forward=xla_forward, ba
     ftape, sums = forward(kp, q, st)
     btape = backward(kp, q, st, ftape)
     g = (assembly or assemble)(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk)
-    return g, sums["cost"] / M.N, sums["se"] / M.N
+    return g, sums["cost"] / nsteps(st), sums["se"] / nsteps(st)

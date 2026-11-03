@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--n", type=int, default=1000, help="patients per scenario")
     ap.add_argument("--out", default="", help="default: <model folder>/eval")
     ap.add_argument("--stress", action="store_true")
+    ap.add_argument("--minutes", type=float, default=30.0, help="episode length (min) of every scenario")
     ap.add_argument("--prior", action="store_true", help="also the untrained policy (prior compensator) of the model's config")
     ap.add_argument("--extra", action="append", default=[], help="name=path: another model on the same patients")
     ap.add_argument("--stim-times", default="", help="comma separated times (min): a scenario with a stimulus of 0.3 at each")
@@ -65,6 +66,7 @@ def main():
         scen.update(M.STRESS)
     for t in (float(x) for x in args.stim_times.split(",") if x):
         scen[f"stim_at_{t:g}"] = M.spec(stim_p=1.0, stim_lo=0.3, stim_hi=0.3, stim_tlo=t, stim_thi=t)
+    scen = {n: dict(sp, T=args.minutes) for n, sp in scen.items()}
 
     res, curves = {}, {}
     for si, (sname, sp) in enumerate(scen.items()):
@@ -112,7 +114,7 @@ def plot(curves, path):
     import matplotlib.pyplot as plt
     show = [s for s in ("nominal", "delay_60s", "mixed_hard") if s in curves]
     ctr = [c for c in ("policy", "UKF-MM", "UKF+LQR", "oracle-CE") if c in curves[show[0]]]
-    t = np.arange(M.N) * M.DT
+    t = np.arange(next(iter(next(iter(curves.values())).values()))[0].shape[1]) * M.DT
     fig, ax = plt.subplots(2, len(show), figsize=(5 * len(show), 6), sharex=True, squeeze=False)
     for j, s in enumerate(show):
         for c in ctr:
