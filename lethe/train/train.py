@@ -12,7 +12,7 @@ of search.py.
   python train.py --out runs/train                       # defaults = the selected configuration (trainer.SELECTED)
   python train.py --out runs/train --resume              # continue after an interruption
   python train.py --out runs/smoke --iters 30 --batch 64 --val-batch 128 --eval-every 10 --H 16 --L 1 --head 0   # quick check
-  PKPD_ENGINE=raw python train.py ...                 # force raw JAX autodiff (see lethe/engine)
+  python train.py --engine raw ...                       # force raw JAX autodiff (see lethe/engine)
 """
 import argparse, json, os, pickle, signal, time
 import jax
@@ -34,7 +34,10 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=500)
     for k, v in CONFIG.items():
         ap.add_argument(f"--{k}", type=type(v), default=None, help=f"default {v}")
+    ap.add_argument("--engine", default="auto", choices=["auto", "raw", "adjoint", "cblk"], help="gradient engine (auto: tuned; see lethe/engine)")
+    ap.add_argument("--full-tune", action="store_true", help="tune every engine candidate of a new shape")
     args = ap.parse_args()
+    T.limit_malloc_arenas()
     os.makedirs(args.out, exist_ok=True)
     ckpt_path = os.path.join(args.out, "checkpoint.pkl")
 
@@ -52,7 +55,7 @@ def main():
     json.dump(c, open(os.path.join(args.out, "config.json"), "w"), indent=1)
     print(f"config: {json.dumps(c)}\nbackend {jax.default_backend()}", flush=True)
     pop = T.Population([c], [state], jax.random.PRNGKey(10_000 + c["seed"]), val_batch=args.val_batch, iters_hint=c["iters"] - state["it"],
-                       block=args.eval_every)
+                       block=args.eval_every, engine=args.engine, full_tune=args.full_tune)
     log = open(os.path.join(args.out, "log.jsonl"), "a")
 
     stop = []

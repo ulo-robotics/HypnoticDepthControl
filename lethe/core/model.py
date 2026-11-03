@@ -39,6 +39,14 @@ def steps(sp):
     return int(round(float(sp["T"]) / DT))
 
 
+def stack_specs(specs):
+    """specs (name -> spec) as one dict of arrays (scenario axis first, for lax.map) and their common episode length T (static: it sets
+    the arrays' shapes); the mapped function samples with dict(stacked_row, T=T)"""
+    Ts = {float(sp["T"]) for sp in specs.values()}
+    assert len(Ts) == 1, f"scenarios of different lengths cannot be stacked: {sorted(Ts)}"
+    return {k: jnp.asarray([sp[k] for sp in specs.values()], jnp.float32) for k in SPEC_NOMINAL if k != "T"}, Ts.pop()
+
+
 def spec(**kw):
     bad = set(kw) - set(SPEC_NOMINAL)
     assert not bad, f"unknown spec keys {bad}"

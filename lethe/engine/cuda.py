@@ -52,7 +52,9 @@ def nsm(d):
 
 
 # ---------------------------------------------------------------- build registry, tape packing, S4D gradients from moments
-CACHE = os.path.join(os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1"), "cuda")
+import lethe
+CACHE = os.path.join(lethe.CACHE, "cuda")
+VERBOSE, LINEINFO = False, False       # nvcc: print registers / spills; -lineinfo (profiling)
 _LOADED = {}
 _BUILD_LOCK = threading.Lock()                # the registry (_LOADED, _INFLIGHT, FFI registration): lethe/engine builds candidates in parallel threads
 _INFLIGHT = {}
@@ -243,14 +245,14 @@ def _compile(header, src_path, symbol, prefix):
         cmd = [nvcc(), "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-arch={arch}", "-Xlinker", "--exclude-libs,ALL",
                "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-diag-suppress", "177,550",
                "-I" + jax.ffi.include_dir(), "-include", hf, src_path, "-o", f"{so}.{os.getpid()}.tmp"]
-        if os.environ.get("CBWD_VERBOSE"):
+        if VERBOSE:
             cmd += ["-Xptxas", "-v"]
-        if os.environ.get("CBWD_LINEINFO"):
+        if LINEINFO:
             cmd += ["-lineinfo"]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"nvcc failed:\n{res.stderr[-4000:]}")
-        if os.environ.get("CBWD_VERBOSE"):
+        if VERBOSE:
             print("\n".join(l for l in res.stderr.splitlines() if "registers" in l or "spill" in l), flush=True)
         os.replace(f"{so}.{os.getpid()}.tmp", so)
     lib = ctypes.cdll.LoadLibrary(so)

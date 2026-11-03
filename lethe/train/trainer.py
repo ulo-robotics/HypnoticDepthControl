@@ -12,7 +12,7 @@ Configuration = optimization (opt, lr, phys_mult, ssm_mult, clip, omb1 = 1 - bet
 weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design (q_theta, sy_scale, rho_lqr, q_x), plus the training setup
 (patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
-import json, math, os, pickle, threading, time
+import ctypes, json, math, os, pickle, threading, time
 from functools import partial, reduce
 import numpy as np
 import jax
@@ -185,7 +185,7 @@ def make_validate(n, stats_fn, scenarios=None, per_patient=False):
     stats_fn(tp, sz, pts) -> per-patient (J, viol) of one member. Returns validate(tp, sz, key) -> per member {scenario: {J, viol}}"""
     scen = scenarios or M.val_specs()
     names = list(scen)
-    specs = {k: jnp.asarray([scen[s][k] for s in names], jnp.float32) for k in M.SPEC_NOMINAL}
+    specs, T = M.stack_specs({s: scen[s] for s in names})
 
     @jax.jit
     def run(tp, sz, key):
@@ -193,7 +193,7 @@ def make_validate(n, stats_fn, scenarios=None, per_patient=False):
 
         def one(inp):
             i, sp = inp
-            J, v = f(tp, sz, M.sample_patients(jax.random.fold_in(key, i), n, sp))
+            J, v = f(tp, sz, M.sample_patients(jax.random.fold_in(key, i), n, dict(sp, T=T)))
             return (J, v) if per_patient else (jnp.mean(J, -1), jnp.mean(v, -1))
         return jax.lax.map(one, (jnp.arange(len(names)), specs))
 
@@ -219,6 +219,15 @@ def evaluate(models, n, key, per_patient=False, stimulus="random", minutes=None)
 
 
 # ---------------------------------------------------------------- the population
+def limit_malloc_arenas(n=2):
+    """at most n glibc malloc arenas: by default every thread that allocates gets one, and the parallel XLA compiles of the engine tuning
+    leave them fragmented (GBs of host memory that are never returned). Called first by the training command lines."""
+    try:
+        ctypes.CDLL("libc.so.6").mallopt(-8, n)                          # M_ARENA_MAX
+    except (OSError, AttributeError):
+        pass
+
+
 _PROGRAMS, _PROGRAMS_LOCK = {}, threading.Lock()     # compiled training blocks and validations, shared by the populations of a process
 
 
@@ -249,7 +258,9 @@ class Population:
     opt_names: the optimizers whose states every member carries (default: the members' own); search.py passes all of them so that one
     compilation serves every population of a shape."""
 
-    def __init__(self, cfgs, states, train_key, shape=None, opt_names=None, val_batch=1024, iters_hint=None, block=100, log=print):
+    def __init__(self, cfgs, states, train_key, shape=None, opt_names=None, val_batch=1024, iters_hint=None, block=100, log=print,
+                 engine=None, full_tune=False):
+        """engine, full_tune: see engine.select (mode, full_tune)"""
         self.cfgs, self.n, self.log, self.block, self.key = cfgs, len(cfgs), log, block, train_key
         self.setup = {k: cfgs[0][k] for k in SETUP}
         assert all({k: c[k] for k in SETUP} == self.setup for c in cfgs), "members must share the training setup"
@@ -270,7 +281,8 @@ class Population:
             hp = hyper(cfgs)
         self.state, self.sz, self.hp, self.key = jax.device_put((state, sz, hp, train_key), jax.devices()[0])
         self.grad_fn, self.engine = E.select(self.state["params"], self.sz, self.setup["batch"], self.hp["w_low"], self.hp["rho_u"], self.plain,
-                                             iters=iters_hint, log=log, minutes=self.setup["minutes"])
+                                             iters=iters_hint, log=log, minutes=self.setup["minutes"],
+                                             mode=engine, full_tune=full_tune)
         self.stats_fn = E.forward_stats_fn(self.engine, self.plain)
         self.val_batch = val_batch
         self._validate = None

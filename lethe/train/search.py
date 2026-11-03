@@ -60,14 +60,14 @@ def screen(designs, n, stimulus):
     names, specs = list(M.VAL), M.val_specs(stimulus)
     keys = _keys()
 
-    stacked = {k: jnp.asarray([specs[s][k] for s in names], jnp.float32) for k in M.SPEC_NOMINAL}
+    stacked, T = M.stack_specs({s: specs[s] for s in names})
     w = jnp.asarray([M.VAL[s][1] for s in names])
 
     @jax.jit
     def scores(phs):
         def per_scen(inp):                                         # one scenario's patients, every design at once (traced once)
             i, sp = inp
-            pts = M.sample_patients(jax.random.fold_in(jax.random.fold_in(keys["val"], 999), i), n, sp)
+            pts = M.sample_patients(jax.random.fold_in(jax.random.fold_in(keys["val"], 999), i), n, dict(sp, T=T))
 
             def one(ph):
                 _, b, _ = P.rollout(dict(params, phys=ph), pts)
@@ -267,7 +267,8 @@ class Search:
         L, H, NS = group_shape(g)
         tk = jax.random.PRNGKey(10_000) if train_seed is None else jax.random.fold_in(jax.random.PRNGKey(10_000), train_seed)
         pop = T.Population(cfgs, states, tk, shape=dict(H=H, NS=NS, L=L, HD=PAD_HEAD, P=5 + PAD_EXTRA), opt_names=T.OPT_NAMES,
-                           val_batch=self.a.val_batch, iters_hint=budget - states[0]["it"], block=self.a.block, log=lambda m: None)
+                           val_batch=self.a.val_batch, iters_hint=budget - states[0]["it"], block=self.a.block, log=lambda m: None,
+                           engine=getattr(self.a, "engine", None), full_tune=getattr(self.a, "full_tune", False))
         if compile:
             pop.compile()
         return pop, time.time() - t0
@@ -440,7 +441,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="Sobol scrambling seed")
     ap.add_argument("--fix", action="append", help="pin a dimension: --fix H=64 --fix opt='\"adam\"'")
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run (overrides the budgets)")
+    ap.add_argument("--engine", default="auto", choices=["auto", "raw", "adjoint", "cblk"], help="gradient engine (auto: tuned; see lethe/engine)")
+    ap.add_argument("--full-tune", action="store_true", help="tune every engine candidate of a new shape")
     args = ap.parse_args()
+    import lethe.train.trainer as T
+    T.limit_malloc_arenas()
     if args.smoke:
         args.trials, args.rungs, args.final_iters, args.final_seeds, args.batch, args.block = 6, "20,40", 20, 2, 32, 10
         args.val_batch, args.rerank_batch, args.test_batch, args.prior_screen = 64, 64, 64, 16

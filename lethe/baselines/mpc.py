@@ -26,11 +26,12 @@ import hashlib, os, subprocess
 from functools import partial
 import numpy as np
 
+import lethe
 from lethe.core import model as M
 from lethe.baselines import classic
 
 BLOCKS = (1, 2, 3, 6, 12, 36)          # move blocks: 60 steps = 5 min
-CODEGEN_DIR = os.path.expanduser("~/.cache/lethe/casadi")
+CODEGEN_DIR = os.path.join(lethe.CACHE, "casadi")
 LC0, LG0 = np.log(M.C50N), np.log(M.GAMMA)
 KE0 = M.NOM["ke0"]
 _Ad, _Bd = M.discretize(*M.pk_matrices(M.NOM))

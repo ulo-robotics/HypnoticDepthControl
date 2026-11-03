@@ -15,11 +15,10 @@ Selection per shape (padded sizes, members, batch, device): every candidate is c
 patients and timed on the real batch; the forward sweep, the backward sweep and the assembly are chosen independently. A candidate that fails
 to compile or disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the adjoint path at
 every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
-Decisions are cached in $PKPD_CACHE/engine.json.
+Decisions are cached in <lethe.CACHE>/engine.json.
 
-PKPD_ENGINE = auto (default) | raw | adjoint | cblk   (adjoint / cblk force that sweep backend; raw forces
-the fallback). PKPD_TUNE=full tunes every candidate (default: a shape is tuned once, the preferred candidates first; see select).
-PKPD_TUNE_DEBUG=1 logs every candidate's memory need against the free GPU memory.
+select(mode=): auto (default) | raw | adjoint | cblk (adjoint / cblk force that sweep backend; raw forces the fallback); full_tune=True tunes
+every candidate (default: a shape is tuned once, the preferred candidates first). The training command lines take --engine / --full-tune.
 """
 import gc, hashlib, json, os, re, time
 from functools import partial
@@ -31,7 +30,11 @@ from lethe.core import model as M
 from lethe.core import policy as P
 from lethe.engine import xla as K
 
-CACHE = os.environ.get("PKPD_CACHE") or os.path.expanduser("~/.cache/pkpd_v1")
+import lethe
+CACHE = lethe.CACHE
+BUILD_THREADS = min(16, os.cpu_count() or 4)    # candidates traced at once (each may build its CUDA library: one nvcc process)
+COMPILE_THREADS = 3                             # XLA compiles at once (8 ran the host out of memory)
+DEBUG = False                                   # log every candidate's memory need against the free GPU memory
 TUNE_FILE = os.path.join(CACHE, "engine.json")
 MIN_TUNE_ITERS = 200             # shorter runs use raw JAX untuned (tuning compiles every candidate)
 TOL = 1e-3                       # relative tolerance of a candidate's tapes vs the XLA reference (float32, stable patients)
@@ -218,10 +221,10 @@ def _compile_jobs(jobs):
     libraries, an nvcc process each), then compiled ahead of time in a narrower one (XLA compiles take host memory)"""
     from concurrent.futures import ThreadPoolExecutor
     trace = lambda fa: jax.eval_shape(fa[0], *fa[1])
-    with ThreadPoolExecutor(int(os.environ.get("PKPD_BUILD_THREADS", "") or min(16, os.cpu_count() or 4))) as ex:
+    with ThreadPoolExecutor(BUILD_THREADS) as ex:
         for f in [ex.submit(trace, fa) for fa in jobs.values()]:
             f.exception()                                           # (a failure shows again, and is kept, when compiled)
-    with ThreadPoolExecutor(int(os.environ.get("PKPD_COMPILE_THREADS", "") or 3)) as ex:   # 8 ran the host out of memory
+    with ThreadPoolExecutor(COMPILE_THREADS) as ex:
         fut = {k: ex.submit(_aot, f, *a) for k, (f, a) in jobs.items()}
         exe = {}
         for k, f in fut.items():
@@ -304,7 +307,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
         if isinstance(e, Exception):
             raise e
         need, free = _need(e), _free()
-        if os.environ.get("PKPD_TUNE_DEBUG"):
+        if DEBUG:
             st = jax.devices()[0].memory_stats() or {}
             log(f"[engine] {k}: needs {(need or 0) / 2**30:.2f} GiB, free {(free or 0) / 2**30:.2f} GiB, largest free block "
                 f"{st.get('largest_free_block_bytes', 0) / 2**30:.2f} GiB")
@@ -433,13 +436,13 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
     return rec
 
 
-def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print, minutes=30.0):
+def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print, minutes=30.0, full_tune=False):
     """choose the gradient implementation for a population (tp, sz, w_low, rho_u with a leading member axis) on batches of B patients with
     episodes of `minutes`.
     Returns (grad_fn(tp, sz, pts, w_low, rho_u) -> (per-patient grads (n, B, ...), loss (n, B), J (n, B)), description).
     A shape is tuned once: another population size of the same shape re-checks (and re-times) only the choice made there. A new shape first
-    tries the candidates that won everywhere so far (_preferred) and tunes the full set only when none of them works (PKPD_TUNE=full: always)."""
-    mode = (mode or os.environ.get("PKPD_ENGINE") or "auto").lower()
+    tries the candidates that won everywhere so far (_preferred) and tunes the full set only when none of them works (full_tune: always)."""
+    mode = (mode or "auto").lower()
     n = jax.tree_util.tree_leaves(tp)[0].shape[0]
     raw = population(raw_grads, n)
     if mode == "raw":
@@ -458,7 +461,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
             cands = [c for c in cands if c[0] != "cblk"]
             acands = [a for a in acands if a == ("xla", {})]
         tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log, minutes)
-        prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
+        prev, full = _other_size(sig), full_tune
         if prev is not None and not full:                                      # the same shape at another population size
             keep = lambda lst, ch: [x for x in lst if (x[0] == "xla" and not x[1]) or [x[0], x[1]] == ch]
             log(f"[engine] this shape was tuned at another population size or by an earlier engine version: checking its choice")

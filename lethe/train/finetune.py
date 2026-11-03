@@ -45,7 +45,10 @@ def main():
     ap.add_argument("--decay-at", default=",".join(map(str, DECAY_AT)))
     ap.add_argument("--minutes", type=float, default=120.0, help="episode length (min) of training (episodes of 30 min .. this), validation and test")
     ap.add_argument("--smoke", action="store_true", help="tiny end-to-end run")
+    ap.add_argument("--engine", default="auto", choices=["auto", "raw", "adjoint", "cblk"], help="gradient engine (auto: tuned; see lethe/engine)")
+    ap.add_argument("--full-tune", action="store_true", help="tune every engine candidate of a new shape")
     a = ap.parse_args()
+    T.limit_malloc_arenas()
     if a.smoke:
         a.iters, a.eval_every, a.val_batch, a.rerank_batch, a.test_batch = 20, 10, 64, 64, 64
     if os.path.exists(os.path.join(a.out, "results.json")):
@@ -61,7 +64,8 @@ def main():
         tp, _ = P.expand(jax.tree_util.tree_map(jnp.asarray, win["params"]))
         tp = T.to_np(tp)
         states = [dict(params=tp, ema=tp, ost={c["opt"]: T.to_np(T.OPTS[c["opt"]].init(tp))}, it=0) for c in cfgs]
-    pop = T.Population(cfgs, states, jax.random.PRNGKey(20_000), val_batch=a.val_batch, iters_hint=a.iters, block=a.eval_every)
+    pop = T.Population(cfgs, states, jax.random.PRNGKey(20_000), val_batch=a.val_batch, iters_hint=a.iters, block=a.eval_every,
+                       engine=a.engine, full_tune=a.full_tune)
     print(f"fine-tuning {len(cfgs)} variants of the search winner (config {win['cfg'].get('opt')} lr {win['cfg']['lr']:.1e}, "
           f"H{win['cfg']['H']} NS{win['cfg']['NS']} L{win['cfg']['L']}) on the random stimulus, engine {pop.engine}", flush=True)
     log = open(os.path.join(a.out, "log.jsonl"), "a")
