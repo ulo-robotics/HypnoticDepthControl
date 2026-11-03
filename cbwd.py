@@ -256,19 +256,17 @@ def casm(tp, btape, ck=None, nt=256):
     return dict(zip(outs, res))
 
 
-def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, cuda=False, ck=None):
-    """per-patient gradients (as kstep.assemble) from backward(..., grads=True): small parameters from the kernel's sums, the large matrices as
-    GEMMs over the steps, the S4D kernels from cuda/s4grad.cu, then the VJP of the kernel layout. The whole batch at once: unlike the replay
-    assembly nothing here grows with the batch beyond the tapes themselves (chunking only copied them). chunk: unused (the engine's signature).
-    cuda=True: the matrices, sums and S4D moments in one pass over the tapes (cuda/casm.cu, ck steps per chunk)"""
+def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, ck=None):
+    """per-patient gradients (as kstep.assemble) from backward(..., grads=True): the matrices, sums and S4D moments in one pass over the tapes
+    (cuda/casm.cu, ck steps per chunk), the S4D-parameter gradients from the moments, then the VJP of the kernel layout. The whole batch at
+    once: nothing here grows with the batch beyond the tapes themselves. chunk: unused (the engine's signature)."""
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: K.to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
     d = dims(kp)
     H, L, HD, PP = d["H"], d["L"], d["HD"], d["PP"]
     HDP = max(HD, 8)
-    ein = lambda a, b: jnp.einsum("bkh,bko->bho", a, b, precision=ASM_PREC)
-    gsm, X = btape["g_sm"], btape["t_x"]
+    gsm = btape["g_sm"]
     g = jax.tree_util.tree_map(lambda a: jnp.zeros((B,) + a.shape, a.dtype), kp)
     o = 0
 
@@ -293,34 +291,24 @@ def assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None,
     decb, u0 = take(1)[:, 0], take(1)[:, 0]
     g["sc"] = g["sc"].at[:, 0].set(u0).at[:, 1].set(decb)
     lng, lnb = take(L * H).reshape(B, L, H), take(L * H).reshape(B, L, H)
-    r = casm(tp, btape, ck) if cuda else None
+    r = casm(tp, btape, ck)
     for l in range(L):
         gl = g["layers"][l]
         gl["g"], gl["beta"] = lng[:, l], lnb[:, l]
-        if cuda:
-            gl["Wv"], gl["Wg"] = r["g_w"][:, l, 0], r["g_w"][:, l, 1]
-            gl["bv"], gl["bg"], gl["D"] = r["g_b"][:, l, 0], r["g_b"][:, l, 1], r["g_b"][:, l, 2]
-            continue
-        aa, dzv, dzg = btape["t_a"][l], btape["t_dzv"][l], btape["t_dzg"][l]
-        gl["Wv"], gl["Wg"] = ein(aa, dzv), ein(aa, dzg)
-        gl["bv"], gl["bg"] = dzv.sum(1), dzg.sum(1)
-        gl["D"] = jnp.einsum("bkh,bkh->bh", X[..., (2 * l + 1) * H:(2 * l + 2) * H], X[..., 2 * l * H:(2 * l + 1) * H], precision=K.HI)
+        gl["Wv"], gl["Wg"] = r["g_w"][:, l, 0], r["g_w"][:, l, 1]
+        gl["bv"], gl["bg"], gl["D"] = r["g_b"][:, l, 0], r["g_b"][:, l, 1], r["g_b"][:, l, 2]
     if HD:
-        if cuda:
-            g["hW"], g["hb"] = r["g_hw"], r["g_hb"]
-        else:
-            dpre = btape["t_dpre"]
-            g["hW"], g["hb"] = ein(btape["t_xe"], dpre), dpre.sum(1)
+        g["hW"], g["hb"] = r["g_hw"], r["g_hb"]
     gt = jax.vmap(lambda gk: kp_vjp(gk)[0])(g)
     glt = gt["extra"]["layers"]
-    s4 = KC.s4d_from_moments(tp, mS, r["pq"]) if cuda else KC.s4d_grads(tp, mS, X, 0, H, 2 * H)
+    s4 = KC.s4d_from_moments(tp, mS, r["pq"])
     for k, v in s4.items():
         glt[k] = glt[k] + v
     return gt
 
 
-def grads(tp, sz, w_low, rho_u, plain, q, st, ftape, T=10, pb=16, lanes=None, chunk=None, casm=False):
+def grads(tp, sz, w_low, rho_u, plain, q, st, ftape, T=10, pb=16, lanes=None, chunk=None):
     """backward with tapes + replay-free assembly in one: the engine's joint candidate (the assembly signature with the kernel's own backward)"""
     kp = K.to_kp(tp, sz, w_low, rho_u, plain)
     bt = backward(kp, q, st, ftape, T, pb=pb, lanes=lanes, grads=True, lam=False)
-    return assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, bt, chunk, cuda=casm)
+    return assemble_tapes(tp, sz, w_low, rho_u, plain, q, st, ftape, bt, chunk)

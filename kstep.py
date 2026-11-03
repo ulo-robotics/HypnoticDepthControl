@@ -15,11 +15,11 @@ Adjoint gradient (per patient, exact):
   assembly (XLA)   with both tapes, every step is independent: one batched VJP of the replayed step over all (step, patient) pairs gives every
                    per-patient parameter gradient except the S4D kernels (dt, A, C), which follow from an FFT cross-correlation of the S4D input
                    with the S4D output cotangent (the S4D layer is a convolution with K_m = 2 Re sum C dA^m dB).
-The sweeps are implemented three times (XLA scans here = the reference, kpallas.py, kcuda.py); `assemble` is shared.
+The sweeps are implemented twice (XLA scans here = the reference, and the blocked CUDA kernels of cbwd.py); `assemble` is the reference assembly.
 
 Parameters come in the training layout of policy.py with the network's sizes sz. A padded network (sizes smaller than the arrays) gets a "masked"
 kernel layout: the S4D input mask is folded into dB, and the layer-norm mask (kp["mH"], count sc[4]), the head switch (sc[5]) and the layer gates
-(sc[6 + l]) are applied in the step. An unpadded network can use the "plain" layout (no masks; the only one kcuda.py implements).
+(sc[6 + l]) are applied in the step. An unpadded network can use the "plain" layout (no masks).
 """
 import math
 from functools import partial
@@ -442,9 +442,9 @@ def xcorr(cy, u):
     return jnp.fft.irfft(jnp.fft.rfft(cy, nf) * jnp.conj(jnp.fft.rfft(u, nf)), nf)[..., :n]
 
 
-def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, s4=None):
-    """per-patient gradients (tree like tp with a leading batch axis) from the two tapes. s4: optional implementation of the S4D-kernel gradients
-    (kcuda.s4d_grads; default: FFT cross-correlation and the kernel's VJP)"""
+def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None):
+    """per-patient gradients (tree like tp with a leading batch axis) from the two tapes; the S4D kernels by FFT cross-correlation and the
+    kernel's VJP"""
     B = q["mu"].shape[0]
     kp, kp_vjp = jax.vjp(lambda t: to_kp(t, sz, w_low, rho_u, plain), tp)
     mS = P.masks(sz, P.shape_of(tp), tp["phys"]["u0"].dtype)["mS"]
@@ -466,12 +466,6 @@ def assemble(tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk=None, s4=No
         g_kp, cy, us = jax.vmap(one, in_axes=axes)(*args)
         g = jax.vmap(lambda gk: kp_vjp(gk)[0])(g_kp)
         gl = g["extra"]["layers"]
-        if s4 is not None:
-            H = us[0].shape[-1]
-            X = jnp.concatenate([z for l in range(len(us)) for z in (us[l], cy[l])], -1)
-            for k, v in s4(tp, mS, X, 0, H, 2 * H).items():
-                gl[k] = gl[k] + v
-            return g
         for l in range(len(us)):                                                 # S4D kernels: FFT cross-correlation, then the kernel's VJP
             gK = xcorr(jnp.swapaxes(cy[l], 1, 2), jnp.swapaxes(us[l], 1, 2))      # (chunk, H, N)
             _, kvjp = jax.vjp(lambda p: s4d_kernel(p, mS), {k: tp["extra"]["layers"][k][l] for k in ("log_dt", "log_A_re", "A_im", "C")})

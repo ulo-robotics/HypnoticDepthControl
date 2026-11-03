@@ -4,16 +4,12 @@ the patients are shared), either by raw JAX autodiff (vmap of grad through polic
 or by the adjoint method of kstep.py, whose forward and backward sweeps each run on the fastest VERIFIED implementation:
   xla      lax.scan sweeps (kstep.xla_forward / xla_backward)           always available; per step (the reference) or with the S4D
                                                                          blocked over T steps (state traffic once per block)
-  pallas   Pallas / Triton kernels (kpallas.py)                          GPU; some sizes do not fit (shared memory)
-  cuda     hand-written CUDA kernels via XLA FFI (kcuda.py)              GPU + nvcc; one unpadded network (train.py)
   cblk     CUDA kernels in the blocked layout (cbwd.py: cuda/cfwd.cu,    GPU + nvcc; populations, masked and plain layouts
            cuda/cbwd.cu): PB patients per thread block, GLU / head on tensor cores, S4D state touched once per T-step block
 and the gradient assembly on one of
   xla      kstep.assemble (replayed steps' VJP; S4D kernels by FFT cross-correlation)      always available, the reference
-  xla+s4   the same with the S4D-kernel gradients from cuda/s4grad.cu                     GPU + nvcc
-  cuda     cuda/asm.cu (fused step VJP) + batched GEMMs + cuda/s4grad.cu (kcuda.assemble)  GPU + nvcc; masked and plain layouts
-  tapes    joint backward + assembly (cbwd.grads): the cuda/cbwd.cu backward also writes the per-step cotangents, so the assembly is GEMMs and
-           cuda/s4grad.cu (or all of it in one pass over the tapes, cuda/casm.cu) without replaying the steps; replaces the backward sweep
+  tapes    joint backward + assembly (cbwd.grads): the cuda/cbwd.cu backward also writes the per-step cotangents, and cuda/casm.cu assembles
+           the gradients in one pass over them without replaying the steps; replaces the backward sweep
            (chosen when forward + joint < forward + backward + assembly)
 Selection per shape (padded sizes, members, batch, device): every candidate is compiled, checked against the XLA reference on stable (nominal)
 patients and timed on the real batch; the forward sweep, the backward sweep and the assembly are chosen independently. A candidate that fails
@@ -21,7 +17,7 @@ to compile or disagrees with the reference is never used. Raw JAX is the fallbac
 every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
 Decisions are cached in $PKPD_CACHE/engine.json.
 
-PKPD_ENGINE = auto (default) | raw | adjoint | pallas | cuda | cblk   (adjoint / pallas / cuda / cblk force that sweep backend; raw forces
+PKPD_ENGINE = auto (default) | raw | adjoint | cblk   (adjoint / cblk force that sweep backend; raw forces
 the fallback). PKPD_TUNE=full tunes every candidate (default: a shape is tuned once, the preferred candidates first; see select).
 PKPD_TUNE_DEBUG=1 logs every candidate's memory need against the free GPU memory.
 """
@@ -45,20 +41,16 @@ FIT = 0.7                        # a candidate runs only if it needs less than t
 FINAL, NFINAL = 1.15, 2          # stage winners within this factor of the best (at most NFINAL each) are timed as whole gradients
 
 XLA_CANDS = [dict(T=10), dict(T=20)]
-PALLAS_CANDS = [dict(kb=16, nw=4, lazy=False), dict(kb=16, nw=8, lazy=False), dict(kb=16, nw=8, lazy=True)]
-CUDA_CANDS = [dict(wpb=1, stage=0), dict(wpb=4, stage=0), dict(wpb=8, stage=1), dict(wpb=16, stage=1)]
-ASM_CUDA_CANDS = [dict(wpb=1, nseg=12), dict(wpb=2, nseg=12), dict(wpb=4, nseg=24)]
 CBLK_CANDS = [dict(T=10, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=10, pb=8, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=5, pb=32, lanes=16),
               dict(T=10, pb=32, lanes=16)]                                   # 8 patients per block for the wide networks, more for the narrow
-TAPES_CANDS = [dict(T=10, pb=16, lanes=32), dict(T=10, pb=32, lanes=16)] + [dict(o, casm=True) for o in (
-    dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, pb=16, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=5, pb=32, lanes=16),
-    dict(T=10, pb=32, lanes=16))]
+TAPES_CANDS = [dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, pb=16, lanes=16), dict(T=10, pb=16, lanes=32),
+               dict(T=5, pb=32, lanes=16), dict(T=10, pb=32, lanes=16)]
 
 
 def _code_hash():
     h = hashlib.sha1()
     d = os.path.dirname(os.path.abspath(__file__))
-    for f in ("kstep.py", "kpallas.py", "kcuda.py", "cbwd.py", "cuda/sweep.cu", "cuda/asm.cu", "cuda/s4grad.cu", "cuda/cbwd.cu", "cuda/cfwd.cu", "cuda/casm.cu",
+    for f in ("kstep.py", "kcuda.py", "cbwd.py", "cuda/cbwd.cu", "cuda/cfwd.cu", "cuda/casm.cu",
               "policy.py", "model.py", "engine.py"):
         p = os.path.join(d, f)
         if os.path.exists(p):
@@ -103,12 +95,6 @@ def pop_map(f, n, in_axes):
 def sweep_fns(kind, opt):
     if kind == "xla":
         return partial(K.xla_forward, **opt), partial(K.xla_backward, **opt)
-    if kind == "pallas":
-        import kpallas
-        return partial(kpallas.forward, **opt), partial(kpallas.backward, **opt)
-    if kind == "cuda":
-        import kcuda
-        return partial(kcuda.forward, **opt), partial(kcuda.backward, **opt)
     if kind == "cblk":
         import cbwd
         return partial(cbwd.forward, **opt), partial(cbwd.backward, **opt)
@@ -125,11 +111,8 @@ def _gpu():
 def candidates(B, n=1, plain=None, only=None):
     out = [("xla", {})] + [("xla", o) for o in XLA_CANDS]
     if _gpu():
-        out += [("pallas", o) for o in PALLAS_CANDS if B % o["kb"] == 0]
         try:
             import kcuda
-            if n == 1 and plain is not None and kcuda.available():
-                out += [("cuda", o) for o in CUDA_CANDS if B % o["wpb"] == 0]
             if kcuda.available():
                 out += [("cblk", o) for o in CBLK_CANDS if B % o["pb"] == 0]
         except Exception:
@@ -143,7 +126,7 @@ def asm_candidates():
         try:
             import kcuda
             if kcuda.available():
-                out += [("xla", dict(s4="cuda"))] + [("cuda", o) for o in ASM_CUDA_CANDS] + [("tapes", o) for o in TAPES_CANDS]
+                out += [("tapes", o) for o in TAPES_CANDS]
         except Exception:
             pass
     return out
@@ -152,13 +135,7 @@ def asm_candidates():
 def asm_fn(kind, opt):
     """the gradient assembly: (tp, sz, w_low, rho_u, plain, q, st, ftape, btape, chunk) -> per-patient gradients"""
     if kind == "xla":
-        if opt.get("s4") == "cuda":
-            import kcuda
-            return partial(K.assemble, s4=kcuda.s4d_grads)
         return K.assemble
-    if kind == "cuda":
-        import kcuda
-        return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: kcuda.assemble(tp, sz, w, r, plain, q, st, ft, bt, None, **opt)
     if kind == "tapes":                                  # joint: ignores bt (runs its own backward)
         import cbwd
         return lambda tp, sz, w, r, plain, q, st, ft, bt, chunk: cbwd.grads(tp, sz, w, r, plain, q, st, ft, chunk=chunk, **opt)
@@ -293,7 +270,7 @@ def _other_size(sig):
 def _preferred(cands, acands):
     """the candidates that won at every measured shape on CUDA GPUs (blocked CUDA sweeps, CUDA tape assembly), with the XLA references"""
     c = [x for x in cands if x[0] == "cblk" or (x[0] == "xla" and not x[1])]
-    a = [x for x in acands if (x[0] == "tapes" and x[1].get("casm")) or (x[0] == "xla" and not x[1])]
+    a = [x for x in acands if x[0] == "tapes" or (x[0] == "xla" and not x[1])]
     return (c, a) if len(c) > 1 and len(a) > 1 else None
 
 
@@ -312,7 +289,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log):
         fwd, bwd = sweep_fns(kind, opt)
         jobs[(kind, repr(opt), "fwd")] = (sweeps(fwd, None), (kp,))
         # a CUDA backward alone is needed only when no joint backward + assembly works: built then (each is an nvcc build)
-        (later if kind in ("cuda", "cblk") else jobs)[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
+        (later if kind == "cblk" else jobs)[(kind, repr(opt), "bwd")] = (sweeps(bwd, 1), (kp, ft_shape))
     for kind, opt in acands:
         af = asm_fn(kind, opt)
         jobs[("asm", kind, repr(opt))] = (pop_map(lambda t, s, w, r, ft, bt, af=af: af(t, s, w, r, plain, q, st, ft, bt, chunk), n, (0,) * 6),
@@ -477,7 +454,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         cands = candidates(B, n, plain, only)
         acands = asm_candidates() if mode == "auto" else [("xla", {})]
         if any(x.dtype == np.float64 for x in jax.tree_util.tree_leaves(tp)):   # the CUDA kernels compute in float32
-            cands = [c for c in cands if c[0] not in ("cuda", "cblk")]
+            cands = [c for c in cands if c[0] != "cblk"]
             acands = [a for a in acands if a == ("xla", {})]
         tune = lambda c, a: _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, c, a, mode, log)
         prev, full = _other_size(sig), os.environ.get("PKPD_TUNE", "").lower() == "full"
