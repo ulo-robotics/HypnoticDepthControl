@@ -213,7 +213,7 @@ def _rel_tree(a, b):
 
 
 def _aot(fn, *args):
-    """ahead-of-time compile (runs in a worker thread: XLA / Triton compilation releases the GIL)"""
+    """ahead-of-time compile (runs in a worker thread: XLA compilation releases the GIL)"""
     return jax.jit(fn).lower(*args).compile()
 
 

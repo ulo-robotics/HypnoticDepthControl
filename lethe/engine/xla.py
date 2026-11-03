@@ -1,7 +1,7 @@
 """
 The closed-loop step in "kernel form" and the adjoint gradient that the fast training engines share.
 
-Kernel form = the same math as policy.act + the plant of policy.rollout, written so it also traces inside a Pallas (Triton) kernel: real / imaginary
+Kernel form = the same math as policy.act + the plant of policy.rollout, in the layout of the CUDA kernels (engine/cuda.py): real / imaginary
 planes instead of complex numbers, no slicing / concatenation / gathers (the GLU halves are separate matrices, the 4x4 plant is 16 scalars, the delay
 line shift is a 0/1 matrix), power-of-two shapes (the physics modes are zero-padded), scalars in one vector `sc`.
 
@@ -42,7 +42,7 @@ def p2(n):
 
 
 def mm(a, W):
-    """(.., K) x (K, N): tl.dot / GEMM when the shapes allow it (Triton needs >= 16 everywhere), else a broadcast-reduce"""
+    """(.., K) x (K, N): a GEMM when every dimension is >= 16, else a broadcast-reduce"""
     if a.ndim == 2 and min(a.shape[0], a.shape[1], W.shape[1]) >= 16:
         return jnp.dot(a, W, precision=HI, preferred_element_type=a.dtype)
     return jnp.sum(a[..., :, None] * W, -2)
