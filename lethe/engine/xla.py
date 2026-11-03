@@ -15,15 +15,14 @@ Adjoint gradient (per patient, exact):
   assembly (XLA)   with both tapes, every step is independent: one batched VJP of the replayed step over all (step, patient) pairs gives every
                    per-patient parameter gradient except the S4D kernels (dt, A, C), which follow from an FFT cross-correlation of the S4D input
                    with the S4D output cotangent (the S4D layer is a convolution with K_m = 2 Re sum C dA^m dB).
-The sweeps are implemented twice (XLA scans here = the reference, and the blocked CUDA kernels of engine/cuda.py); `assemble` is the reference assembly.
+The sweeps are implemented twice (XLA scans here = the reference, and the blocked CUDA kernels of engine/cuda.py); `assemble` is the reference
+assembly.
 
 Parameters come in the training layout of core/policy.py with the network's sizes sz. A padded network (sizes smaller than the arrays) gets a "masked"
 kernel layout: the S4D input mask is folded into dB, and the layer-norm mask (kp["mH"], count sc[4]), the head switch (sc[5]) and the layer gates
 (sc[6 + l]) are applied in the step. An unpadded network can use the "plain" layout (no masks).
 """
 import math
-from functools import partial
-import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -107,7 +106,8 @@ def to_kq(pts):
     """patient batch (model.sample_patients) -> per-patient constants (B, ...) and per-step inputs (N, B)"""
     B = pts["mu"].shape[0]
     a = jnp.exp(-M.DT / pts["tau"])
-    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), stim=pts["stim"], stim_t=pts["stim_t"], stim2=pts["stim2"], stim_t2=pts["stim_t2"], stim3=pts["stim3"], stim_t3=pts["stim_t3"], gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+    q = dict(mu=pts["mu"], a_ou=a, osc=pts["sd"] * jnp.sqrt(1 - a * a), gamma=pts["gamma"], e0=pts["e0"], emax=pts["emax"],
+             **{k: pts[k] for k in ("stim", "stim_t", "stim2", "stim_t2", "stim3", "stim_t3")},
              dmask=jax.nn.one_hot(pts["delay"], DP, dtype=pts["mu"].dtype))
     Ad = pts["Ad"].reshape(B, 16)
     for i in range(16):
@@ -296,7 +296,8 @@ def block_mats(lp, T):
     for _ in range(T):
         pw.append(pw[-1] * dA)
     Pw = jnp.stack(pw, -1)
-    return dict(Wb=C[..., None] * Pw[..., 1:], Wu=dB[..., None] * Pw[..., T - 1::-1], AT=Pw[..., T], K=2 * jnp.real(jnp.sum((C * dB)[..., None] * Pw[..., :T], 1)))
+    return dict(Wb=C[..., None] * Pw[..., 1:], Wu=dB[..., None] * Pw[..., T - 1::-1], AT=Pw[..., T],
+                K=2 * jnp.real(jnp.sum((C * dB)[..., None] * Pw[..., :T], 1)))
 
 
 def _rdot(hr, hi, W):

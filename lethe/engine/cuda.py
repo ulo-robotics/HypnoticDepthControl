@@ -7,7 +7,7 @@ replaying the steps (xla.assemble replays every step and takes its VJP again).
 Layout of the kernel: one thread block = PB patients of one network, LANES threads per patient, the GLU / head matmuls on tensor cores across the
 block's patients. One shared library per shape and launch option, built with nvcc on first use and cached by content hash (CACHE).
 """
-import ctypes, hashlib, math, os, subprocess
+import ctypes, hashlib, os, subprocess
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -56,7 +56,7 @@ import lethe
 CACHE = os.path.join(lethe.CACHE, "cuda")
 VERBOSE, LINEINFO = False, False       # nvcc: print registers / spills; -lineinfo (profiling)
 _LOADED = {}
-_BUILD_LOCK = threading.Lock()                # the registry (_LOADED, _INFLIGHT, FFI registration): lethe/engine builds candidates in parallel threads
+_BUILD_LOCK = threading.Lock()                # the registry (_LOADED, _INFLIGHT, FFI registration): candidates are built in parallel threads
 _INFLIGHT = {}
 
 
@@ -161,7 +161,8 @@ def tf32_pack(w):
 
 def pack_q(q):
     B = q["mu"].shape[0]
-    cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc", "stim2", "stim_t2", "stim3", "stim_t3")]
+    cols = [q[f"A{i}"] for i in range(16)] + [q[f"B{i}"] for i in range(4)] + [
+        q[k] for k in ("mu", "stim", "stim_t", "a_ou", "gamma", "e0", "emax", "osc", "stim2", "stim_t2", "stim3", "stim_t3")]
     cols = jnp.stack(cols, 1)
     return jnp.concatenate([cols, jnp.zeros((B, 32 - cols.shape[1]), cols.dtype), q["dmask"]], 1)
 
@@ -216,7 +217,8 @@ def outputs(d, B, T, grads, lam, N):
 # ---------------------------------------------------------------- build
 def _header(names_in, names_out, d, T, pb, lanes, grads, tc, lam, B, N):
     f = lambda v: f"{float(v)!r}f"
-    lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}", f"#define HEAD {int(d['HD'] > 0)}",
+    lines = [f"#define HP {d['H']}", f"#define NSP {d['NS']}", f"#define LP {d['L']}", f"#define HDP {max(d['HD'], 8)}",
+             f"#define HEAD {int(d['HD'] > 0)}",
              f"#define P5P {d['PP']}", f"#define TBLK {T}", f"#define NSTEP {N}", f"#define PB {pb}", f"#define DPAD {K.DP}", f"#define BN {B}",
              f"#define LANES {lanes}", f"#define TC {int(tc)}", f"#define GRADS {int(grads)}", f"#define LAMOUT {int(lam)}"]
     for n, v in (("DT_", M.DT), ("E0_", M.E0), ("EMAX_", M.EMAX), ("GAMMA_", M.GAMMA), ("C50N_", M.C50N), ("UMAX_", M.UMAX)):

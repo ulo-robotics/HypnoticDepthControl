@@ -10,7 +10,7 @@ r         w_ref(target) / C50N: the physics branch runs in target-normalized uni
 
 Two parameter layouts:
   compact   (files, deployment, C++ export) a plain dict of arrays, the layout of the old best_model.pkl files:
-              phys  = dict(a, b, Bu, Bw, Cout, u0)          (P,) (P,) (P,2) (P,2) (P,2) (1,)   complex values stored as [..., (re, im)], P = 5 + n_extra
+              phys  = dict(a, b, Bu, Bw, Cout, u0)          (P,) (P,) (P,2) (P,2) (P,2) (1,)   complex as [..., (re, im)], P = 5 + n_extra
               extra = dict(enc_W (3,H), enc_b (H,), layers=[...], dec_W (H or head,1), dec_b (1,), [head_W1 (H,head), head_b1 (head,)])
               layer = dict(log_dt (H,), log_A_re (H,NS), A_im (H,NS), C (H,NS,2), D (H,), W_mix (H,2H), b_mix (2H,), ln_g (H,), ln_b (H,))
   training  the same values with one tree structure for every size: the layers stacked along a leading axis, the gated-mixing halves as
@@ -237,7 +237,8 @@ def act(tp, mk, pre, state, y, u_prev, tgt, tgt_prev):
 
 
 # ---------------------------------------------------------------- closed loop in JAX (training and evaluation)
-PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "stim_t", "stim2", "stim_t2", "stim3", "stim_t3", "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
+PATIENT_AXES = {k: (2 if k == "z" else 0) for k in ("pk", "Ad", "Bd", "mu", "tau", "sd", "stim", "stim_t", "stim2", "stim_t2", "stim3", "stim_t3",
+                                                   "delay", "gamma", "e0", "emax", "tgt", "sy", "z")}  # batch axis of each field
 
 
 def patient_axes(pts):

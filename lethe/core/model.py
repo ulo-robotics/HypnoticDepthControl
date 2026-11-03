@@ -27,7 +27,8 @@ KMAX = 8                             # most target / noise-level changes per epi
 T_IND = 10.0                         # min: the induction phase
 
 # ---------------------------------------------------------------- scenarios
-SPEC_NOMINAL = dict(T=30.0, tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15, stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0, stim_neg=0.0, stim_nmax=1,
+SPEC_NOMINAL = dict(T=30.0, tau_lo=20.0, tau_hi=20.0, sd_lo=0.15, sd_hi=0.15,
+                    stim_p=0.0, stim_lo=0.15, stim_hi=0.45, stim_tlo=5.0, stim_thi=28.0, stim_neg=0.0, stim_nmax=1,
                     dmin=0, dmax=0,
                     gamma_lo=GAMMA, gamma_hi=GAMMA, e0_lo=E0, e0_hi=E0, emax_lo=EMAX, emax_hi=EMAX,
                     tgt_lo=TARGET, tgt_hi=TARGET, pk_shift=0.0, sy_lo=SY, sy_hi=SY,
@@ -178,7 +179,7 @@ def sample_patients(key, B, sp, nom_frac=0.0):
     A spec with len_lo / len_hi (min) also gives each patient its own episode length len (steps, at most N)."""
     N = steps(sp)
     f = lambda v: jnp.asarray(v, jnp.float32)
-    lens = "len_hi" in sp                                                # per-patient episode lengths: only training specs carry len_lo / len_hi (min)
+    lens = "len_hi" in sp                                    # per-patient episode lengths: only training specs carry len_lo / len_hi (min)
     sp = {k: f(v) for k, v in sp.items()}
     ks = jax.random.split(key, 16)
     u = lambda k, shape=(B,): jax.random.uniform(k, shape)

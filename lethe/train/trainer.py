@@ -12,8 +12,8 @@ Configuration = optimization (opt, lr, phys_mult, ssm_mult, clip, omb1 = 1 - bet
 weights (w_low, rho_u), architecture (H, NS, L, head, n_extra) and prior design (q_theta, sy_scale, rho_lqr, q_x), plus the training setup
 (patient_clip, nominal_frac, max_delay, delay_ramp, batch, stimulus). Gradients come from engine.select (raw JAX or the faster verified kernel paths).
 """
-import ctypes, json, math, os, pickle, threading, time
-from functools import partial, reduce
+import ctypes, json, os, pickle, threading, time
+from functools import reduce
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -108,7 +108,8 @@ def hyper(cfgs):
     return dict(opt=jnp.asarray([OPT_NAMES.index(c["opt"]) for c in cfgs], jnp.int32),
                 sched=jnp.asarray([SCHED_NAMES.index(c["sched"]) for c in cfgs], jnp.int32),
                 lr=jnp.asarray([c["lr"] * OPT_LR_MULT.get(c["opt"], 1.0) for c in cfgs], jnp.float32),
-                b1=1 - f("omb1"), b2=1 - f("omb2"), **{k: f(k) for k in ("phys_mult", "ssm_mult", "clip", "wd", "tc", "floor", "warm", "ema", "w_low", "rho_u")})
+                b1=1 - f("omb1"), b2=1 - f("omb2"),
+                **{k: f(k) for k in ("phys_mult", "ssm_mult", "clip", "wd", "tc", "floor", "warm", "ema", "w_low", "rho_u")})
 
 
 def opt_update(names, ost, g, params, hp, it):

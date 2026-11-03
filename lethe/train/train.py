@@ -17,7 +17,6 @@ of search.py.
 import argparse, json, os, pickle, signal, time
 import jax
 
-from lethe.core import model as M
 from lethe.core import policy as P
 from lethe.train import trainer as T
 

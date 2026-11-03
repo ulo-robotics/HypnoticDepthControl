@@ -241,7 +241,8 @@ class Search:
                     continue
                 done[0] += len(g)
                 el = time.time() - t0
-                print(f"  [{tag}] {done[0]}/{len(todo)} trials, {el / 60:.1f} min, ETA {el / done[0] * (len(todo) - done[0]) / 60:.0f} min", flush=True)
+                eta = el / done[0] * (len(todo) - done[0]) / 60
+                print(f"  [{tag}] {done[0]}/{len(todo)} trials, {el / 60:.1f} min, ETA {eta:.0f} min", flush=True)
 
     def shrink(self, g, tag):
         """g's shape did not fit: at most half its population size from now on (recorded: a resumed run keeps it). Returns the new cap"""
@@ -336,8 +337,8 @@ class Search:
                         os.remove(self.spath(t))
                 for t in survivors[:5]:
                     c = t["cfg"]
-                    print(f"  top: trial {t['id']:5d} score {t['score']:8.3f}  {c['opt']} {c['sched']} lr {c['lr']:.1e} H{c['H']} NS{c['NS']} L{c['L']} "
-                          f"head{c['head']} +{c['n_extra']}m", flush=True)
+                    print(f"  top: trial {t['id']:5d} score {t['score']:8.3f}  {c['opt']} {c['sched']} lr {c['lr']:.1e} "
+                          f"H{c['H']} NS{c['NS']} L{c['L']} head{c['head']} +{c['n_extra']}m", flush=True)
                 trials[:] = survivors
                 self.save(rung=r + 1)
             # seed copies share the trial's state at the start of the final stage
@@ -368,7 +369,8 @@ class Search:
         models = [P.shrink(pickle.load(open(self.spath(t), "rb"))["ema"], t["cfg"]) for t in live]
         w = np.array([M.VAL[s][1] for s in M.VAL])
         comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
-        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True, stimulus=M.score_stimulus(a.stimulus))])
+        sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, _keys()["rerank"], per_patient=True,
+                                                     stimulus=M.score_stimulus(a.stimulus))])
         mean, se = sc.mean(1), sc.std(1, ddof=1) / math.sqrt(sc.shape[1])
         rows = []
         for p in sorted({t["parent"] for t in live}):

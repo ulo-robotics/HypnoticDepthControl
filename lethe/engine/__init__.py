@@ -13,8 +13,8 @@ and the gradient assembly on one of
            (chosen when forward + joint < forward + backward + assembly)
 Selection per shape (padded sizes, members, batch, device): every candidate is compiled, checked against the XLA reference on stable (nominal)
 patients and timed on the real batch; the forward sweep, the backward sweep and the assembly are chosen independently. A candidate that fails
-to compile or disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the adjoint path at
-every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
+to compile or disagrees with the reference is never used. Raw JAX is the fallback when no adjoint candidate works (it was slower than the
+adjoint path at every measured shape, and vmapped over a population it mostly does not fit in memory), and serves runs too short to pay for tuning.
 Decisions are cached in <lethe.CACHE>/engine.json.
 
 select(mode=): auto (default) | raw | adjoint | cblk (adjoint / cblk force that sweep backend; raw forces the fallback); full_tune=True tunes
@@ -44,7 +44,8 @@ FIT = 0.7                        # a candidate runs only if it needs less than t
 FINAL, NFINAL = 1.15, 2          # stage winners within this factor of the best (at most NFINAL each) are timed as whole gradients
 
 XLA_CANDS = [dict(T=10), dict(T=20)]
-CBLK_CANDS = [dict(T=10, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=10, pb=8, lanes=16), dict(T=10, pb=16, lanes=32), dict(T=5, pb=32, lanes=16),
+CBLK_CANDS = [dict(T=10, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=10, pb=8, lanes=16), dict(T=10, pb=16, lanes=32),
+              dict(T=5, pb=32, lanes=16),
               dict(T=10, pb=32, lanes=16)]                                   # 8 patients per block for the wide networks, more for the narrow
 TAPES_CANDS = [dict(T=5, pb=8, lanes=32), dict(T=5, pb=8, lanes=16), dict(T=5, pb=16, lanes=16), dict(T=10, pb=16, lanes=32),
                dict(T=5, pb=32, lanes=16), dict(T=10, pb=32, lanes=16)]
@@ -301,7 +302,7 @@ def _tune(tp, sz, B, w_low, rho_u, plain, n, chunk, cands, acands, mode, log, mi
     t_compile = time.perf_counter() - t0
 
     def timed(k, *a):
-        e = exe.get(k)
+        e = exe.get(k)  # noqa: F821 (deleted only after the last call)
         if e is None:
             raise LookupError("not built")
         if isinstance(e, Exception):
@@ -464,7 +465,7 @@ def select(tp, sz, B, w_low, rho_u, plain=None, iters=None, mode=None, log=print
         prev, full = _other_size(sig), full_tune
         if prev is not None and not full:                                      # the same shape at another population size
             keep = lambda lst, ch: [x for x in lst if (x[0] == "xla" and not x[1]) or [x[0], x[1]] == ch]
-            log(f"[engine] this shape was tuned at another population size or by an earlier engine version: checking its choice")
+            log("[engine] this shape was tuned at another population size or by an earlier engine version: checking its choice")
             rec = tune(keep(cands, prev["fwd"]) + [x for x in keep(cands, prev["bwd"]) if x not in keep(cands, prev["fwd"])],
                        keep(acands, prev["asm"]))
             rec = rec if rec["engine"] == "adjoint" and [rec["fwd"], rec["asm"]] == [prev["fwd"], prev["asm"]] else None

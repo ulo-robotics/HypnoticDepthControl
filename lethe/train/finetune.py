@@ -13,7 +13,7 @@ and it is tested ONCE on the search's test key (random stimulus) against the win
   python finetune.py --search runs/search --out runs/finetune
   python finetune.py --search runs/search_smoke --out runs/finetune_smoke --smoke
 """
-import argparse, json, math, os, pickle, time
+import argparse, json, math, os, time
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -87,11 +87,13 @@ def main():
     print(f"trained in {(time.time() - t0) / 60:.1f} min", flush=True)
 
     # re-rank the best snapshots and the winner itself on a fresh key; the best one is tested once
-    names = [f"lr x{m:.3g}, decay at {d:.2f}" for m in (float(x) for x in a.lr_mults.split(",")) for d in (float(x) for x in a.decay_at.split(","))] + ["search winner (not fine-tuned)"]
+    names = [f"lr x{m:.3g}, decay at {d:.2f}" for m in (float(x) for x in a.lr_mults.split(",")) for d in (float(x) for x in a.decay_at.split(","))]
+    names += ["search winner (not fine-tuned)"]
     models = [b["params"] for b in best] + [win["params"]]
     w = np.array([M.VAL[s][1] for s in M.VAL])
     comb = lambda st: sum(w[j] * (st[s]["J"] + 2.0 * st[s]["viol"]) for j, s in enumerate(M.VAL)) / w.sum()     # per patient
-    sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, jax.random.fold_in(S._keys()["rerank"], 1), per_patient=True, minutes=a.minutes)])
+    sc = np.stack([comb(st) for st in T.evaluate(models, a.rerank_batch, jax.random.fold_in(S._keys()["rerank"], 1), per_patient=True,
+                                                 minutes=a.minutes)])
     mean = sc.mean(1)
     bi = int(np.argmin(mean))
     print("\n=== re-rank (fresh key, random stimulus, %d patients per scenario) ===" % a.rerank_batch)
@@ -102,11 +104,13 @@ def main():
     _, BASE, _ = S.space()
     fix = {k: json.loads(v) for k, v in (x.split("=", 1) for x in sargs.get("fix") or [])}
     base = P.init_params(jax.random.PRNGKey(0), dict(BASE, **fix))
-    test = np.stack([comb(st) for st in T.evaluate([models[bi], win["params"], base], a.test_batch, S._keys()["test"], per_patient=True, minutes=a.minutes)])
+    test = np.stack([comb(st) for st in T.evaluate([models[bi], win["params"], base], a.test_batch, S._keys()["test"], per_patient=True,
+                                                   minutes=a.minutes)])
     ci = lambda d: float(1.96 * d.std(ddof=1) / math.sqrt(len(d)))
     cfg = cfgs[bi] if bi < len(cfgs) else dict(win["cfg"])
     res = dict(model=names[bi], cfg=cfg, iters=best[bi]["it"] if bi < len(best) else 0,
-               rerank=[dict(name=n, mean=float(mean[i]), best_val=best[i]["score"] if i < len(best) else None, best_it=best[i]["it"] if i < len(best) else None)
+               rerank=[dict(name=n, mean=float(mean[i]), best_val=best[i]["score"] if i < len(best) else None,
+                            best_it=best[i]["it"] if i < len(best) else None)
                        for i, n in enumerate(names)],
                test_score=float(test[0].mean()), winner_score=float(test[1].mean()), base_prior_score=float(test[2].mean()),
                test_improvement=float((test[2] - test[0]).mean()), test_improvement_ci=ci(test[2] - test[0]),

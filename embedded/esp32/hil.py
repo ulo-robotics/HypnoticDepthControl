@@ -113,7 +113,8 @@ def main():
         def f(k, y, t, tp):
             if k == 0:
                 st.clear()
-                st.update(u=np.zeros(1, np.float32), s=[np.zeros((1, d["modes"]), np.float32)] * 2 + [np.zeros((d["L"], 1, d["H"], d["NS"]), np.float32)] * 2)
+                s4 = np.zeros((d["L"], 1, d["H"], d["NS"]), np.float32)
+                st.update(u=np.zeros(1, np.float32), s=[np.zeros((1, d["modes"]), np.float32)] * 2 + [s4] * 2)
             feed = dict(y=np.full(1, y, np.float32), tgt=np.full(1, t, np.float32), tgt_prev=np.full(1, tp, np.float32),
                         u_prev=st["u"], **dict(zip(E.INPUTS[4:], st["s"])))
             o = sess(feed)

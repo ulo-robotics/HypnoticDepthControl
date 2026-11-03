@@ -1,0 +1,24 @@
+[project]
+name = "lethe"
+version = "0.0.0"
+description = "Closed-loop propofol control with a learned S4D policy on a physics compensator"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 150
+target-version = "py310"
+extend-exclude = ["runs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E731",   # lambda assignments: used deliberately for small local functions
+    "E741",   # names like l (layer index) follow the math
+    "E401",   # several imports on one line
+    "E702",   # statements on one line (compact plant / filter updates)
+    "E402",   # imports after sys.path setup in scripts
+]

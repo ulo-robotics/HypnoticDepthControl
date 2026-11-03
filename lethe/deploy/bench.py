@@ -9,7 +9,7 @@ Exports the model and reference episodes (deploy/cpp.py), builds cpp/bench.cpp w
 the JAX policy step by step (max |du| in mg/min) and reports the median / p99 latency per step; then times policy.act through JAX on the CPU
 and (if present) the GPU. Writes <out>/bench.json.
 """
-import argparse, json, os, pickle, subprocess, time
+import argparse, json, os, subprocess, time
 import numpy as np
 
 from lethe.deploy import cpp as export_cpp
@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def jax_latency(params, device, steps=360, reps=5):
-    import jax, jax.numpy as jnp
+    import jax
     from lethe.core import model as M
     from lethe.core import policy as P
     with jax.default_device(device):

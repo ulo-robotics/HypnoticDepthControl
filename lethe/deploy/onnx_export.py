@@ -27,7 +27,7 @@ selection score, the BIS trajectories, the infusions) and set it beside a physic
 Recurrent states in integers do not hold up: an int8 S4D state breaks the controller (score +17), and a full-integer LiteRT model (16x8:
 int16 activations and states), even with its state magnitudes equalized, drifts to twice the floor's BIS error over an episode.
 """
-import argparse, os, pickle, shutil, subprocess, tempfile, time
+import argparse, os, shutil, subprocess, tempfile, time
 import numpy as np
 
 from lethe.deploy import cpp as export_cpp
@@ -248,7 +248,6 @@ def calibrate(params, d, n, seed=1000):
     """closed loops of the float32 step (onnxruntime) on n patients of every scenario, keys seed + i: the int8 matmuls' smoothing and
     activation scales, group -> (s, a)"""
     from onnx import TensorProto, helper as oh
-    from lethe.core import model as M
     taps = {}
     m, _ = build(params, taps=taps)
     m.graph.output.extend(oh.make_tensor_value_info(t, TensorProto.FLOAT, None) for t in taps.values())
