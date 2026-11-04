@@ -52,10 +52,12 @@ trained with exact pathwise gradients over a broad, randomized patient populatio
 | `lethe/baselines/mpc.py`, `parallel.py` | MPC-MM and MHE+NMPC (CasADi + IPOPT, optional); closed loops in parallel processes |
 | `lethe/evaluate.py` | trained policies vs the baselines on the same fresh patients, paired differences, per-patient metrics, figure |
 | `lethe/deploy/` | the exports: `cpp.py` (model.bin + reference episodes for `cpp/`), `onnx_export.py` (ONNX, int8, TensorRT, LiteRT, each checked in closed loops), `bench.py` (C++ vs JAX) |
+| `lethe/deploy/edge/` | edge deployment: `runner.py` (the `edge.py` command line: prepare, run on boards over ssh, table), `baselines.py` (UKF-MM, MPC-MM, MHE+NMPC as CasADi-generated C), `trt.py` (TensorRT 8.x / JetPack 4), `coral.py` (Coral Edge TPU split) |
+| `edge/` | their board-side sources (`baselines/`, `tensorrt/`, `coral/`) and what each board needs (`edge/README.md`) |
 | `cpp/lethe_infer.hpp`, `cpp/bench.cpp` | the deployed controller as one dependency-free C++17 header; its benchmark |
 | `embedded/esp32/` | the header as an ESP-IDF app on emulated ESP32s (QEMU), with closed loops against onnxruntime |
 | `tests/`, `selftest.py` | the test suite (pytest) and its one-command runner |
-| `train.py`, `search.py`, `finetune.py`, `evaluate.py`, `export_cpp.py`, `export_onnx.py`, `bench_infer.py` | command lines (each calls its module's `main`) |
+| `train.py`, `search.py`, `finetune.py`, `evaluate.py`, `export_cpp.py`, `export_onnx.py`, `bench_infer.py`, `edge.py` | command lines (each calls its module's `main`) |
 
 ## Use
     pip install -r requirements.txt                                   # GPU: jax[cuda12]; or the Dockerfile. CasADi only for the MPC baselines
