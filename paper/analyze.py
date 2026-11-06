@@ -10,6 +10,7 @@ DATA_DIR holds (copied from the run folder, nothing recomputed except the trace 
   eval250/       the same, 250 min, 500 patients per validation scenario
   mpc30/, mpc250/  evaluate.py with the MPC baselines on the same patients (Lethe and UKF-MM again: the check that they are the same)
   long_segments.json  cost per 30-min segment over 250 min, the earlier model with the time input and Lethe on the same patients (traces.py)
+  edge/          edge.py run's results/<host>.jsonl for rpi5, rpi4 (with the Coral) and nano (with TensorRT)
   model_info.json     prior design, physics modes, S4D memories and parameter counts of the model (model_info.py)
   search.log, finetune.log  stdout of the stages
 Writes LATEX_DIR/tab_*.tex, LATEX_DIR/fig/*.pdf and LATEX_DIR/numbers.json.
@@ -530,10 +531,10 @@ if os.path.isdir(os.path.join(DATA, "covariates")):
 # ================================================================ edge boards (edge.py results: median / p99 per step, max error vs the reference)
 EDGE = os.path.join(DATA, "edge")
 if os.path.isdir(EDGE):
-    jl = lambda f: [json.loads(l) for l in open(os.path.join(EDGE, f)) if l.startswith("{")]
     boards = ("rpi5", "rpi4", "nano")
-    leth = {h: jl(f"lethe_{h}.txt")[0] for h in boards}
-    base = {h: {r["baseline"]: r for r in jl(f"{h}.jsonl")} for h in boards}
+    rows = {h: [json.loads(l) for l in open(os.path.join(EDGE, f"{h}.jsonl")) if l.startswith("{")] for h in boards}   # edge.py run
+    leth = {h: next(r for r in rows[h] if "float" in r) for h in boards}
+    base = {h: {r["baseline"]: r for r in rows[h] if "baseline" in r} for h in boards}
     us = lambda v: f"{v:.1f}" if v < 1e3 else f"{v / 1e3:.1f}\\,ms"
     L = [r"\begin{tabular}{l" + "rr" * len(boards) + "r}", r"\toprule",
          "per step & " + " & ".join(rf"\multicolumn{{2}}{{c}}{{{n}}}" for n in ("Raspberry Pi 5", "Raspberry Pi 4", "Jetson Nano")) + r" & error\\",
@@ -544,12 +545,12 @@ if os.path.isdir(EDGE):
     for k, nm in (("ukfmm", "UKF-MM"), ("mpcmm", "MPC-MM"), ("mhe", "MHE+NMPC")):
         L.append(f"{nm} & " + " & ".join(f"{us(base[h][k]['us_per_step_median'])} & {us(base[h][k]['us_per_step_p99'])}" for h in boards)
                  + f" & {max(base[h][k]['max_abs_err_vs_python'] for h in boards):.1e}\\\\")
-    trt = [r for r in jl("nano_trt.jsonl") if r["graph"]]
+    trt = [r for r in rows["nano"] if r.get("engine", "").endswith(".plan") and r["graph"]]
     for r in trt:
         if r["engine"] in ("policy_fp32.plan", "policy_fp16.plan"):
             L.append(f"Lethe, TensorRT {r['engine'][7:11]} (GPU) & -- & -- & -- & -- & {r['us_per_step_median']:.0f} & {r['us_per_step_p99']:.0f}"
                      f" & {r['max_abs_err_vs_jax']:.1e}\\\\")
-    co = {r["engine"]: r for r in jl("coral_rpi4.jsonl")}
+    co = {r["engine"]: r for r in rows["rpi4"] if r.get("engine") in ("cpu_int8", "edgetpu")}
     for e, nm in (("cpu_int8", "Lethe, int8 split, CPU (Python)"), ("edgetpu", "Lethe, int8 split, Coral TPU (Python)")):
         L.append(f"{nm} & -- & -- & {us(co[e]['us_per_step_median'])} & {us(co[e]['us_per_step_p99'])} & -- & -- & "
                      f"{co[e]['max_abs_err_vs_jax']:.0f}$^*$\\\\")

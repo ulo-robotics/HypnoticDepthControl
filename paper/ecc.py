@@ -126,10 +126,10 @@ nums["cov"] = {c: dict(score=float(score_pp(E30, c).mean()), **dict(zip(("d", "c
 
 # ---- edge boards: median microseconds per step
 EDGE = os.path.join(DATA, "edge")
-lethe = {h: json.loads([l for l in open(os.path.join(EDGE, f"lethe_{h}.txt")) if l.startswith("{")][0]) for h in ("rpi5", "rpi4", "nano")}
-base = {h: {r["baseline"]: r for r in map(json.loads, (l for l in open(os.path.join(EDGE, f"{h}.jsonl")) if l.startswith("{")))}
-        for h in ("rpi5", "rpi4", "nano")}
-trt = [json.loads(l) for l in open(os.path.join(EDGE, "nano_trt.jsonl"))]
+rows = {h: [json.loads(l) for l in open(os.path.join(EDGE, f"{h}.jsonl")) if l.startswith("{")] for h in ("rpi5", "rpi4", "nano")}  # edge.py run
+lethe = {h: next(r for r in rows[h] if "float" in r) for h in rows}
+base = {h: {r["baseline"]: r for r in rows[h] if "baseline" in r} for h in rows}
+trt = [r for r in rows["nano"] if r.get("engine", "").endswith(".plan")]
 fmt = lambda us: f"{us:.1f}" if us < 100 else (f"{us / 1e3:.1f}\\,ms" if us < 1e5 else f"{us / 1e3:.0f}\\,ms")
 L = [r"\begin{tabular}{lrrr}", r"\toprule", r"per 5-s step & Pi 5 & Pi 4 & Jetson Nano\\", r"\midrule"]
 L.append("Lethe (C++, float) & " + " & ".join(f"{lethe[h]['float']['ns_per_step_median'] / 1e3:.1f}" for h in base) + r"\\")
@@ -139,7 +139,7 @@ for k, nm in (("ukfmm", "UKF-MM"), ("mpcmm", "MPC-MM"), ("mhe", "MHE+NMPC")):
                                      for h in base) + r"\\")
 g = min((r for r in trt if r["graph"] and "fp32" in r["engine"]), key=lambda r: r["us_per_step_median"])
 L.append(r"Lethe (TensorRT, GPU) & -- & -- & " + f"{g['us_per_step_median']:.0f}" + r"\\")
-coral = {r["engine"]: r for r in map(json.loads, open(os.path.join(EDGE, "coral_rpi4.jsonl")))}["edgetpu"]
+coral = next(r for r in rows["rpi4"] if r.get("engine") == "edgetpu")
 L.append(r"Lethe (Coral Edge TPU) & -- & " + fmt(coral["us_per_step_median"]) + r" & --\\")
 L += [r"\bottomrule", r"\end{tabular}"]
 open(os.path.join(OUT, "tab_edge.tex"), "w").write("\n".join(L) + "\n")

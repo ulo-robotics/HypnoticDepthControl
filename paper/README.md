@@ -18,7 +18,7 @@ Then collect one data folder (copied, nothing recomputed):
     DATA/covariates/   runs/finetune/paper/covariates   DATA/covariates.json
     DATA/long_segments.json, DATA/model_info.json       runs/finetune/paper
     DATA/onnx_export.log, DATA/onnx_export_litert.log   export_onnx.py's stdout
-    DATA/edge/         edge.py's results (<host>.jsonl, coral_rpi4.jsonl, nano_trt.jsonl, lethe_*.txt)
+    DATA/edge/         runs/finetune/edge/results (edge.py run: rpi5.jsonl, rpi4.jsonl with the Coral, nano.jsonl with TensorRT)
 
 and generate (numpy and matplotlib only):
 
