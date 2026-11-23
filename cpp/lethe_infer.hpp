@@ -1,9 +1,9 @@
 // lethe_infer.hpp -- dependency-free C++17 inference engine of the Lethe policy (one patient, one control step at a time).
 //
-//   lethe::Model m = lethe::Model::load("model.bin");     // written by export_cpp.py
+//   lethe::Model m = lethe::Model::load("model.bin");     // written by export_cpp.py (LETHE03); Model::parse(bytes, end) from memory
 //   lethe::Policy<float> pol(m);                           // or Policy<double>
-//   pol.reset();
-//   for each 5 s step k:  u = pol.step(k, bis_measured, target_now, target_previous);    // infusion, mg/min, in [0, 100]
+//   pol.reset();                                           // at the start of each episode
+//   every 5 s:  u = pol.step(bis_measured, target_now, target_previous);    // infusion, mg/min, in [0, 100]
 //
 // The math is policy.act (JAX): the physics compensator (complex modes in target-normalized units), the encoder, L S4D layers (diagonal
 // complex recurrence, GELU, gated mixing, residual, layer norm), the optional MLP head, the decoder. All matrices are discretized by the
@@ -14,13 +14,14 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace lethe {
 
-constexpr double DT = 5.0 / 60.0, T_END = 30.0, UMAX = 100.0, E0 = 100.0, EMAX = 100.0, GAMMA = 2.0, C50N = 4.5;
+constexpr double UMAX = 100.0, E0 = 100.0, EMAX = 100.0, GAMMA = 2.0, C50N = 4.5;
 
 struct Layer {
   std::vector<double> dAr, dAi, dBr, dBi, Cr, Ci;    // (H, NS)
@@ -35,26 +36,29 @@ struct Model {
   std::vector<Layer> layers;
   std::vector<double> hW, hb, dec;                            // hW (H, HD), hb (HD), dec (HD, or H without a head)
 
-  static Model load(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
+  // model.bin in memory (p .. end), for targets without a filesystem (embedded/esp32)
+  static Model parse(const uint8_t* p, const uint8_t* end) {
+    auto take = [&](void* dst, size_t n) {
+      if (p + n > end) throw std::runtime_error("model.bin: truncated");
+      std::memcpy(dst, p, n);
+      p += n;
+    };
     char magic[8];
-    f.read(magic, 8);
-    if (std::memcmp(magic, "LETHE01\0", 8) != 0) throw std::runtime_error(path + ": not a Lethe model file");
+    take(magic, 8);
+    if (std::memcmp(magic, "LETHE03\0", 8) != 0) throw std::runtime_error("not a Lethe model file (LETHE03)");
     int32_t d[5];
-    f.read(reinterpret_cast<char*>(d), sizeof d);
+    take(d, sizeof d);
     Model m;
     m.H = d[0]; m.NS = d[1]; m.L = d[2]; m.HD = d[3]; m.P = d[4];
     auto rd = [&](size_t n) {
       std::vector<double> v(n);
-      f.read(reinterpret_cast<char*>(v.data()), n * sizeof(double));
-      if (!f) throw std::runtime_error(path + ": truncated");
+      take(v.data(), n * sizeof(double));
       return v;
     };
     const size_t H = m.H, NS = m.NS, P = m.P, HD = m.HD;
     auto s = rd(2); m.u0 = s[0]; m.dec_b = s[1];
     m.lr = rd(P); m.li = rd(P); m.Bur = rd(P); m.Bui = rd(P); m.Bwr = rd(P); m.Bwi = rd(P); m.Cor = rd(P); m.Coi = rd(P);
-    m.enc = rd(4 * H); m.enc_b = rd(H);
+    m.enc = rd(3 * H); m.enc_b = rd(H);
     for (int l = 0; l < m.L; l++) {
       Layer y;
       y.dAr = rd(H * NS); y.dAi = rd(H * NS); y.dBr = rd(H * NS); y.dBi = rd(H * NS); y.Cr = rd(H * NS); y.Ci = rd(H * NS);
@@ -64,6 +68,13 @@ struct Model {
     if (HD > 0) { m.hW = rd(H * HD); m.hb = rd(HD); }
     m.dec = rd(HD > 0 ? HD : H);
     return m;
+  }
+
+  static Model load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return parse(b.data(), b.data() + b.size());
   }
 };
 
@@ -90,15 +101,15 @@ class Policy {
     u_prev_ = T(0);
   }
 
-  // one control step: step index k (t = k * 5 s), measured BIS y, target now / at the previous step. Returns the infusion (mg/min).
-  T step(int k, T y, T tgt, T tgt_prev) {
+  // one control step: measured BIS y, target now / at the previous step. Returns the infusion (mg/min).
+  T step(T y, T tgt, T tgt_prev) {
     const int H = m_.H, NS = m_.NS, P = m_.P, HD = m_.HD;
     const T r = wref(tgt) / T(C50N), rho = wref(tgt_prev) / wref(tgt);
     for (int p = 0; p < P; p++) { pr_[p] *= rho; pi_[p] *= rho; }
     T s = std::clamp((T(E0) - y) / T(EMAX), T(1e-3), T(1) - T(1e-3));
     const T w = std::min(T(C50N) * std::pow(s / (T(1) - s), T(1) / T(GAMMA)), T(3 * C50N));
-    const T f[4] = {(y - tgt) / T(50), u_prev_ / (r * T(UMAX)), T(k * DT / T_END), w / (r * T(C50N)) - T(1)};
-    for (int h = 0; h < H; h++) x_[h] = f[0] * enc_[h] + f[1] * enc_[H + h] + f[2] * enc_[2 * H + h] + f[3] * enc_[3 * H + h] + enc_b_[h];
+    const T f[3] = {(y - tgt) / T(50), u_prev_ / (r * T(UMAX)), w / (r * T(C50N)) - T(1)};
+    for (int h = 0; h < H; h++) x_[h] = f[0] * enc_[h] + f[1] * enc_[H + h] + f[2] * enc_[2 * H + h] + enc_b_[h];
     for (int l = 0; l < m_.L; l++) layer(l);
     T o = T(m_.dec_b);
     if (HD > 0) {

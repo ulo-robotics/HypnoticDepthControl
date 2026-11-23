@@ -35,7 +35,7 @@ static void run(const lethe::Model& m, const Trace& tr, int reps, const char* na
   for (int i = 0; i < tr.n; i++) {
     pol.reset();
     for (int k = 0; k < tr.N; k++) {
-      T u = pol.step(k, T(tr.y[i][k]), T(tr.tgt[i][k]), T(tr.tgt[i][std::max(k - 1, 0)]));
+      T u = pol.step(T(tr.y[i][k]), T(tr.tgt[i][k]), T(tr.tgt[i][std::max(k - 1, 0)]));
       err = std::max(err, std::abs(double(u) - tr.u[i][k]));
     }
   }
@@ -45,7 +45,7 @@ static void run(const lethe::Model& m, const Trace& tr, int reps, const char* na
     const int i = r % tr.n;
     pol.reset();
     auto t0 = std::chrono::steady_clock::now();
-    for (int k = 0; k < tr.N; k++) sink = sink + pol.step(k, T(tr.y[i][k]), T(tr.tgt[i][k]), T(tr.tgt[i][std::max(k - 1, 0)]));
+    for (int k = 0; k < tr.N; k++) sink = sink + pol.step(T(tr.y[i][k]), T(tr.tgt[i][k]), T(tr.tgt[i][std::max(k - 1, 0)]));
     auto t1 = std::chrono::steady_clock::now();
     ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / tr.N);
   }

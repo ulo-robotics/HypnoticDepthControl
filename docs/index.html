@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SAFE3D-AI — Formal Verification for Trustworthy 3D Perception in Autonomous Mobile Robots</title>
+  <meta name="description" content="SAFE3D-AI applies formal neural-network verification to strengthen the evidence supporting vision-based perception in Autonomous Mobile Robots operating in industrial logistics." />
+  <link rel="stylesheet" href="static/css/app.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+<!-- ===== HERO ===== -->
+<header class="hero">
+  <h1 class="publication-title">SAFE3D-AI: Formal Verification for Trustworthy 3D Perception in Autonomous Mobile Robots</h1>
+
+  <div class="publication-authors">
+    <span class="author-block"><a href="https://orcid.org/0009-0005-0138-8451">Manuel Nunes Abreu</a><sup>1</sup>,</span>
+    <span class="author-block"><a href="https://orcid.org/0000-0003-3833-3794">Luís Garrote</a><sup>1</sup>,</span>
+    <span class="author-block"><a href="https://orcid.org/0000-0002-9689-3637">Luís Conde Bento</a><sup>1, 2</sup>,</span>
+    <span class="author-block"><a href="https://orcid.org/0000-0001-7828-622X">Bradley Schmerl</a><sup>3</sup>,</span>
+    <span class="author-block"><a href="https://orcid.org/0000-0002-7750-5221">Urbano J. Nunes</a><sup>1</sup>,</span>
+    <span class="author-block"><a href="https://orcid.org/0000-0002-6735-8301">David Garlan</a><sup>3</sup></span>
+  </div>
+
+  <div class="affiliations">
+    <sup>1</sup>Institute of Systems and Robotics — University of Coimbra (ISR-UC), Portugal<br />
+    <sup>2</sup>University of Leiria and Oeste, Leiria, Portugal<br />
+    <sup>3</sup>Software and Societal Systems Department — Carnegie Mellon University (CMU), USA
+  </div>
+
+  <div class="actions">
+    <a href="https://github.com/SAFE3D-AI" class="primary" target="_blank">
+      <svg width="18" height="18" viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.43-.49-2.59-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      Code
+    </a>
+    <a href="#videos" class="secondary">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+      Videos
+    </a>
+    <a href="#publications" class="secondary">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+      Publications
+    </a>
+  </div>
+</header>
+
+<!-- ===== ABSTRACT ===== -->
+<section id="abstract">
+  <div class="figure teaser">
+    <img src="static/images/verification_pipeline_clean.png" alt="Overview of the SAFE3D-AI verification pipeline for 3D perception in autonomous mobile robots." />
+    <p class="caption">SAFE3D-AI overview: a verification pipeline for trustworthy 3D perception in autonomous mobile robots.</p>
+  </div>
+
+  <h2>Abstract</h2>
+  <p>
+
+    The project focuses on applying formal neural network verification to enhance the robustness and safety of the 3D vision system being developed for the Autonomous Mobile Robots (AMRs) in the GreenAuto PRR initiative. The AMR forklift 3D vision system being developed to detect humans, ensuring safe logistics operations. Given the safety-critical nature of this task, the collaboration between CMU and Portuguese partners aims to integrate formal neural network verification techniques to improve system robustness against real-world anomalies, such as corrupted images and adversarial attacks. By systematically verifying the neural networks used in the AMR’s 3D vision system, the project will ensure that these AI models can safely handle anomalies and meet industrial safety standards. This joint effort between CMU, ISR-UC and Flowbotic will provide a solution that not only advances scientific knowledge but also has practical applications in logistics automation within the automotive industry.
+  </p>
+  <p>
+    It proposes a collaborative research effort between Carnegie Mellon University (CMU) and Portuguese partners to improve the safety and robustness of AI systems used in industrial robotics, specifically focusing on neural network-based vision systems in Autonomous Mobile Robots (AMRs). The primary goal is to apply formal neural network verification to validate the AI model's robustness, ensuring safe operation in scenarios where the AMR encounters anomalies corrupted images and adversarial attacks, as part of the GreenAuto initiative.
+  </p>
+
+
+  <div class="figure">
+    <img src="static/images/pipelineICIST.png" alt="Overview of the proposed pipeline for robustness evaluation of CNN-based image classification models. The framework includes dataset construction, model training, and formal verification under perturbations." />
+    <p class="caption">Robustness evaluation pipeline, from dataset construction and model training to formal verification under perturbations.</p>
+  </div>
+
+  <div class="figure">
+    <img src="static/images/formalverificationresults.png" alt="Formal verification results for the evaluated models under various perturbations using alpha-beta-CROWN verifier." />
+    <p class="caption">Formal verification results for the evaluated models under different perturbations using the α,β-CROWN verifier.</p>
+  </div>
+
+</section>
+
+
+<!-- ===== DEMO VIDEOS ===== -->
+<section id="videos">
+  <div class="carousel-wrapper">
+    <div class="carousel-track-container">
+      <div class="carousel-track">
+
+        <!-- Slide 1: Static scenarios -->
+        <div class="carousel-slide">
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/estatico.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Static Scene — RGB</p>
+          </div>
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/estatico depth.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Static Scene — Depth</p>
+          </div>
+        </div>
+
+        <div class="carousel-slide">
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/estatico luz depth.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Static Scene (Light Variation) — Depth</p>
+          </div>
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/estatico luz.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Static Scene (Light Variation) — RGB</p>
+          </div>
+        </div>
+
+        <!-- Slide 2: Depth + Dynamic scenarios -->
+        <div class="carousel-slide">
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/moving.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Dynamic Scene — RGB</p>
+          </div>
+          <div class="video-item">
+            <video autoplay controls muted loop playsinline height="240">
+              <source src="static/videos/moving depth.mp4" type="video/mp4">
+            </video>
+            <p class="video-label">Dynamic Scene — Depth</p>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Navigation arrows -->
+    <button class="carousel-btn carousel-btn--prev" aria-label="Previous slide">
+      <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"></polyline></svg>
+    </button>
+    <button class="carousel-btn carousel-btn--next" aria-label="Next slide">
+      <svg viewBox="0 0 24 24"><polyline points="9 6 15 12 9 18"></polyline></svg>
+    </button>
+  </div>
+
+  <div class="carousel-pagination"></div>
+</section>
+
+<!--===== PUBLICATIONS ===== -->
+<section id="publications">
+  <h2>Publications</h2>
+  <p>Peer-reviewed conference papers published as part of this project.</p>
+
+  <div class="pub-entry">
+    <p>
+      <strong>Abreu, M.</strong>, Garrote, L., Bento, L.C., Schmerl, B., Nunes, U.J., &amp; Garlan, D. (2026).<br />
+      Formal Verification of Deep Neural Networks for Image Classification in Industrial Environments.<br />
+      <em>16th International Conference on Information Science and Technology (ICIST)</em>, Coimbra, Portugal, pp. 385–393.<br />
+      <a href="https://doi.org/10.1109/ICIST71072.2026.11727805" target="_blank">DOI: 10.1109/ICIST71072.2026.11727805</a>
+    </p>
+  </div>
+
+  <div class="pub-entry">
+    <p>
+      <strong>Costa, M.</strong> et al. (2026).<br />
+      Trustworthy Neural Traffic Sign Recognition: Attacks, Explanations, and Verification.<br />
+      <em>16th International Conference on Information Science and Technology (ICIST)</em>, Coimbra, Portugal, pp. 520–528.<br />
+      <a href="https://doi.org/10.1109/ICIST71072.2026.11727713" target="_blank">DOI: 10.1109/ICIST71072.2026.11727713</a>
+    </p>
+  </div>
+
+  <div class="pub-entry">
+    <p>
+      <strong>Abreu, M.</strong>, Borges, E., Garrote, L., Mendes, A., &amp; Nunes, U.J. (2025).<br />
+      DepthTriFusion: A Three-Stream RGB-LiDAR-Normal Pipeline for Depth Estimation.<br />
+      In: Pinto, V.H., Lima, J., Dias, A., Ferre, M. (eds) <em>ROBOT 2025: Advances in Robotics</em>. Lecture Notes in Networks and Systems, vol 2044. Springer, Cham.<br />
+      <a href="https://doi.org/10.1007/978-3-032-30156-7_43" target="_blank">DOI: 10.1007/978-3-032-30156-7_43</a>
+    </p>
+  </div>
+
+  <div class="pub-entry">
+    <p>
+      <strong>Garrote, L.</strong>, Borges, E., Mendes, A., &amp; Nunes, U.J. (2025).<br />
+      The Impact of Loss Functions and Architectures in Object Re-identification: A Comparative Study.<br />
+      In: Pinto, V.H., Lima, J., Dias, A., Ferre, M. (eds) <em>ROBOT 2025: Advances in Robotics</em>. Lecture Notes in Networks and Systems, vol 2044. Springer, Cham.<br />
+      <a href="https://doi.org/10.1007/978-3-032-30156-7_38" target="_blank">DOI: 10.1007/978-3-032-30156-7_38</a>
+    </p>
+  </div>
+
+  <div class="pub-entry">
+    <p>
+      <strong>Abreu, M.</strong>, Borges, E., Perdiz, J., Garrote, L., Mendes, A., &amp; Nunes, U.J. (2026).<br />
+      Attention-Based Multimodal Fusion for Robust 6D Pose Estimation in Cluttered Industrial Environments.<br />
+      <em>2026 IEEE International Conference on Autonomous Robot Systems and Competitions (ICARSC)</em>, Barcelos, Portugal, pp. 124–131.<br />
+      <a href="https://doi.org/10.1109/ICARSC70216.2026.11523333" target="_blank">DOI: 10.1109/ICARSC70216.2026.11523333</a>
+    </p>
+  </div>
+
+</section>
+
+<footer>
+  <img class="sponsorship-logos" src="static/images/sponsorships.png" alt="Logótipos das entidades financiadoras, académicas e parceiras do projeto SAFE3D-AI" />
+  <br /> <br />
+  <p>
+    SAFE3D-AI — A collaboration between
+    <a href="https://isr.uc.pt/" target="_blank">ISR-UC</a>,
+    <a href="https://www.cs.cmu.edu/" target="_blank">CMU</a>,
+    and <a href="https://www.flowbotic.eu/" target="_blank">Flowbotic</a>.
+  </p>
+  <p>
+    Funded by <a href="https://www.prr.pt/" target="_blank">Portugal 2020 / PRR</a> within the
+    <a href="https://www.greenauto.pt/" target="_blank">GreenAuto</a> initiative.
+    Supported by <a href="https://www.cmuportugal.org" target="_blank">CMU Portugal</a> and
+    <a href="https://www.fct.pt/" target="_blank">FCT</a>.
+  </p>
+  <p style="margin-top: 1rem; font-size: 0.8rem;">
+    Website template adapted from
+    <a href="https://nerfies.github.io/" target="_blank">Nerfies</a> and
+    <a href="https://openvla.github.io/" target="_blank">OpenVLA</a>
+    under a <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank">CC BY-SA 4.0</a> license.
+  </p>
+</footer>
+
+<script src="static/js/carousel.js"></script>
+</body>
+</html>
